@@ -1,4 +1,4 @@
-# Kimi Code 用量面板 (Kimi Code Usage Panel) v3.0
+# Kimi Code 用量面板 (Kimi Code Usage Panel) v3.1
 
 实时记录并可视化 **Kimi Code Agent** 的每一次模型调用用量，并把**模型能力管理**（识图 / 深度思考 / 工具调用 / 强度档位）与**官方配额监控**整合进同一侧栏卡片。零外部依赖、纯本地采集，全部界面直接渲染在桌面端内。
 
@@ -19,9 +19,10 @@
   - 近 7 天微缩走势条（Sparkline）、今日/累计模型明细切换、折叠记忆
 - **📈 全尺寸大屏（内嵌渲染，无 iframe）**：波浪面积图 + 调用量柱形（今日逐小时 / 本周 7 天 / 本月 30 天切换）、模型份额表、会话 Top 8、30 天明细表、深浅主题切换。点击卡片标题或「📊 面板」打开。
 - **🛠️ 模型与能力管理器**：`⚙` 打开弹窗，按模型开关识图 `image_in` / 深度思考 `thinking` / 工具调用 `tool_use`，强度档位下拉（按 `support_efforts` 过滤）、一键全开、设为默认、搜索过滤；修改自动备份 `config.toml` 并经 `kimi doctor config` 校验，会话内 `/reload` 生效。
+- **🔄 自动更新**：面板头部「更新」按钮自动比对 GitHub 仓库 `ziyiclouds-blip/kimicode-ylmb` 的版本，有新版本一键下载、覆盖插件文件并自动重启服务（用量数据、价格配置、desktop_path.txt 不受影响）；也可在会话里用 `/update`。
 - **🛡️ 纯本地**：数据不上传；状态保存在 `~/.kimi-code/usage-collector-state.json`，跨重启不丢历史。
 
-## 架构（v3.0 重构）
+## 架构（v3.x）
 
 ```
 插件 hooks (SessionStart/Heartbeat/Stop/SessionEnd, cwd=插件根)
@@ -30,8 +31,9 @@
 scripts/service.py ──单进程──┬─ scanner.py 增量扫描 wire.jsonl（字节偏移续扫）
    pythonw 常驻 39281         ├─ 每 2s 写 desktop-dist: assets/kimi-usage-data.js + kimi-usage.json
                              ├─ index.html 注入自愈（覆盖更新后自动重注入）
-                             ├─ HTTP API: /api/data|usage|quota|set-default|toggle-capability|update-model|add-model|auto-enable-all
-                             └─ 5min 轮询官方 usages 额度（OAuth Bearer）
+                             ├─ HTTP API: /api/data|usage|quota|set-default|toggle-capability|update-model|add-model|auto-enable-all|update/check|update/apply
+                             ├─ 5min 轮询官方 usages 额度（OAuth Bearer）
+                             └─ /api/update/apply → scripts/updater.py：等端口释放→覆盖插件文件→重拉服务
 assets/kimi-usage-widget.js ── 侧栏卡片 + 全屏报表 + 模型弹窗（单一注入脚本）
 ```
 
@@ -65,10 +67,11 @@ kimi-code-usage/
 ├── assets/
 │   ├── kimi-usage-widget.js    # 侧栏卡片+大屏+模型弹窗（唯一注入脚本）
 │   └── kimi-usage.json         # 最新报表副本（Skill 可读）
-├── commands/                   # /kimi-code-usage:usage|cache|panel|models
+├── commands/                   # /kimi-code-usage:usage|cache|panel|models|start|update
 ├── scripts/
 │   ├── bootstrap.cmd           # 唯一 hook 入口（找 Python → service.py --tick）
 │   ├── service.py              # 常驻服务：采集+注入+API+额度轮询+旧套件迁移
+│   ├── updater.py              # 自更新助手（等退出→覆盖文件→重拉服务）
 │   └── scanner.py              # wire.jsonl 增量扫描器 + 状态持久化
 └── skills/kimi-code-usage/     # 用量解读 Skill
 ```

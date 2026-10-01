@@ -502,7 +502,7 @@ class UsageScanner(object):
             self._offsets.update(st.get('offsets') or {})
             if st.get('all'):
                 self._agg.all.update({k: v for k, v in st['all'].items() if k in self._agg.all})
-            if st.get('today_key') == _day_key():
+            if st.get('today_key') == _day_key(int(time.time() * 1000)):
                 if st.get('today'):
                     self._agg.today.update({k: v for k, v in st['today'].items() if k in self._agg.today})
                 for m, b in (st.get('models_today') or {}).items():

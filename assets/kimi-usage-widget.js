@@ -59,6 +59,8 @@
   let kupWavePeriod = 'week';
   let kupModelTab = 'today';
   let kupTheme = 'dark';
+  let kupUpdateInfo = null;   // {current, latest, update, error}
+  let kupUpdating = false;
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -1691,6 +1693,7 @@
               <span>⚡ Kimi Code 用量面板</span>
             </div>
             <div class="kup-head-tools">
+              <button class="kup-btn" id="kup-update-btn">更新</button>
               <button class="kup-btn" id="kup-theme-btn">切换主题</button>
               <button class="kup-btn kup-btn-primary" id="kup-refresh-btn">刷新</button>
               <button class="kup-close" id="kup-close">&times;</button>
@@ -1792,7 +1795,9 @@
         reloadDataScript();
         fetchData();
         probeService();
+        kupCheckUpdate(true);
       };
+      modal.querySelector('#kup-update-btn').onclick = kupUpdateClick;
       modal.querySelectorAll('#kup-wave-tabs .kup-tab').forEach(function(t) {
         t.onclick = function() { kupSelectWavePeriod(t.getAttribute('data-period')); };
       });
@@ -1803,6 +1808,87 @@
     }
     modal.classList.add('active');
     kupRenderAll();
+    if (kupUpdateInfo === null) kupCheckUpdate(true);
+  }
+
+  /* ================================================================
+   * 自更新（检查 GitHub 新版本 → 一键更新 → 服务自动重启）
+   * ================================================================ */
+  function kupUpdateBadge() {
+    var btn = document.getElementById('kup-update-btn');
+    if (!btn) return;
+    if (kupUpdating) { btn.textContent = '更新中…'; btn.style.color = ''; return; }
+    if (kupUpdateInfo && kupUpdateInfo.update) {
+      btn.textContent = '⬆ 更新 v' + kupUpdateInfo.latest;
+      btn.style.color = 'var(--color-accent, #1a88ff)';
+      btn.style.borderColor = 'var(--color-accent, #1a88ff)';
+    } else {
+      btn.textContent = '更新';
+      btn.style.color = '';
+      btn.style.borderColor = '';
+    }
+  }
+
+  function kupCheckUpdate(silent) {
+    return fetch(API_BASE + '/api/update/check', { cache: 'no-store' })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        kupUpdateInfo = d;
+        kupUpdateBadge();
+        if (!silent) {
+          if (d.error) kmmToast('检查更新失败：' + d.error, true);
+          else if (d.update) kmmToast('发现新版本 v' + d.latest + '（当前 v' + d.current + '），点「更新」一键升级');
+          else kmmToast('已是最新版本 v' + d.current);
+        }
+        return d;
+      })
+      .catch(function() { if (!silent) kmmToast('检查更新失败：后台服务未响应', true); });
+  }
+
+  function kupUpdateClick() {
+    if (kupUpdating) return;
+    var go = function() {
+      kupUpdating = true;
+      kupUpdateBadge();
+      fetch(API_BASE + '/api/update/apply', { method: 'POST' })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          if (d.success && d.latest) {
+            kmmToast('正在更新到 v' + d.latest + '，服务重启中…');
+          } else {
+            kmmToast(d.message || '更新失败', !d.success);
+          }
+          if (!(d.success && d.latest)) { kupUpdating = false; kupUpdateBadge(); }
+        })
+        .catch(function() {
+          // 服务重启时连接被重置属正常——更新大概率已在进行
+          kmmToast('服务重启中，稍后自动恢复');
+        });
+      // 更新完成后旧按钮状态失效，等下次探活回来再复位
+      setTimeout(function() {
+        kupUpdating = false;
+        kupUpdateInfo = null;
+        kupUpdateBadge();
+        kupCheckUpdate(true);
+      }, 20000);
+    };
+    if (kupUpdateInfo === null) {
+      kupCheckUpdate(true).then(function(d) {
+        if (d && d.update) { if (confirm('发现新版本 v' + d.latest + '（当前 v' + d.current + '），立即更新？服务会自动重启。')) go(); }
+        else if (d && d.error) kmmToast('检查更新失败：' + d.error, true);
+        else if (d) kmmToast('已是最新版本 v' + d.current);
+      });
+      return;
+    }
+    if (kupUpdateInfo.update) {
+      if (confirm('更新到 v' + kupUpdateInfo.latest + '？服务会自动重启，几秒钟后恢复。')) go();
+    } else if (kupUpdateInfo.error) {
+      kmmToast('检查更新失败：' + kupUpdateInfo.error, true);
+      kupUpdateInfo = null;
+    } else {
+      kmmToast('已是最新版本 v' + kupUpdateInfo.current);
+      kupCheckUpdate(true);
+    }
   }
 
   /* ================================================================
@@ -2439,5 +2525,5 @@
   setInterval(heartbeatCheck, 3000);
   setInterval(probeService, 10000);
 
-  console.log('Kimi Code 用量一体化组件 v3.0 已初始化');
+  console.log('Kimi Code 用量一体化组件 v3.1 已初始化');
 })();

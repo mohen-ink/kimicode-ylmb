@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -43,6 +44,23 @@ LOG_FILE = os.path.join(SCRIPT_DIR, 'service.log')
 
 WIDGET_SRC = os.path.join(ASSETS_SRC, 'kimi-usage-widget.js')
 PRICING_PATH = os.path.join(KIMI_HOME, 'usage-dashboard', 'pricing.json')
+
+# 自更新源：GitHub 仓库（改源只需改这一行）
+UPDATE_REPO = 'ziyiclouds-blip/kimicode-ylmb'
+UPDATE_BRANCH = 'main'
+UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/%s/%s/kimi.plugin.json' % (UPDATE_REPO, UPDATE_BRANCH)
+UPDATE_ZIP_URL = 'https://codeload.github.com/%s/zip/refs/heads/%s' % (UPDATE_REPO, UPDATE_BRANCH)
+
+
+def plugin_version():
+    try:
+        with open(os.path.join(PLUGIN_ROOT, 'kimi.plugin.json'), encoding='utf-8') as f:
+            return str(json.load(f).get('version') or '0.0.0')
+    except Exception:
+        return '0.0.0'
+
+
+PLUGIN_VERSION = plugin_version()
 
 
 def load_pricing():
@@ -815,6 +833,75 @@ def auto_enable_all_in_text(content):
     return cur
 
 
+# ---------------- 自更新 ----------------
+_UPDATE_CACHE = {'t': 0.0, 'data': None}
+
+
+def _semver(v):
+    parts = []
+    for x in re.split(r'[^\d]+', str(v or '')):
+        if x.isdigit():
+            parts.append(int(x))
+    return tuple(parts or [0])
+
+
+def check_update(force=False):
+    """对比 GitHub 清单版本，5 分钟内存缓存。返回 {current, latest, update, error}。"""
+    now = time.time()
+    if not force and _UPDATE_CACHE['data'] is not None and now - _UPDATE_CACHE['t'] < 300:
+        return _UPDATE_CACHE['data']
+    out = {'current': PLUGIN_VERSION, 'latest': None, 'update': False,
+           'repo': 'https://github.com/%s' % UPDATE_REPO, 'error': None}
+    try:
+        req = urllib.request.Request(UPDATE_MANIFEST_URL,
+                                     headers={'User-Agent': 'kimi-code-usage/%s' % PLUGIN_VERSION})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            d = json.loads(r.read().decode('utf-8'))
+        latest = str(d.get('version') or '')
+        out['latest'] = latest
+        out['update'] = _semver(latest) > _semver(PLUGIN_VERSION)
+    except Exception as e:
+        out['error'] = '%r' % e
+    _UPDATE_CACHE['t'] = now
+    _UPDATE_CACHE['data'] = out
+    return out
+
+
+def apply_update():
+    """下载新版 zip → 拉起 updater.py 守护进程 → 安排本进程退出（updater 会重新拉起）。"""
+    try:
+        req = urllib.request.Request(UPDATE_ZIP_URL,
+                                     headers={'User-Agent': 'kimi-code-usage/%s' % PLUGIN_VERSION})
+        fd, zip_path = tempfile.mkstemp(prefix='kimi-usage-update-', suffix='.zip')
+        try:
+            with os.fdopen(fd, 'wb') as f, urllib.request.urlopen(req, timeout=30) as r:
+                shutil.copyfileobj(r, f)
+        except Exception:
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+            raise
+        py = sys.executable
+        cand = os.path.join(os.path.dirname(py), 'pythonw.exe')
+        if os.path.exists(cand):
+            py = cand
+        flags = 0
+        if os.name == 'nt':
+            flags = getattr(subprocess, 'DETACHED_PROCESS', 0x00000008) | getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+        subprocess.Popen([py, os.path.join(SCRIPT_DIR, 'updater.py'), PLUGIN_ROOT, zip_path],
+                         cwd=PLUGIN_ROOT, creationflags=flags,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, close_fds=True)
+        log('updater spawned, scheduling self-exit for update')
+        # 让 HTTP 响应先发出去再退出
+        threading.Timer(0.8, os._exit, args=(0,)).start()
+        return True, '更新包已下载，服务正在重启…'
+    except Exception as e:
+        log('apply_update failed: %r' % e)
+        return False, '更新失败：%r' % e
+
+
 # ---------------- HTTP API ----------------
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -844,7 +931,9 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split('?')[0]
         if path in ('/api/status', '/api/health'):
             self._json({'status': 'ok', 'name': 'kimi-code-usage', 'port': PORT,
-                        'pid': os.getpid(), 'version': '3.0.0'})
+                        'pid': os.getpid(), 'version': PLUGIN_VERSION})
+        elif path == '/api/update/check':
+            self._json(check_update(force='force' in self.path))
         elif path in ('/api/usage', '/api/dashboard'):
             self._json(LATEST_DATA or collect_once() or {})
         elif path == '/api/quota':
@@ -948,6 +1037,17 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/auto-enable-all':
                 ok, msg = safe_apply_config(auto_enable_all_in_text(get_config_content()))
                 return self._json({'success': ok, 'message': msg}, 200 if ok else 400)
+
+            if path == '/api/update/apply':
+                chk = check_update(force=True)
+                if chk.get('error'):
+                    return self._json({'success': False, 'message': '检查更新失败：%s' % chk['error']}, 502)
+                if not chk.get('update'):
+                    return self._json({'success': True, 'message': '已是最新版本 v%s' % PLUGIN_VERSION,
+                                       'current': PLUGIN_VERSION})
+                ok, msg = apply_update()
+                d = {'success': ok, 'message': msg, 'current': PLUGIN_VERSION, 'latest': chk.get('latest')}
+                return self._json(d, 200 if ok else 500)
         except Exception as e:
             return self._json({'success': False, 'message': '处理异常：%r' % e}, 500)
 
