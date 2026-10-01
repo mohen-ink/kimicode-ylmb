@@ -1,0 +1,1164 @@
+# -*- coding: utf-8 -*-
+"""
+Kimi Code 用量面板 · 本地服务（单进程）
+
+职责：
+  1. 后台扫描 wire.jsonl → 聚合 今日/昨日/本周/本月/累计/逐日/逐时/会话/模型
+  2. 每 2s 产出同源数据文件写进桌面端 desktop-dist：
+       assets/kimi-usage-data.js  (window.__KIMI_DATA__，侧栏卡片瞬时加载)
+       assets/kimi-usage-widget.js (侧栏卡片本体，自愈看护)
+       kimi-usage.json            (面板/Skill/命令可读的报表数据)
+  3. 看护 index.html 注入点（桌面端更新覆盖后自动重注入，清理旧套件残留注入）
+  4. HTTP API :39281 模型能力管理（config.toml 安全改写：备份+kimi doctor 校验）
+  5. --tick      : hook 调用入口——确保服务在跑、跑一次采集、注入检查，然后退出
+     --once      : 只采集+写文件，不常驻（无服务时的降级刷新）
+     无参数      : 常驻服务
+
+启动链：kimi.plugin.json hooks → scripts/bootstrap.cmd → service.py
+（桌面端无需任何开机自启/桌面脚本；服务随会话心跳拉起，随客户端退出自然闲置）
+"""
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = 39281
+PLUGIN_ROOT = os.environ.get('KIMI_PLUGIN_ROOT') or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSETS_SRC = os.path.join(PLUGIN_ROOT, 'assets')
+HOME = os.path.expanduser('~')
+KIMI_HOME = os.path.join(HOME, '.kimi-code')
+CONFIG_PATH = os.path.join(KIMI_HOME, 'config.toml')
+CONFIG_NEW_PATH = os.path.join(KIMI_HOME, 'config-new.toml')
+STATE_FILE = os.path.join(KIMI_HOME, 'usage-collector-state.json')
+LOG_FILE = os.path.join(SCRIPT_DIR, 'service.log')
+
+WIDGET_SRC = os.path.join(ASSETS_SRC, 'kimi-usage-widget.js')
+PRICING_PATH = os.path.join(KIMI_HOME, 'usage-dashboard', 'pricing.json')
+
+
+def load_pricing():
+    try:
+        with open(PRICING_PATH, encoding='utf-8') as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_pricing(alias, entry):
+    m = load_pricing()
+    if entry is None:
+        m.pop(alias, None)
+    else:
+        m[alias] = entry
+    os.makedirs(os.path.dirname(PRICING_PATH), exist_ok=True)
+    safe_write(PRICING_PATH, json.dumps(m, ensure_ascii=False, indent=2))
+
+sys.path.insert(0, SCRIPT_DIR)
+import scanner  # noqa: E402
+
+
+def log(msg):
+    try:
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write('[%s] %s\n' % (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), msg))
+    except Exception:
+        pass
+
+
+# ---------------- desktop-dist 定位 ----------------
+def get_dist_dir():
+    cfg = os.path.join(SCRIPT_DIR, 'desktop_path.txt')
+    try:
+        if os.path.exists(cfg):
+            p = open(cfg, encoding='utf-8').read().strip().strip('"').strip("'")
+            if os.path.isdir(p):
+                return p
+    except Exception:
+        pass
+    candidates = [
+        os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs', 'Kimi Code', 'resources', 'desktop-dist'),
+        r'C:\Program Files\Kimi Code\resources\desktop-dist',
+        r'C:\Program Files (x86)\Kimi Code\resources\desktop-dist',
+    ]
+    for c in candidates:
+        if c and os.path.isdir(c):
+            return c
+    return ''
+
+
+DIST_DIR = ''
+DIST_ASSETS = ''
+INDEX_HTML = ''
+
+
+def refresh_dist_paths():
+    global DIST_DIR, DIST_ASSETS, INDEX_HTML
+    DIST_DIR = get_dist_dir()
+    DIST_ASSETS = os.path.join(DIST_DIR, 'assets') if DIST_DIR else ''
+    INDEX_HTML = os.path.join(DIST_DIR, 'index.html') if DIST_DIR else ''
+
+
+refresh_dist_paths()
+
+# ---------------- 旧套件迁移 ----------------
+LEGACY_DIR = os.path.join(KIMI_HOME, 'model-manager')
+LEGACY_TAG = os.path.join(KIMI_HOME, 'usage-dashboard', 'legacy-migrated.flag')
+
+
+def _kill_legacy_processes():
+    """无条件清掉旧 model-manager 的 supervisor/server（幂等，flag 后每次也跑，防 supervisor 复活）。"""
+    try:
+        subprocess.run([
+            'powershell', '-NoProfile', '-Command',
+            "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'model-manager.*(supervisor|server)\\.py' }"
+            " | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+        ], capture_output=True, timeout=20)
+    except Exception:
+        pass
+
+
+def kill_port_owner():
+    """端口被占且不是我们的服务时，按 PID 杀掉占用者。
+    安全阀：占用者进程命令行含本插件 service.py 时绝不杀（防并发 tick 误杀刚拉起的 daemon）。"""
+    if port_is_ours():
+        return
+    try:
+        out = subprocess.run(
+            ['netstat', '-ano', '-p', 'tcp'],
+            capture_output=True, text=True, timeout=15).stdout or ''
+        pids = []
+        for line in out.splitlines():
+            parts = line.split()
+            if (len(parts) >= 5 and parts[1].endswith(':%d' % PORT)
+                    and parts[3].upper().startswith('LISTEN')):
+                pids.append(parts[4])
+        for pid in set(pids):
+            try:
+                q = subprocess.run([
+                    'powershell', '-NoProfile', '-Command',
+                    "(Get-CimInstance Win32_Process -Filter 'ProcessId=%s').CommandLine" % pid
+                ], capture_output=True, text=True, timeout=15)
+                cl = (q.stdout or '').strip()
+                if 'service.py' in cl and ('kimi-code-usage' in cl or 'kimi-code' in cl):
+                    log('skip kill pid %s: looks like our own service (%s)' % (pid, cl[:120]))
+                    continue
+                subprocess.run(['taskkill', '/PID', pid, '/F'],
+                               capture_output=True, timeout=10)
+                log('killed foreign listener on %d (pid %s)' % (PORT, pid))
+            except Exception:
+                pass
+    except Exception as e:
+        log('kill_port_owner error: %r' % e)
+
+
+def spawn_lock():
+    """拉起 daemon 前互相让行：lock 文件新于 12s 视为有进程正在拉起，直接返回 False。"""
+    lock = os.path.join(KIMI_HOME, 'usage-dashboard', 'spawn.lock')
+    try:
+        os.makedirs(os.path.dirname(lock), exist_ok=True)
+        try:
+            st = os.stat(lock)
+            if time.time() - st.st_mtime < 12:
+                return False
+        except OSError:
+            pass
+        with open(lock, 'w') as f:
+            f.write(str(os.getpid()))
+        return True
+    except Exception:
+        return True
+
+
+def migrate_legacy():
+    """接管 39281：停掉旧 model-manager 守护/服务、摘除其开机自启与 index.html 旧注入。
+    flag 只标记"一次性清理"做过；杀旧进程的动作每次都会跑（supervisor 会复活 server）。"""
+    _kill_legacy_processes()
+    try:
+        if os.path.exists(LEGACY_TAG):
+            return
+        if not os.path.exists(LEGACY_DIR):
+            os.makedirs(os.path.dirname(LEGACY_TAG), exist_ok=True)
+            with open(LEGACY_TAG, 'w') as f:
+                f.write(datetime.now().isoformat())
+            return
+        # 摘自启：Startup 目录 + Run 键
+        startup = os.path.join(os.environ.get('APPDATA', ''),
+                               'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
+        for f in ('KimiModelManager.vbs',):
+            p = os.path.join(startup, f)
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        subprocess.run(['reg', 'delete', r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
+                        '/v', 'KimiCodePlugin', '/f'], capture_output=True, timeout=10)
+        # 摘除 index.html 中的旧注入标签
+        if INDEX_HTML and os.path.exists(INDEX_HTML):
+            strip_legacy_injections()
+        os.makedirs(os.path.dirname(LEGACY_TAG), exist_ok=True)
+        with open(LEGACY_TAG, 'w') as f:
+            f.write(datetime.now().isoformat())
+        log('legacy model-manager migrated')
+    except Exception as e:
+        log('migrate_legacy error: %r' % e)
+
+
+# 注入标签统一由 ensure_injection/_INJECT_RE 管理（widget 带 ?v=mtime 版本号）
+_INJECT_RE = re.compile(r'\s*<script src="/assets/kimi-(embedded|usage)-(data|widget)\.js[^"]*"></script>\s*')
+
+
+def strip_legacy_injections():
+    try:
+        html = io.open(INDEX_HTML, encoding='utf-8').read()
+        new_html = _INJECT_RE.sub('\n', html)
+        if new_html != html:
+            io.open(INDEX_HTML, 'w', encoding='utf-8').write(new_html)
+    except Exception:
+        pass
+
+
+def _widget_tag():
+    """带 mtime 版本号的注入标签——浏览器/Electron 会缓存无参数 script URL，
+    不加版本号时 widget 更新后用户仍看到旧 UI（如缺价格按钮）。"""
+    try:
+        v = int(os.path.getmtime(WIDGET_SRC))
+    except OSError:
+        v = 0
+    return '<script src="/assets/kimi-usage-widget.js?v=%d"></script>' % v
+
+
+def ensure_injection():
+    """自愈：index.html 缺注入标签就补；清掉旧注入与带 ?v= 的重复标签。"""
+    if not INDEX_HTML or not os.path.exists(INDEX_HTML):
+        return
+    try:
+        html = io.open(INDEX_HTML, encoding='utf-8').read()
+        new_html = _INJECT_RE.sub('\n', html)
+        data_tag = '<script src="/assets/kimi-usage-data.js"></script>'
+        widget_tag = _widget_tag()
+        block = '  %s\n  %s\n' % (data_tag, widget_tag)
+        if '</body>' in new_html:
+            new_html = new_html.replace('</body>', block + '  </body>')
+        else:
+            new_html += '\n' + block
+        if new_html != html:
+            io.open(INDEX_HTML, 'w', encoding='utf-8').write(new_html)
+    except Exception:
+        pass
+
+
+def sync_widget_asset():
+    """把插件内的侧栏卡片 JS 同步到 desktop-dist/assets（自愈看护）。"""
+    if not DIST_ASSETS or not os.path.exists(WIDGET_SRC):
+        return
+    dest = os.path.join(DIST_ASSETS, 'kimi-usage-widget.js')
+    try:
+        if (not os.path.exists(dest)
+                or os.path.getsize(dest) != os.path.getsize(WIDGET_SRC)):
+            os.makedirs(DIST_ASSETS, exist_ok=True)
+            shutil.copy2(WIDGET_SRC, dest)
+    except Exception:
+        pass
+
+
+# ---------------- 数据产出 ----------------
+def _fmt_tokens(n):
+    n = int(n)
+    if n >= 1e9:
+        return '%.1fB' % (n / 1e9)
+    if n >= 1e6:
+        return '%.1fM' % (n / 1e6)
+    if n >= 1e3:
+        return '%.1fK' % (n / 1e3)
+    return str(n)
+
+
+def _fmt_cost(c):
+    if c >= 1000:
+        return '¥%.1fk' % (c / 1000.0)
+    if c >= 100:
+        return '¥%.0f' % c
+    if c >= 1:
+        return '¥%.1f' % c
+    return '¥%.2f' % c
+
+
+def _bucket_json(b, date='', cost=None):
+    tokens = int(b.get('tokens', 0))
+    cost = round(cost if cost is not None else b.get('cost', 0.0), 1)
+    return {
+        'tokens': tokens, 'tokens_fmt': _fmt_tokens(tokens),
+        'cost': cost, 'cost_fmt': _fmt_cost(cost),
+        'calls': int(b.get('records', 0)),
+        'in': int(b.get('input', 0)), 'in_fmt': _fmt_tokens(b.get('input', 0)),
+        'out': int(b.get('output', 0)), 'out_fmt': _fmt_tokens(b.get('output', 0)),
+        'cache_pct': round(_hit(b) * 100, 1),
+        'date': date,
+    }
+
+
+def _hit(b):
+    inp = b.get('input', 0)
+    return (b.get('cache_read', 0) / inp) if inp else 0.0
+
+
+def _range_sum(daily, start_key, end_key):
+    b = {'tokens': 0, 'cost': 0.0, 'input': 0, 'output': 0,
+         'cache_read': 0, 'cache_create': 0, 'records': 0}
+    for k, cell in daily.items():
+        if start_key <= k <= end_key:
+            for f in b:
+                b[f] += cell.get(f, 0)
+    return b
+
+
+def _models_in_range(daily_models, start_key, end_key):
+    """某日期区间内的按模型聚合桶 {model: bucket}。"""
+    acc = {}
+    for k, mdict in daily_models.items():
+        if not (start_key <= k <= end_key):
+            continue
+        for m, b in mdict.items():
+            a = acc.setdefault(m, {'tokens': 0, 'cost': 0.0, 'input': 0, 'output': 0,
+                                   'cache_read': 0, 'cache_create': 0, 'records': 0})
+            for f in a:
+                a[f] += b.get(f, 0)
+    return acc
+
+
+def _buckets_cost(mdict):
+    """按当前计价重算一组模型桶的总成本（改价即时生效）。"""
+    try:
+        return sum(scanner.priced_cost(m, b) for m, b in mdict.items())
+    except Exception:
+        return sum(b.get('cost', 0.0) for b in mdict.values())
+
+
+def _model_rows(rows):
+    out = []
+    for r in rows:
+        try:
+            cost = scanner.priced_cost(r['model'], r)
+        except Exception:
+            cost = r.get('cost', 0.0)
+        out.append({
+            'model': r['model'], 'tokens': r['tokens'], 'tokens_fmt': _fmt_tokens(r['tokens']),
+            'calls': r.get('calls', r.get('records', 0)),
+            'cache_pct': round(r.get('hit', 0.0) * 100, 1),
+            'cost': round(cost, 1), 'cost_fmt': _fmt_cost(cost),
+            'input': int(r.get('input', 0)), 'output': int(r.get('output', 0)),
+            'in_fmt': _fmt_tokens(r.get('input', 0)), 'out_fmt': _fmt_tokens(r.get('output', 0)),
+        })
+    return out
+
+
+def _model_rows_from_buckets(mdict):
+    rows = [dict(b, model=m, hit=_hit(b)) for m, b in mdict.items()]
+    rows.sort(key=lambda r: -r['tokens'])
+    return _model_rows(rows)
+
+
+def _session_rows(rows):
+    out = []
+    for r in rows[:8]:
+        key = r['key']
+        short = key.replace('session_', '')[:8] or key[:8]
+        out.append({
+            'key': key, 'short': short,
+            'tokens': r['tokens'], 'tokens_fmt': _fmt_tokens(r['tokens']),
+            'calls': r.get('records', 0), 'cache_pct': round(r['hit'] * 100, 1),
+            'cost': round(r['cost'], 1), 'cost_fmt': _fmt_cost(r['cost']),
+            'last': r.get('last', 0),
+        })
+    return out
+
+
+def _quota_json(official):
+    """官方额度 + 配速（已用% ÷ 窗口已过%）。"""
+    if not official:
+        return None
+    now = time.time()
+    out = {}
+
+    def fill(name, used, limit, reset):
+        if not limit:
+            return
+        frac_used = used / limit
+        frac_elapsed = None
+        eta = ''
+        try:
+            rt = datetime.strptime(reset[:19].replace('T', ' '), '%Y-%m-%d %H:%M:%S')
+            import time as _t
+            reset_ts = _t.mktime(rt.timetuple())
+            span = 7 * 86400 if name == 'week' else 300
+            start_ts = reset_ts - span
+            if start_ts < now < reset_ts:
+                frac_elapsed = (now - start_ts) / span
+                if frac_used > 0 and frac_elapsed and frac_used / frac_elapsed > 0:
+                    eta_ts = now + (1 - frac_used) / (frac_used / (now - start_ts))
+                    eta = datetime.fromtimestamp(eta_ts).strftime('%m-%d %H:%M')
+        except Exception:
+            frac_elapsed = None
+        pace = (frac_used / frac_elapsed) if frac_elapsed else None
+        out[name] = {
+            'used': used, 'limit': limit,
+            'pct': round(frac_used * 100, 1),
+            'reset': reset,
+            'pace': round(pace, 2) if pace is not None else None,
+            'eta': eta,
+        }
+
+    fill('week', official.get('wk_used'), official.get('wk_limit'), official.get('wk_reset', ''))
+    fill('h5', official.get('h5_used'), official.get('h5_limit'), official.get('h5_reset', ''))
+    out['ts'] = official.get('ts')
+    return out or None
+
+
+def build_dashboard(snap, official):
+    """kimi-usage.json 全量内容（旧 schema 超集）。"""
+    now = datetime.now()
+    today_key = now.strftime('%Y-%m-%d')
+    yday_key = (datetime.fromtimestamp(now.timestamp() - 86400)).strftime('%Y-%m-%d')
+    daily = snap['daily'] or {}
+    daily_models = snap.get('daily_models') or {}
+
+    def row_bag(rows):
+        return {r['model']: r for r in rows}
+
+    # 各周期成本按当前计价从分模型桶重算（改价即时生效）；无分模型数据退回桶内 cost
+    ydm = daily_models.get(yday_key) or {}
+    today = _bucket_json(snap['today'], today_key,
+                         cost=_buckets_cost(row_bag(snap['models_today'])))
+    yesterday = _bucket_json(daily.get(yday_key) or {}, yday_key,
+                             cost=_buckets_cost(ydm))
+
+    dow = now.isoweekday()          # 1=周一
+    wk_start = (datetime.fromtimestamp(now.timestamp() - (dow - 1) * 86400)).strftime('%Y-%m-%d')
+    wm = _models_in_range(daily_models, wk_start, today_key)
+    week = _bucket_json(_range_sum(daily, wk_start, today_key), wk_start,
+                        cost=_buckets_cost(wm))
+    mo_start = now.strftime('%Y-%m-01')
+    mm = _models_in_range(daily_models, mo_start, today_key)
+    month = _bucket_json(_range_sum(daily, mo_start, today_key), mo_start,
+                         cost=_buckets_cost(mm))
+    cumul = _bucket_json(snap['all'],
+                         cost=_buckets_cost(row_bag(snap['models_all'])))
+
+    today['models'] = _model_rows(snap['models_today'])
+    yesterday['models'] = _model_rows_from_buckets(ydm)
+    week['models'] = _model_rows_from_buckets(wm)
+    month['models'] = _model_rows_from_buckets(mm)
+
+    burn = snap['burn']
+    cur = snap['cur']
+    sess = snap['session'] or {}
+    quota = _quota_json(official)
+
+    days30 = []
+    for i in range(29, -1, -1):
+        d = datetime.fromtimestamp(now.timestamp() - i * 86400)
+        k = d.strftime('%Y-%m-%d')
+        cell = daily.get(k) or {}
+        tk = int(cell.get('tokens', 0))
+        dmk = daily_models.get(k)
+        dcost = _buckets_cost(dmk) if dmk is not None else cell.get('cost', 0.0)
+        days30.append({
+            'label': d.strftime('%m-%d'), 'date': k, 'tokens': tk,
+            'tokens_fmt': _fmt_tokens(tk), 'calls': int(cell.get('records', 0)),
+            'cost': round(dcost, 1),
+        })
+
+    hourly_rows = []
+    for h, (tok, calls) in enumerate(snap['hourly_today']):
+        hourly_rows.append({'hour': h, 'tokens': int(tok), 'calls': int(calls),
+                            'tokens_fmt': _fmt_tokens(tok)})
+
+    # 时间序列点：今日按小时、本周按日、本月按日
+    ts_today = [{'label': '%02d' % r['hour'], 'tokens': r['tokens'], 'calls': r['calls']}
+                for r in hourly_rows]
+    ts_week = [{'label': d['label'], 'tokens': d['tokens'], 'calls': d['calls']} for d in days30[-7:]]
+    ts_month = [{'label': d['label'], 'tokens': d['tokens'], 'calls': d['calls']} for d in days30]
+
+    header_tokens = today['tokens_fmt']
+    return {
+        'updated_at': now.strftime('%Y-%m-%d %H:%M:%S'),
+        'header': {
+            'tokens_fmt': header_tokens, 'cost_fmt': today['cost_fmt'],
+            'cache_pct': '%.0f%%' % today['cache_pct'],
+            'speed_tps': '%d t/s' % round(snap['tps']),
+        },
+        'today': today, 'yesterday': yesterday, 'week': week, 'month': month,
+        'cumul': cumul,
+        'rate': {
+            'tokens_per_hour': _fmt_tokens(burn['tokens']) + '/h',
+            'cost_per_hour': _fmt_cost(burn['cost']) + '/h',
+            'window': '近60分钟',
+        },
+        'cache': {'pct': cumul['cache_pct'], 'pct_fmt': '%.0f%%' % cumul['cache_pct']},
+        'speed': {'tps': '%d t/s' % round(snap['tps']), 'model': snap['tps_model'] or '--',
+                  'avg_tps': '%d t/s' % round(snap['avg_tps'])},
+        'cur': {
+            'alias': cur.get('alias') or cur.get('model') or '--',
+            'model': cur.get('model') or '',
+            'effort': cur.get('effort') or '',
+            'session': cur.get('session') or '',
+            'sub_agent': cur.get('sub_agent') or '',
+        },
+        'session': ({
+            'key': sess.get('key', ''), 'tokens_fmt': _fmt_tokens(sess.get('tokens', 0)),
+            'calls': sess.get('records', 0), 'cache_pct': round(sess.get('hit', 0) * 100, 1),
+            'cost_fmt': _fmt_cost(sess.get('cost', 0.0)),
+        } if sess else None),
+        'quota': quota,
+        'days30': days30,
+        'hourly': hourly_rows,
+        'timeseries': {
+            'today': {'points': ts_today},
+            'week': {'points': ts_week},
+            'month': {'points': ts_month},
+        },
+        'today_models': _model_rows(snap['models_today']),
+        'cumul_models': _model_rows(snap['models_all']),
+        'sessions': _session_rows(snap['sessions']),
+        'footer': {'file_count': snap['files'], 'session_count': len(snap['sessions']),
+                   'time': now.strftime('%H:%M:%S')},
+    }
+
+
+def safe_write(path, text):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(text)
+        for _ in range(2):
+            try:
+                os.replace(tmp, path)
+                break
+            except OSError:
+                time.sleep(0.05)
+    except Exception:
+        pass
+
+
+SCANNER = None
+LATEST_OFFICIAL = None
+LATEST_DATA = {}
+STATE_DIRTY = {'v': False}
+
+
+def collect_once():
+    """跑一次完整采集+落盘（供 --once / tick / 常驻循环共用）。"""
+    global LATEST_DATA
+    refresh_dist_paths()
+    mdata = get_models_data()
+    # 别名→裸 model id 映射喂给 scanner，让按别名存的价格能对上 wire 日志里的 model id
+    amap = {}
+    for mi in mdata.get('models', []):
+        mid = mi.get('model') or ''
+        if mid:
+            amap.setdefault(mid, []).append(mi.get('alias') or '')
+    try:
+        scanner.MODEL_ALIASES = amap
+    except Exception:
+        pass
+    if SCANNER is None:
+        return
+    SCANNER.scan_once()
+    snap = SCANNER.snapshot()
+    dash = build_dashboard(snap, LATEST_OFFICIAL)
+    LATEST_DATA = dash
+
+    if DIST_DIR:
+        safe_write(os.path.join(DIST_DIR, 'kimi-usage.json'),
+                   json.dumps(dash, ensure_ascii=False))
+    # 插件内保留一份副本（Skill/命令可读）
+    try:
+        safe_write(os.path.join(PLUGIN_ROOT, 'assets', 'kimi-usage.json'),
+                   json.dumps(dash, ensure_ascii=False))
+    except Exception:
+        pass
+
+    if DIST_ASSETS:
+        js = ('// Kimi Code Auto-generated Data Cache\n'
+              'window.__KIMI_DATA__ = %s;\n'
+              'if (typeof window.__KMM_ON_DATA_UPDATE__ === "function") {'
+              ' try { window.__KMM_ON_DATA_UPDATE__(window.__KIMI_DATA__); } catch(e) {} }\n'
+              % json.dumps({'usage': dash, 'models': mdata,
+                            'service': service_alive_flag(),
+                            'time': int(time.time() * 1000)}, ensure_ascii=False))
+        # 侧栏卡片轮询 embedded-data.js；usage-data.js 为 index.html 注入点，两份同源
+        safe_write(os.path.join(DIST_ASSETS, 'kimi-usage-data.js'), js)
+        safe_write(os.path.join(DIST_ASSETS, 'kimi-embedded-data.js'), js)
+
+    STATE_DIRTY['v'] = True
+    return dash
+
+
+def service_alive_flag():
+    return {'port': PORT, 'pid': os.getpid(),
+            'api': 'http://127.0.0.1:%d/api/status' % PORT}
+
+
+# ---------------- config.toml 读写（模型管理） ----------------
+def _load_toml(content):
+    try:
+        import tomllib  # py3.11+
+        return tomllib.loads(content)
+    except Exception:
+        pass
+    try:
+        import toml
+        return toml.loads(content)
+    except Exception:
+        return _mini_toml(content)
+
+
+def _mini_toml(content):
+    """极简 TOML 兜底解析：只够 [models.*]/[providers.*] 读字段。"""
+    data = {}
+    section = []
+    for raw in content.split('\n'):
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('[') and line.endswith(']'):
+            name = line.strip('[] ')
+            parts = [p.strip().strip('"') for p in re.split(r'\.(?=(?:[^"]*"[^"]*")*[^"]*$)', name)]
+            section = parts
+            d = data
+            for p in parts:
+                d = d.setdefault(p, {})
+            continue
+        if '=' in line:
+            k, _, v = line.partition('=')
+            k = k.strip().strip('"')
+            v = v.strip()
+            d = data
+            for p in section:
+                d = d.setdefault(p, {})
+            d[k] = _mini_val(v)
+    return data
+
+
+def _mini_val(v):
+    if v.startswith('"') and v.endswith('"'):
+        return v[1:-1]
+    if v.startswith('['):
+        inner = v.strip('[] ')
+        return [x.strip().strip('"') for x in inner.split(',') if x.strip()]
+    if v in ('true', 'false'):
+        return v == 'true'
+    try:
+        return int(v)
+    except ValueError:
+        try:
+            return float(v)
+        except ValueError:
+            return v
+
+
+def get_config_content():
+    if not os.path.exists(CONFIG_PATH):
+        return ''
+    with open(CONFIG_PATH, 'rb') as f:
+        return f.read().decode('utf-8', errors='replace')
+
+
+def get_models_data():
+    content = get_config_content()
+    data = _load_toml(content) or {}
+    default_model = data.get('default_model', '')
+    providers = data.get('providers', {}) or {}
+    thinking_cfg = data.get('thinking', {}) or {}
+    pricing = load_pricing()
+    models = []
+    for alias, m in (data.get('models', {}) or {}).items():
+        caps = m.get('capabilities', []) or []
+        prov = m.get('provider', '')
+        prov_type = (providers.get(prov, {}) or {}).get('type', '')
+        adaptive = bool(m.get('adaptive_thinking'))
+        efforts = m.get('support_efforts', []) or []
+        if not efforts and ('thinking' in caps or adaptive):
+            # adaptive_thinking（Claude 系）与显式 thinking 模型：官方选择器档位 low..max
+            efforts = ['low', 'medium', 'high', 'xhigh', 'max']
+        models.append({
+            'alias': alias,
+            'provider': prov,
+            'provider_type': prov_type,
+            'model': m.get('model', ''),
+            'display_name': m.get('display_name', alias),
+            'max_context_size': m.get('max_context_size', 250000),
+            'capabilities': caps,
+            'has_image': 'image_in' in caps,
+            'has_thinking': 'thinking' in caps or adaptive,
+            'adaptive_thinking': adaptive,
+            'has_tools': 'tool_use' in caps,
+            'support_efforts': efforts,
+            'default_effort': m.get('default_effort', thinking_cfg.get('effort', 'high')),
+            'is_default': alias == default_model,
+            'pricing': pricing.get(alias) or pricing.get(m.get('model', '')) or None,
+        })
+    models.sort(key=lambda m: (not m['is_default'], m['alias']))
+    return {'default_model': default_model,
+            'providers': list(providers.keys()),
+            'thinking': thinking_cfg,
+            'models': models}
+
+
+def safe_apply_config(new_content):
+    """写 config-new.toml → kimi doctor 校验 → 时间戳备份 → 原子替换。"""
+    with open(CONFIG_NEW_PATH, 'wb') as f:
+        f.write(new_content.encode('utf-8'))
+    kimi = shutil.which('kimi') or shutil.which('kimi.cmd') or 'kimi'
+    try:
+        res = subprocess.run([kimi, 'doctor', 'config', CONFIG_NEW_PATH],
+                             capture_output=True, text=True, timeout=30)
+        if res.returncode != 0:
+            try:
+                os.remove(CONFIG_NEW_PATH)
+            except OSError:
+                pass
+            return False, '校验失败：\n%s\n%s' % (res.stdout, res.stderr)
+    except FileNotFoundError:
+        # kimi CLI 不在 PATH：跳过校验但保留备份
+        pass
+    except Exception as e:
+        try:
+            os.remove(CONFIG_NEW_PATH)
+        except OSError:
+            pass
+        return False, '校验异常：%r' % e
+
+    ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+    try:
+        if os.path.exists(CONFIG_PATH):
+            shutil.copy2(CONFIG_PATH, CONFIG_PATH + '.' + ts + '.bak')
+        shutil.move(CONFIG_NEW_PATH, CONFIG_PATH)
+    except Exception as e:
+        return False, '替换失败：%r' % e
+    collect_once()
+    return True, '配置已校验并应用，会话内 /reload 生效'
+
+
+def update_model_in_text(content, alias, updates):
+    escaped = re.escape(alias)
+    pattern = r'(\[models\.(?:"%s"|%s)\])(.*?)(?=\n\[|\Z)' % (escaped, escaped)
+    m = re.search(pattern, content, re.DOTALL)
+    if not m:
+        return content, False
+    header, body = m.group(1), m.group(2)
+    lines = body.split('\n')
+    new_lines = []
+    handled = set()
+
+    def render(k, v):
+        if isinstance(v, bool):
+            return '%s = %s' % (k, str(v).lower())
+        if isinstance(v, int):
+            return '%s = %d' % (k, v)
+        if isinstance(v, list):
+            return '%s = [ %s ]' % (k, ', '.join('"%s"' % x for x in v))
+        return '%s = "%s"' % (k, v)
+
+    for line in lines:
+        s = line.strip()
+        if '=' in s and not s.startswith('#'):
+            k = s.split('=')[0].strip()
+            if k in updates:
+                new_lines.append(render(k, updates[k]))
+                handled.add(k)
+                continue
+        new_lines.append(line)
+    for k, v in updates.items():
+        if k not in handled:
+            new_lines.append(render(k, v))
+    new_content = content[:m.start()] + header + '\n'.join(new_lines) + content[m.end():]
+    return new_content, True
+
+
+def set_default_model_in_text(content, alias):
+    if re.search(r'^default_model\s*=', content, re.MULTILINE):
+        return re.sub(r'^default_model\s*=.*$',
+                      'default_model = "%s"' % alias, content, flags=re.MULTILINE)
+    return 'default_model = "%s"\n' % alias + content
+
+
+def auto_enable_all_in_text(content):
+    data = _load_toml(content) or {}
+    cur = content
+    for alias, m in (data.get('models', {}) or {}).items():
+        caps = list(m.get('capabilities', []) or [])
+        changed = False
+        for cap in ('tool_use', 'thinking', 'image_in'):
+            if cap not in caps:
+                caps.append(cap)
+                changed = True
+        if changed:
+            updates = {'capabilities': caps}
+            if 'thinking' in caps or m.get('adaptive_thinking'):
+                # adaptive_thinking（Claude 系）与 thinking 模型补官方五档
+                updates['support_efforts'] = m.get('support_efforts') or ['low', 'medium', 'high', 'xhigh', 'max']
+                updates['default_effort'] = m.get('default_effort') or 'high'
+            cur, _ = update_model_in_text(cur, alias, updates)
+    return cur
+
+
+# ---------------- HTTP API ----------------
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _cors(self):
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', '*')
+        self.send_header('Access-Control-Allow-Private-Network', 'true')
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+        self.send_response(code)
+        self._cors()
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self._cors()
+        self.end_headers()
+
+    def do_GET(self):
+        path = self.path.split('?')[0]
+        if path in ('/api/status', '/api/health'):
+            self._json({'status': 'ok', 'name': 'kimi-code-usage', 'port': PORT,
+                        'pid': os.getpid(), 'version': '3.0.0'})
+        elif path in ('/api/usage', '/api/dashboard'):
+            self._json(LATEST_DATA or collect_once() or {})
+        elif path == '/api/quota':
+            self._json({'quota': (LATEST_DATA or {}).get('quota'),
+                        'official': LATEST_OFFICIAL})
+        elif path == '/api/data':
+            self._json(get_models_data())
+        elif path == '/api/reload':
+            self._json({'success': True, 'data': collect_once() or {}})
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        path = self.path.split('?')[0]
+        try:
+            req = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))).decode('utf-8'))
+        except Exception:
+            req = {}
+        try:
+            if path == '/api/set-default':
+                alias = req.get('alias', '')
+                if not alias:
+                    return self._json({'success': False, 'message': '缺少 alias'}, 400)
+                ok, msg = safe_apply_config(set_default_model_in_text(get_config_content(), alias))
+                return self._json({'success': ok, 'message': msg}, 200 if ok else 400)
+
+            if path == '/api/toggle-capability':
+                alias, cap = req.get('alias', ''), req.get('capability', '')
+                enabled = bool(req.get('enabled', True))
+                if not alias or not cap:
+                    return self._json({'success': False, 'message': '缺少参数'}, 400)
+                data = get_models_data()
+                target = next((m for m in data['models'] if m['alias'] == alias), None)
+                if not target:
+                    return self._json({'success': False, 'message': '模型 %s 不存在' % alias}, 400)
+                caps = list(target['capabilities'])
+                if enabled and cap not in caps:
+                    caps.append(cap)
+                elif not enabled and cap in caps:
+                    caps.remove(cap)
+                new_content, _ = update_model_in_text(get_config_content(), alias, {'capabilities': caps})
+                ok, msg = safe_apply_config(new_content)
+                return self._json({'success': ok, 'message': msg}, 200 if ok else 400)
+
+            if path == '/api/update-model':
+                alias, updates = req.get('alias', ''), req.get('updates', {})
+                if not alias or not updates:
+                    return self._json({'success': False, 'message': '缺少参数'}, 400)
+                new_content, _ = update_model_in_text(get_config_content(), alias, updates)
+                ok, msg = safe_apply_config(new_content)
+                return self._json({'success': ok, 'message': msg}, 200 if ok else 400)
+
+            if path == '/api/add-model':
+                alias = req.get('alias', '').strip()
+                provider = req.get('provider', '').strip()
+                model_id = req.get('model', '').strip()
+                if not alias or not provider or not model_id:
+                    return self._json({'success': False, 'message': 'alias/provider/model 必填'}, 400)
+                block = ('\n[models."%s"]\nprovider = "%s"\nmodel = "%s"\n'
+                         'max_context_size = %d\ncapabilities = [ "tool_use", "thinking", "image_in" ]\n'
+                         'display_name = "%s"\nsupport_efforts = [ "low", "medium", "high", "max" ]\n'
+                         'default_effort = "high"\n'
+                         % (alias, provider, model_id,
+                            int(req.get('max_context_size', 250000)),
+                            req.get('display_name', '').strip() or alias))
+                ok, msg = safe_apply_config(get_config_content() + block)
+                return self._json({'success': ok, 'message': msg}, 200 if ok else 400)
+
+            if path == '/api/set-price':
+                alias = (req.get('alias') or '').strip()
+                mode = (req.get('mode') or '').strip()
+                if not alias:
+                    return self._json({'success': False, 'message': '缺少 alias'}, 400)
+                if mode not in ('volume', 'per_call', ''):
+                    return self._json({'success': False, 'message': "mode 需为 volume / per_call / ''(重置)"}, 400)
+                if not mode:
+                    save_pricing(alias, None)
+                    collect_once()
+                    return self._json({'success': True, 'message': '%s 已恢复默认计价' % alias})
+                if mode == 'per_call':
+                    try:
+                        price = float(req.get('price'))
+                    except (TypeError, ValueError):
+                        return self._json({'success': False, 'message': 'price 必须是数字'}, 400)
+                    save_pricing(alias, {'mode': 'per_call', 'price': price})
+                    collect_once()
+                    return self._json({'success': True, 'message': '%s 按次计价 ¥%g/次' % (alias, price)})
+                entry = {'mode': 'volume'}
+                for k in ('input', 'output', 'cache_hit', 'cache_write'):
+                    v = req.get(k)
+                    if v is not None and v != '':
+                        try:
+                            entry[k] = float(v)
+                        except (TypeError, ValueError):
+                            return self._json({'success': False, 'message': '%s 必须是数字' % k}, 400)
+                save_pricing(alias, entry)
+                collect_once()
+                return self._json({'success': True, 'message': '%s 按量计价已保存' % alias})
+
+            if path == '/api/auto-enable-all':
+                ok, msg = safe_apply_config(auto_enable_all_in_text(get_config_content()))
+                return self._json({'success': ok, 'message': msg}, 200 if ok else 400)
+        except Exception as e:
+            return self._json({'success': False, 'message': '处理异常：%r' % e}, 500)
+
+        self.send_response(404)
+        self.end_headers()
+
+
+# ---------------- 状态持久化 ----------------
+def load_state():
+    try:
+        st = json.load(open(STATE_FILE, encoding='utf-8'))
+    except Exception:
+        return
+    if not SCANNER or not SCANNER.import_state(st):
+        return
+    # 一致性自愈：历史污染（被杀 daemon 的半扫档）表现为
+    # offsets 已标大量文件但 daily/sessions 聚合远小于 all → 清档重扫
+    try:
+        all_r = int((st.get('all') or {}).get('records') or 0)
+        daily_r = sum(int(b.get('records') or 0) for b in (st.get('daily') or {}).values())
+        offsets_n = len(st.get('offsets') or {})
+        if offsets_n > 50 and all_r > 500 and daily_r < all_r * 0.5:
+            log('state inconsistent (all=%d daily=%d offsets=%d) -> full rescan' % (all_r, daily_r, offsets_n))
+            SCANNER.reset()
+            return
+    except Exception:
+        pass
+    log('state restored (v%d)' % st.get('version', 0))
+
+
+def save_state():
+    if not SCANNER or not STATE_DIRTY['v']:
+        return
+    try:
+        tmp = STATE_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(SCANNER.export_state(), f, ensure_ascii=False)
+        os.replace(tmp, STATE_FILE)
+        STATE_DIRTY['v'] = False
+    except Exception:
+        pass
+    # 顺带清理旧版采集器的遗留文件
+    for stale in ('credentials.json', 'quota-current.json'):
+        p = os.path.join(KIMI_HOME, stale)
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+
+
+# ---------------- 主循环 / 启动 ----------------
+def _poll_official_loop():
+    global LATEST_OFFICIAL
+    while True:
+        try:
+            LATEST_OFFICIAL = scanner.fetch_official()
+        except Exception:
+            pass
+        time.sleep(300)
+
+
+_NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _urlopen(url, timeout=3):
+    """绕过系统代理直连本机（代理可能劫持 127.0.0.1 导致探活失败→重复拉起）。"""
+    return _NO_PROXY.open(url, timeout=timeout)
+
+
+def port_is_ours():
+    for _ in range(2):
+        try:
+            with _urlopen('http://127.0.0.1:%d/api/status' % PORT, timeout=4) as r:
+                d = json.loads(r.read().decode())
+                return d.get('name') == 'kimi-code-usage'
+        except Exception:
+            time.sleep(0.3)
+    return False
+
+
+def spawn_daemon():
+    """静默拉起常驻服务进程（pythonw 后台）。"""
+    py = sys.executable
+    # 优先 pythonw.exe 免窗口
+    cand = os.path.join(os.path.dirname(py), 'pythonw.exe')
+    if os.path.exists(cand):
+        py = cand
+    for alt in (r'C:\Program Files\python\pythonw.exe', r'C:\Program Files\Python313\pythonw.exe',
+                r'C:\Program Files\Python312\pythonw.exe', r'C:\Program Files\Python311\pythonw.exe'):
+        if not os.path.exists(py) or 'Microsoft\\WindowsApps' in py:
+            if os.path.exists(alt):
+                py = alt
+    flags = 0
+    if os.name == 'nt':
+        flags = getattr(subprocess, 'DETACHED_PROCESS', 0x00000008) | getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+    try:
+        subprocess.Popen([py, os.path.join(SCRIPT_DIR, 'service.py')],
+                         cwd=PLUGIN_ROOT, creationflags=flags,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, close_fds=True)
+        log('daemon spawned via %s' % py)
+        return True
+    except Exception as e:
+        log('spawn_daemon failed: %r' % e)
+        return False
+
+
+def tick():
+    """hook 入口：服务不在就拉起；服务在就触发一次采集刷新。"""
+    if port_is_ours():
+        try:
+            _urlopen('http://127.0.0.1:%d/api/reload' % PORT, timeout=3).read()
+        except Exception:
+            pass
+        return 0
+    # 端口空着或被旧套件/僵尸进程占着：迁移旧套件，杀掉占用者后拉起新服务
+    migrate_legacy()
+    kill_port_owner()
+    time.sleep(0.6)
+    if port_is_ours():
+        return 0                 # 期间另一个 tick 已经把服务拉起来了
+    if spawn_lock() and spawn_daemon():
+        # 等服务起来完成首次注入即可返回；失败时降级为一次性采集
+        for _ in range(40):
+            if port_is_ours():
+                return 0
+            time.sleep(0.25)
+    return run_once()
+
+
+def run_once():
+    """降级：无常驻服务，跑一次采集+注入+落盘。"""
+    global SCANNER
+    if SCANNER is None:
+        SCANNER = scanner.UsageScanner()
+        load_state()
+    migrate_legacy()
+    kill_port_owner()
+    sync_widget_asset()
+    ensure_injection()
+    collect_once()
+    save_state()
+    return 0
+
+
+class _HTTPServer(ThreadingHTTPServer):
+    # Windows 下 SO_REUSEADDR 允许两个进程同时 LISTEN 同一端口——关掉它防双绑
+    allow_reuse_address = False
+
+
+def run_server():
+    global SCANNER
+    if port_is_ours():
+        log('another daemon already serving on %d, exiting' % PORT)
+        return
+    migrate_legacy()
+    SCANNER = scanner.UsageScanner()
+    load_state()
+    # 扫描由主循环 collect_once 驱动，不再另起后台线程（双线程曾并发扫文件导致重复计数）
+    threading.Thread(target=_poll_official_loop, daemon=True).start()
+
+    httpd = None
+    try:
+        httpd = _HTTPServer(('127.0.0.1', PORT), Handler)
+    except OSError as e:
+        # 端口被占：若不是我们的服务，迁移旧套件并按 PID 清场后再绑一次
+        if not port_is_ours():
+            migrate_legacy()
+            kill_port_owner()
+            try:
+                httpd = _HTTPServer(('127.0.0.1', PORT), Handler)
+            except OSError:
+                log('port %d unavailable: %r' % (PORT, e))
+                httpd = None
+    if httpd:
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        log('service listening on 127.0.0.1:%d' % PORT)
+    else:
+        # 没绑到端口还继续跑只会攒脏 state（无法提供 API）——退出交给下次 tick 重拉
+        save_state()
+        log('exiting: no HTTP listener bound')
+        return
+
+    n = 0
+    while True:
+        try:
+            sync_widget_asset()
+            ensure_injection()
+            collect_once()
+            n += 1
+            if n % 15 == 0:
+                save_state()
+        except Exception as e:
+            log('loop error: %r' % e)
+        time.sleep(2)
+
+
+if __name__ == '__main__':
+    try:
+        if '--tick' in sys.argv:
+            sys.exit(tick())
+        if '--once' in sys.argv:
+            sys.exit(run_once())
+        run_server()
+    except KeyboardInterrupt:
+        save_state()
+    except Exception as e:
+        log('fatal: %r' % e)
+        try:
+            save_state()
+        except Exception:
+            pass
+        sys.exit(1)

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.log
+
+# runtime-generated local data / per-machine config
+assets/kimi-usage.json
+scripts/desktop_path.txt
+scripts/service.log
