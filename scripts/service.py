@@ -45,10 +45,12 @@ LOG_FILE = os.path.join(SCRIPT_DIR, 'service.log')
 WIDGET_SRC = os.path.join(ASSETS_SRC, 'kimi-usage-widget.js')
 PRICING_PATH = os.path.join(KIMI_HOME, 'usage-dashboard', 'pricing.json')
 
-# 自更新源：GitHub 仓库（改源只需改这一行）
+# 自更新源：GitHub 仓库（改源只需改 UPDATE_REPO）
 UPDATE_REPO = 'ziyiclouds-blip/kimicode-ylmb'
 UPDATE_BRANCH = 'main'
-UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/%s/%s/kimi.plugin.json' % (UPDATE_REPO, UPDATE_BRANCH)
+# 走 api.github.com 读清单：raw.* 按分支缓存较久，刚发布时容易拿到旧版本号
+UPDATE_MANIFEST_URL = ('https://api.github.com/repos/%s/contents/kimi.plugin.json?ref=%s'
+                       % (UPDATE_REPO, UPDATE_BRANCH))
 UPDATE_ZIP_URL = 'https://codeload.github.com/%s/zip/refs/heads/%s' % (UPDATE_REPO, UPDATE_BRANCH)
 
 
@@ -854,7 +856,8 @@ def check_update(force=False):
            'repo': 'https://github.com/%s' % UPDATE_REPO, 'error': None}
     try:
         req = urllib.request.Request(UPDATE_MANIFEST_URL,
-                                     headers={'User-Agent': 'kimi-code-usage/%s' % PLUGIN_VERSION})
+                                     headers={'User-Agent': 'kimi-code-usage/%s' % PLUGIN_VERSION,
+                                              'Accept': 'application/vnd.github.raw+json'})
         with urllib.request.urlopen(req, timeout=8) as r:
             d = json.loads(r.read().decode('utf-8'))
         latest = str(d.get('version') or '')
