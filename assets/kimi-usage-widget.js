@@ -27,6 +27,22 @@
   try {
     isCollapsed = localStorage.getItem(STORAGE_COLLAPSED_KEY) === 'true';
   } catch (e) {}
+  const STORAGE_MIN_MODEL_KEY = 'kimi-usage-min-model-html';
+  let kuLastMinHtml = '';
+  try { kuLastMinHtml = localStorage.getItem(STORAGE_MIN_MODEL_KEY) || ''; } catch (e) {}
+
+  function kuMinModelHtml() {
+    const rows = (state.today_models && state.today_models.length)
+      ? state.today_models
+      : (state.cumul_models || []);
+    const top = rows[0];
+    if (!top || !top.model || top.model === '--') return '';
+    const name = String(top.model).split('/').pop();
+    const cp = (top.cache_pct != null) ? top.cache_pct : 0;
+    return esc(name) + ' · <b>' + esc(top.tokens_fmt || fmtTok(top.tokens))
+      + '</b> <span class="c">' + esc(cp) + '%</span>'
+      + ' <span class="m">' + esc(top.cost_fmt || '--') + '</span>';
+  }
 
   let state = {
     updated_at: '--',
@@ -89,6 +105,122 @@
       d.classList.toggle('ku-dot-off', !serviceOnline);
       d.title = serviceTitle();
     });
+  }
+
+  /* ---------- 弹层开合动画（opacity/transform 渐进，关闭延迟隐藏） ---------- */
+  const KU_ANIM_MS = 190;
+  function kuLayerShow(el, cls) {
+    if (!el) return;
+    clearTimeout(el._kuHideTimer);
+    el.classList.add(cls);                       // display:flex 立即响应
+    el.classList.remove('ku-anim-in');
+    void el.offsetWidth;                         // 强制回流，确保过渡生效
+    requestAnimationFrame(function() { el.classList.add('ku-anim-in'); });
+  }
+  function kuLayerHide(el, cls) {
+    if (!el || !el.classList.contains(cls)) return;
+    el.classList.remove('ku-anim-in');           // 先播关闭动画
+    clearTimeout(el._kuHideTimer);
+    el._kuHideTimer = setTimeout(function() { el.classList.remove(cls); }, KU_ANIM_MS);
+  }
+  // 空闲时调度重渲染：面板先出现，内容异步填充
+  function kuScheduleIdle(fn) {
+    var done = false;
+    var run = function() {
+      if (done) return; done = true;
+      try { fn(); } catch (e) {}
+    };
+    if (typeof window.requestIdleCallback === 'function') {
+      try { window.requestIdleCallback(run, { timeout: 400 }); } catch (e) { run(); }
+    } else {
+      requestAnimationFrame(function() { setTimeout(run, 0); });
+    }
+    setTimeout(run, 450); // 兜底，确保一定会执行
+  }
+
+  /* ---------- 侧栏详情小弹层（模型 / 会话 完整信息，hover 触发） ---------- */
+  var kuPopEl = null;
+  var kuPopShowT = null;
+  var kuPopHideT = null;
+  function kuClosePop() {
+    clearTimeout(kuPopShowT);
+    if (kuPopEl) { try { kuPopEl.remove(); } catch (e) {} kuPopEl = null; }
+  }
+  function kuScheduleClosePop() {
+    clearTimeout(kuPopHideT);
+    kuPopHideT = setTimeout(kuClosePop, 140);
+  }
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && kuPopEl) kuClosePop();
+  }, true);
+  function kuOpenPop(anchor, title, rowsHtml) {
+    if (!anchor || !document.contains(anchor)) { kuClosePop(); return; }
+    if (kuPopEl && kuPopEl._anchor === anchor && document.body.contains(kuPopEl)) {
+      var html = '<div class="ku-pop-head"><span>' + esc(title) + '</span></div>' + rowsHtml;
+      if (kuPopEl._html !== html) { kuPopEl.innerHTML = html; kuPopEl._html = html; }
+      return;
+    }
+    kuClosePop();
+    var pop = document.createElement('div');
+    pop.className = 'ku-pop';
+    pop._anchor = anchor;
+    pop._html = '<div class="ku-pop-head"><span>' + esc(title) + '</span></div>' + rowsHtml;
+    pop.innerHTML = pop._html;
+    pop.addEventListener('mouseenter', function() { clearTimeout(kuPopHideT); });
+    pop.addEventListener('mouseleave', kuScheduleClosePop);
+    document.body.appendChild(pop);
+    var r = anchor.getBoundingClientRect();
+    var pw = Math.min(252, window.innerWidth - 12);
+    var x = Math.max(6, Math.min(r.left, window.innerWidth - pw - 6));
+    var y = r.bottom + 6;
+    pop.style.width = pw + 'px';
+    var ph = pop.offsetHeight || 120;
+    if (y + ph > window.innerHeight - 6) y = Math.max(6, r.top - ph - 6);
+    pop.style.left = x + 'px';
+    pop.style.top = y + 'px';
+    kuPopEl = pop;
+  }
+  function kuBindHoverPop(el, buildRows, title) {
+    if (!el) return;
+    el._kuPopBuild = buildRows;
+    el._kuPopTitle = title || '详情';
+    if (kuPopEl && kuPopEl._anchor === el) kuOpenPop(el, el._kuPopTitle, buildRows());
+    if (el._kuPopBound) return;
+    el._kuPopBound = true;
+    el.addEventListener('mouseenter', function() {
+      clearTimeout(kuPopHideT);
+      clearTimeout(kuPopShowT);
+      kuPopShowT = setTimeout(function() {
+        kuOpenPop(el, el._kuPopTitle, el._kuPopBuild());
+      }, 90);
+    });
+    el.addEventListener('mouseleave', function() {
+      clearTimeout(kuPopShowT);
+      kuScheduleClosePop();
+    });
+  }
+  function kuPopRow(k, v) {
+    return '<div class="ku-pop-row"><span class="ku-pop-k">' + esc(k) + '</span><span class="ku-pop-v">' + esc(v) + '</span></div>';
+  }
+  // 当前模型完整信息弹层
+  function kuCurModelDetail(alias) {
+    var cur = state.cur || {};
+    var m = (modelsData && modelsData.models || []).find(function(x) { return x.alias === alias; }) || {};
+    var effs = (m.effective_efforts && m.effective_efforts.length) ? m.effective_efforts
+             : (m.support_efforts && m.support_efforts.length) ? m.support_efforts : null;
+    var rows =
+      kuPopRow('别名', alias) +
+      (m.provider ? kuPopRow('提供方', m.provider) : '') +
+      (m.model ? kuPopRow('模型', m.model) : '') +
+      (m.display_name ? kuPopRow('显示名', m.display_name) : '') +
+      kuPopRow('思考档位', cur.effort || m.default_effort || '--') +
+      (effs ? kuPopRow('可用档位', effs.join(' / ')) : '') +
+      kuPopRow('工具调用', m.has_tools ? '支持' : '不支持') +
+      (m.has_thinking != null ? kuPopRow('深度思考', (m.has_thinking || m.always_thinking) ? '开启' : '关闭') : '') +
+      (m.max_context_size ? kuPopRow('上下文', Math.round(m.max_context_size / 1024) + 'k') : '') +
+      (cur.session ? kuPopRow('会话', cur.session) : '') +
+      (cur.sub_agent ? kuPopRow('子代理', cur.sub_agent) : '');
+    return rows;
   }
 
   /* ================================================================
@@ -207,6 +339,7 @@
     .ku-summary-strip {
       display: flex;
       align-items: center;
+      flex-wrap: wrap;
       gap: 5px;
       margin-bottom: 9px;
       padding-bottom: 7px;
@@ -247,7 +380,10 @@
       overflow: hidden;
       text-overflow: ellipsis;
       padding-left: 12px;
+      min-height: 14px;
+      line-height: 14px;
     }
+    .ku-min-model .ku-min-ph { opacity: 0.5; font-weight: 500; }
     .ku-min-model b {
       color: var(--color-text, #0f172a);
       font-weight: 700;
@@ -261,8 +397,11 @@
       font-weight: 700;
       font-size: 11.5px;
       color: var(--color-text, #0f172a);
-      flex-shrink: 0;
+      flex: 0 1 auto;
+      min-width: 0;
       white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .ku-min-center {
       display: flex;
@@ -341,23 +480,27 @@
       font-weight: 700;
       color: var(--color-text, #0f172a);
       font-variant-numeric: tabular-nums;
-      margin-right: 14px;
       min-width: 60px;
+      flex: 1;
     }
     .ku-row-cost {
       font-weight: 600;
       color: var(--color-text, #334155);
       font-variant-numeric: tabular-nums;
+      margin-left: auto;
+      text-align: right;
     }
     .ku-row-cache { align-items: center; }
     .ku-cache-label { color: var(--color-success, #3fb950) !important; }
     .ku-cache-bar-wrap {
       width: 72px;
+      max-width: 40%;
       height: 7px;
       background: color-mix(in srgb, var(--color-text, #000) 8%, transparent);
       border-radius: 3px;
       overflow: hidden;
       margin-right: 12px;
+      flex-shrink: 0;
     }
     .ku-cache-bar-fill {
       height: 100%;
@@ -373,19 +516,34 @@
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    /* 当前模型行徽章 */
-    .ku-cur-badges { display: inline-flex; align-items: center; gap: 4px; margin-left: 6px; flex-shrink: 0; }
-    .ku-cur-badge {
-      font-size: 9.5px;
-      font-weight: 700;
-      padding: 0 4px;
-      border-radius: 4px;
-      line-height: 15px;
+    /* 当前模型行：名称（可收缩省略）+ 右侧次要信息 */
+    #ku-cur-row { min-width: 0; }
+    #ku-cur-row .ku-row-model { flex: 0 1 auto; min-width: 0; }
+    .ku-cur-meta {
+      margin-left: auto;
+      padding-left: 8px;
+      font-size: 10px;
+      color: var(--color-text-secondary, #64748b);
       white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+      flex: 0 1 auto;
     }
-    .ku-cur-effort { background: color-mix(in srgb, var(--color-accent, #1a88ff) 14%, transparent); color: var(--color-accent, #1a88ff); }
-    .ku-cur-tools { background: color-mix(in srgb, var(--color-success, #3fb950) 14%, transparent); color: var(--color-success, #059669); }
-    .ku-cur-sub { color: var(--color-text-secondary, #64748b); font-size: 10.5px; }
+    .ku-cur-meta:empty { display: none; }
+    /* 详情弹层只在名称上 hover 触发 */
+    #ku-cur-model { cursor: default; }
+    #ku-cur-model:hover { color: var(--color-accent, #1a88ff); }
+    .ku-model-item:focus-visible { outline: 1px solid var(--color-accent, #1a88ff); outline-offset: 1px; border-radius: 3px; }
+    .ku-m-name { cursor: default; }
+    .ku-m-name:hover { color: var(--color-accent, #1a88ff); }
+    #ku-sess-key { cursor: default; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+    #ku-sess-key:hover { color: var(--color-accent, #1a88ff); }
+    /* 会话行三段式：key 可收缩 / tokens 弹性 / 缓存+成本右对齐 */
+    #ku-sess-key { margin-left: 0; text-align: left; color: var(--color-text-secondary, #64748b); font-weight: 500; }
+    #ku-sess-tokens { flex: 1; min-width: 0; margin-left: 8px; }
+    #ku-sess-cache { flex-shrink: 0; margin-left: 6px; }
+    #ku-sess-cost { flex-shrink: 0; margin-left: 6px; }
     .ku-meta-calls {
       font-size: 11px;
       color: var(--color-text-secondary, #64748b);
@@ -413,9 +571,12 @@
       gap: 2.5px;
       height: 14px;
       padding: 0 2px;
+      flex: 1;
+      min-width: 0;
     }
     .ku-sparkline-bar {
-      width: 4px;
+      flex: 1;
+      min-width: 3px;
       background: color-mix(in srgb, var(--color-text, #000) 30%, #334155);
       border-radius: 1px;
       min-height: 2px;
@@ -446,13 +607,17 @@
     }
     .ku-model-item {
       display: grid;
-      grid-template-columns: minmax(80px, 1fr) 52px 36px 52px;
+      grid-template-columns: minmax(0, 1fr) minmax(52px, auto) minmax(36px, auto) minmax(48px, auto);
+      column-gap: 8px;
       align-items: center;
       font-size: 11px;
       font-variant-numeric: tabular-nums;
       line-height: 1.4;
-      padding: 1px 0;
+      padding: 2px 4px;
+      margin: 0 -4px;
+      border-radius: 5px;
     }
+    .ku-model-item:hover { background: color-mix(in srgb, var(--color-text, #000) 5%, transparent); }
     .ku-m-name {
       overflow: hidden;
       text-overflow: ellipsis;
@@ -471,6 +636,33 @@
       border-top: 1px solid color-mix(in srgb, var(--color-text, #000) 5%, transparent);
       font-variant-numeric: tabular-nums;
     }
+    /* 侧栏详情小弹层（模型 / 会话 完整信息） */
+    .ku-pop {
+      position: fixed;
+      z-index: 99998;
+      width: 252px;
+      max-height: 280px;
+      overflow-y: auto;
+      padding: 9px 11px 10px;
+      border-radius: 10px;
+      border: 1px solid color-mix(in srgb, var(--color-text, #000) 14%, transparent);
+      background: var(--color-bg, var(--color-sidebar-bg, #ffffff));
+      color: var(--color-text, #1e293b);
+      box-shadow: 0 10px 32px rgba(0,0,0,.28);
+      font-size: 11px;
+      line-height: 1.55;
+      animation: ku-pop-in .15s ease;
+      user-select: text;
+    }
+    @keyframes ku-pop-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+    .ku-pop-head {
+      font-weight: 700; font-size: 11.5px; margin-bottom: 5px;
+      padding-bottom: 5px;
+      border-bottom: 1px solid color-mix(in srgb, var(--color-text, #000) 8%, transparent);
+    }
+    .ku-pop-row { display: flex; gap: 8px; margin: 3px 0; align-items: baseline; }
+    .ku-pop-k { flex-shrink: 0; width: 58px; color: var(--color-text-secondary, #94a3b8); font-size: 10.5px; }
+    .ku-pop-v { flex: 1; min-width: 0; overflow-wrap: anywhere; word-break: break-all; font-weight: 500; }
 `;
   style.textContent += `
     /* ========== 2. 全屏报表弹层 (kup-) ========== */
@@ -485,8 +677,21 @@
       justify-content: center;
       padding: 20px;
       box-sizing: border-box;
+      opacity: 0;
+      transition: opacity 0.19s ease;
     }
     #${PANEL_MODAL_ID}.active { display: flex; }
+    #${PANEL_MODAL_ID}.ku-anim-in { opacity: 1; }
+    #${PANEL_MODAL_ID}.ku-anim-in .kup-card {
+      transform: none;
+      transition: transform 0.2s cubic-bezier(0.25, 0.6, 0.3, 1) 0.02s, opacity 0.17s ease 0.02s;
+      opacity: 1;
+    }
+    #${PANEL_MODAL_ID} .kup-card {
+      transform: translateY(14px) scale(0.985);
+      opacity: 0;
+      transition: transform 0.16s ease-in, opacity 0.14s ease-in;
+    }
     .kup-card {
       width: 96vw;
       max-width: 1400px;
@@ -724,6 +929,23 @@
     .kup-grid2 { display:grid; grid-template-columns:1.2fr 1fr; gap:16px; }
     @media(max-width:960px){ .kup-grid2{grid-template-columns:1fr} }
     .kup-scroll { max-height:360px; overflow:auto; }
+    .kup-scroll table { table-layout: fixed; width: 100%; }
+    .kup-scroll td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* 面板打开时的骨架占位（异步渲染前立即给出反馈） */
+    #${PANEL_MODAL_ID} .kup-shell { position: relative; }
+    .kup-skel-overlay {
+      position: absolute; inset: 0; z-index: 5;
+      background: var(--kup-bg, transparent);
+      padding: 20px 24px;
+    }
+    .kup-skel { padding: 14px 18px; }
+    .kup-skel-row {
+      height: 13px; border-radius: 6px; margin: 8px 0;
+      background: linear-gradient(90deg, var(--kup-track) 25%, color-mix(in srgb, var(--kup-text) 14%, transparent) 50%, var(--kup-track) 75%);
+      background-size: 200% 100%;
+      animation: kup-skel-shimmer 1.15s linear infinite;
+    }
+    @keyframes kup-skel-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 `;
   style.textContent += `
     /* ========== 3. 模型管理弹窗 (kmm-) ========== */
@@ -736,12 +958,23 @@
       display: none;
       align-items: center;
       justify-content: center;
+      opacity: 0;
+      transition: opacity 0.18s ease;
     }
     #${KMM_OVERLAY_ID}.visible { display: flex; }
+    #${KMM_OVERLAY_ID}.ku-anim-in { opacity: 1; }
+    #${KMM_OVERLAY_ID}.ku-anim-in #kmm-modal {
+      transform: none;
+      opacity: 1;
+      transition: transform 0.19s cubic-bezier(0.25, 0.6, 0.3, 1) 0.02s, opacity 0.16s ease 0.02s;
+    }
     #kmm-modal {
       width: 580px;
       max-width: 90vw;
       max-height: 80vh;
+      transform: translateY(12px) scale(0.975);
+      opacity: 0;
+      transition: transform 0.15s ease-in, opacity 0.13s ease-in;
       background: var(--color-surface, #1f1f1f);
       border: 1px solid color-mix(in srgb, var(--color-text, #fff) 10%, transparent);
       border-radius: 12px;
@@ -812,10 +1045,18 @@
       background: rgba(0,0,0,.45); backdrop-filter: blur(3px);
       display: none; align-items: center; justify-content: center;
       font-family: system-ui, -apple-system, sans-serif;
+      opacity: 0; transition: opacity 0.17s ease;
     }
     #kpr-overlay.visible { display: flex; }
+    #kpr-overlay.ku-anim-in { opacity: 1; }
+    #kpr-overlay.ku-anim-in #kpr-modal {
+      transform: none; opacity: 1;
+      transition: transform 0.18s cubic-bezier(0.25, 0.6, 0.3, 1) 0.02s, opacity 0.15s ease 0.02s;
+    }
     #kpr-modal {
       width: 460px; max-height: 86vh; overflow-y: auto;
+      transform: translateY(10px) scale(0.98); opacity: 0;
+      transition: transform 0.14s ease-in, opacity 0.12s ease-in;
       background: var(--color-surface-raised, #ffffff);
       color: var(--color-text, #1f2329);
       border-radius: 14px; box-shadow: 0 24px 64px rgba(0,0,0,.35);
@@ -871,6 +1112,8 @@
    * 侧栏卡片
    * ================================================================ */
   function updateDOM() {
+    // 列表重建后旧 anchor 已脱离 DOM，孤儿弹层一并清掉
+    if (kuPopEl && kuPopEl._anchor && !document.contains(kuPopEl._anchor)) kuClosePop();
     const card = document.getElementById(CARD_ID);
     if (!card) return;
 
@@ -890,19 +1133,13 @@
     // 第二行：今日用量最高的模型（名称 · tokens · 缓存率 · 成本）
     const minModel = card.querySelector('#ku-min-model');
     if (minModel) {
-      const rows = (state.today_models && state.today_models.length)
-        ? state.today_models
-        : (state.cumul_models || []);
-      const top = rows[0];
-      if (top) {
-        const name = String(top.model || '--').split('/').pop();
-        const cp = (top.cache_pct != null) ? top.cache_pct : 0;
-        minModel.innerHTML = esc(name) + ' · <b>' + esc(top.tokens_fmt || fmtTok(top.tokens))
-          + '</b> <span class="c">' + cp + '%</span>'
-          + ' <span class="m">' + esc(top.cost_fmt || '--') + '</span>';
-      } else {
-        minModel.textContent = '';
+      const fresh = kuMinModelHtml();
+      if (fresh && fresh !== kuLastMinHtml) {
+        kuLastMinHtml = fresh;
+        try { localStorage.setItem(STORAGE_MIN_MODEL_KEY, fresh); } catch (err) {}
       }
+      const minHtml = fresh || kuLastMinHtml || '<span class="ku-min-ph">--</span>';
+      if (minModel._html !== minHtml) { minModel.innerHTML = minHtml; minModel._html = minHtml; }
     }
 
     // 今日 / 累计 / 速率
@@ -929,7 +1166,7 @@
     const spModel = card.querySelector('#ku-speed-model');
     if (spModel) spModel.textContent = shortName(state.speed.model);
 
-    // 当前模型行（usage.cur + models 能力徽章）
+    // 当前模型行（usage.cur + models 能力徽章；过长别名降入第二行详情，ℹ 徽标弹出完整信息）
     const curRow = card.querySelector('#ku-cur-row');
     if (curRow) {
       const cur = state.cur || {};
@@ -945,12 +1182,15 @@
           nameEl.textContent = shortName(alias);
           nameEl.title = alias;
         }
-        let badges = '';
-        if (cur.effort) badges += `<span class="ku-cur-badge ku-cur-effort" title="思考强度">思:${esc(cur.effort)}</span>`;
-        if (cfg && cfg.has_tools) badges += '<span class="ku-cur-badge ku-cur-tools" title="支持工具调用 tool_use">工√</span>';
-        if (cur.sub_agent) badges += `<span class="ku-cur-sub" title="子代理">（子代理 ${esc(cur.sub_agent)}）</span>`;
-        const badgesEl = card.querySelector('#ku-cur-badges');
-        if (badgesEl) badgesEl.innerHTML = badges;
+        // 主行：名称 + 右侧次要信息（思考档位 · 子代理），工具等完整信息在悬停浮层
+        const metaEl = card.querySelector('#ku-cur-meta');
+        if (metaEl) {
+          const meta = [cur.effort, cur.sub_agent].filter(Boolean).join(' · ');
+          if (metaEl.textContent !== meta) metaEl.textContent = meta;
+        }
+        // 滑入名称弹完整信息，滑出即关
+        const nameEl2 = card.querySelector('#ku-cur-model');
+        kuBindHoverPop(nameEl2, function() { return kuCurModelDetail(alias); }, '当前模型');
       }
     }
 
@@ -984,15 +1224,27 @@
       } else {
         sessRow.style.display = '';
         const keyEl = card.querySelector('#ku-sess-key');
+        const sKey = String(s.key || '');
         if (keyEl) {
-          const k = String(s.key || '');
-          keyEl.textContent = k.length > 8 ? k.slice(0, 8) : (k || '--');
-          keyEl.title = `会话 ${k} · ${s.cost_fmt || ''}`;
+          const shortKey = sKey.replace(/^session_/, '').slice(0, 8) || '--';
+          if (keyEl.textContent !== shortKey) keyEl.textContent = shortKey;
+          keyEl.title = `会话 ${sKey} · ${s.cost_fmt || ''}`;
         }
-        const valEl = card.querySelector('#ku-sess-val');
-        if (valEl) valEl.textContent = s.tokens_fmt || '--';
-        const cacheEl = card.querySelector('#ku-sess-cache');
-        if (cacheEl) cacheEl.textContent = `缓存 ${s.cache_pct != null ? s.cache_pct : '--'}%`;
+        const sTok = card.querySelector('#ku-sess-tokens');
+        if (sTok) sTok.textContent = s.tokens_fmt || '--';
+        const sCache = card.querySelector('#ku-sess-cache');
+        if (sCache) sCache.textContent = (s.cache_pct != null ? s.cache_pct : '--') + '%';
+        const sCost = card.querySelector('#ku-sess-cost');
+        if (sCost) sCost.textContent = s.cost_fmt || '--';
+        // 只在会话 key 上滑入弹详情
+        kuBindHoverPop(keyEl, function() {
+          return kuPopRow('会话 ID', sKey || '--') +
+            kuPopRow('Token', s.tokens_fmt || '--') +
+            kuPopRow('调用次数', (s.calls != null ? s.calls : '--') + ' 次') +
+            kuPopRow('缓存率', (s.cache_pct != null ? s.cache_pct : '--') + '%') +
+            kuPopRow('估算成本', s.cost_fmt || '--') +
+            (s.last ? kuPopRow('最近活动', s.last) : '');
+        }, '会话详情');
       }
     }
 
@@ -1011,11 +1263,12 @@
       sparkStart.textContent = days[0].label;
       sparkEnd.textContent = days[days.length - 1].label;
       const maxTok = Math.max.apply(null, days.map(d => d.tokens || 0).concat([1]));
-      sparkWrap.innerHTML = days.map((d, idx) => {
+      const sparkHtml = days.map((d, idx) => {
         const h = Math.max(2, Math.round(((d.tokens || 0) / maxTok) * 14));
         const isLast = (idx === days.length - 1);
         return `<div class="ku-sparkline-bar ${isLast ? 'active' : ''}" style="height:${h}px" title="${d.label}: ${(d.tokens || 0).toLocaleString()} tokens"></div>`;
       }).join('');
+      if (sparkWrap._html !== sparkHtml) { sparkWrap.innerHTML = sparkHtml; sparkWrap._html = sparkHtml; }
     }
 
     // 模型列表 (今日 vs 累计)
@@ -1034,20 +1287,58 @@
     const listEl = card.querySelector('#ku-models-list');
     if (!listEl) return;
     const models = (activeTab === 'today' ? state.today_models : state.cumul_models) || [];
-    if (!models.length) {
-      listEl.innerHTML = '<div style="color:var(--color-text-secondary,#8a97ab);font-size:10px;padding:4px 0;">暂无模型调用数据</div>';
+    const top5 = models.slice(0, 5);
+    if (!top5.length) {
+      if (listEl.getAttribute('data-mode') !== 'empty') {
+        listEl.innerHTML = '<div style="color:var(--color-text-secondary,#8a97ab);font-size:10px;padding:4px 0;">暂无模型调用数据</div>';
+        listEl.setAttribute('data-mode', 'empty');
+      }
       return;
     }
-    listEl.innerHTML = models.slice(0, 5).map(m => {
+    var items = listEl.querySelectorAll('.ku-model-item');
+    if (listEl.getAttribute('data-mode') === 'list' && items.length === top5.length) {
+      // 行数不变 → 就地更新文本，不重建 DOM，避免跳动和 hover 浮层丢失
+      items.forEach(function(item, i) {
+        var m = top5[i];
+        var full = m.model || m.raw_name || m.name || '';
+        item.title = full;
+        item.setAttribute('data-i', i);
+        var nameEl = item.querySelector('.ku-m-name');
+        var tokEl = item.querySelector('.ku-m-tokens');
+        var cacheEl = item.querySelector('.ku-m-cache');
+        var costEl = item.querySelector('.ku-m-cost');
+        if (nameEl) { var nm = m.name || (full ? full.split('/').pop() : '--'); if (nameEl.textContent !== nm) nameEl.textContent = nm; }
+        if (tokEl) { var t = m.tokens_fmt || '--'; if (tokEl.textContent !== t) tokEl.textContent = t; }
+        if (cacheEl) { var c = (m.cache_pct != null ? m.cache_pct : '--') + '%'; if (cacheEl.textContent !== c) cacheEl.textContent = c; }
+        if (costEl) { var co = m.cost_fmt || '--'; if (costEl.textContent !== co) costEl.textContent = co; }
+      });
+      return;
+    }
+    // 行数变化或首次渲染 → 重建
+    listEl.setAttribute('data-mode', 'list');
+    listEl.innerHTML = top5.map(function(m, i) {
       const full = m.model || m.raw_name || m.name || '';
       const name = m.name || (full ? full.split('/').pop() : '--');
-      return `<div class="ku-model-item">
-        <span class="ku-m-name" title="${esc(full)}">${esc(name)}</span>
+      return `<div class="ku-model-item" data-i="${i}" title="${esc(full)}">
+        <span class="ku-m-name">${esc(name)}</span>
         <span class="ku-m-tokens">${esc(m.tokens_fmt)}</span>
         <span class="ku-m-cache">${m.cache_pct != null ? m.cache_pct : '--'}%</span>
         <span class="ku-m-cost">${esc(m.cost_fmt)}</span>
       </div>`;
     }).join('');
+    // 只在模型名称上滑入弹详情，滑出即关（闭包实时读列表，就地更新后仍正确）
+    listEl.querySelectorAll('.ku-model-item').forEach(function(item) {
+      var nameEl = item.querySelector('.ku-m-name');
+      kuBindHoverPop(nameEl, function() {
+        var list = (activeTab === 'today' ? state.today_models : state.cumul_models) || [];
+        var m = list[Number(item.getAttribute('data-i') || 0)] || {};
+        return kuPopRow('模型', m.model || m.raw_name || m.name || '--') +
+          kuPopRow('Token', m.tokens_fmt || '--') +
+          kuPopRow('调用次数', (m.calls != null ? m.calls : '--') + ' 次') +
+          kuPopRow('缓存率', (m.cache_pct != null ? m.cache_pct : '--') + '%') +
+          kuPopRow('估算成本', m.cost_fmt || '--');
+      }, '模型调用明细');
+    });
   }
 
   function createCard() {
@@ -1095,10 +1386,10 @@
           <span class="ku-row-cost" id="ku-rate-cost">--</span>
         </div>
 
-        <div class="ku-row" id="ku-cur-row" title="当前会话使用的模型">
+        <div class="ku-row" id="ku-cur-row" title="当前会话使用的模型，滑入名称查看详情">
           <span class="ku-row-label">模型</span>
           <span class="ku-row-model" id="ku-cur-model">--</span>
-          <span class="ku-cur-badges" id="ku-cur-badges"></span>
+          <span class="ku-cur-meta" id="ku-cur-meta"></span>
         </div>
 
         <div class="ku-row" id="ku-quota-row" style="display:none">
@@ -1107,11 +1398,12 @@
           <span class="ku-row-cost">周配额</span>
         </div>
 
-        <div class="ku-row" id="ku-sess-row" style="display:none">
+        <div class="ku-row" id="ku-sess-row" style="display:none" title="当前会话用量，滑入查看详情">
           <span class="ku-row-label">会话</span>
-          <span class="ku-row-cost" id="ku-sess-key" style="font-variant-numeric:tabular-nums;">--</span>
-          <span class="ku-row-val" id="ku-sess-val" style="margin-left:8px;min-width:0;">--</span>
+          <span class="ku-row-cost" id="ku-sess-key">--</span>
+          <span class="ku-row-val" id="ku-sess-tokens">--</span>
           <span class="ku-row-cost" id="ku-sess-cache">--</span>
+          <span class="ku-row-cost" id="ku-sess-cost">--</span>
         </div>
 
         <div class="ku-row ku-row-cache">
@@ -1165,7 +1457,7 @@
             <button class="ku-min-action-btn ku-min-btn-plus" id="ku-min-expand-btn" title="展开">+</button>
           </div>
         </div>
-        <div class="ku-min-model" id="ku-min-model"></div>
+        <div class="ku-min-model" id="ku-min-model">${kuMinModelHtml() || kuLastMinHtml || '<span class="ku-min-ph">--</span>'}</div>
       </div>
     `;
 
@@ -1224,6 +1516,7 @@
     if (footer && footer.parentNode) {
       const widget = createCard();
       footer.parentNode.insertBefore(widget, footer);
+      kuLastSig = '';
       updateDOM();
     }
   }
@@ -1292,7 +1585,7 @@
         sub: '成本 ' + (m.cost_fmt || '¥0') + ' · 缓存 ' + (m.cache_pct || 0) + '%'
       }
     ];
-    el.innerHTML = cards.map(function(c) {
+    kupSetHtml(el, cards.map(function(c) {
       return '<div class="kup-kpi-card ' + c.cls + '">' +
         '<div class="kup-kpi-head">' +
           '<span class="kup-kpi-title">' + c.label + '</span>' +
@@ -1306,7 +1599,13 @@
         '</div>' +
         '<div class="kup-kpi-sub-text"><span>' + esc(c.sub) + '</span></div>' +
       '</div>';
-    }).join('');
+    }).join(''));
+  }
+
+  function kupSetHtml(el, html) {
+    if (el._html === html && el.innerHTML) return;
+    el.innerHTML = html;
+    el._html = html;
   }
 
   function kupRenderSubMetrics() {
@@ -1333,12 +1632,12 @@
         sub: '重置 ' + (state.quota.h5.reset || '--')
       });
     }
-    el.innerHTML = pills.map(function(p) {
+    kupSetHtml(el, pills.map(function(p) {
       return '<div class="kup-sub-pill">' +
         '<div class="kup-sub-pill-left"><span>' + p.label + '</span><b>' + esc(p.val) + '</b></div>' +
         '<div class="kup-sub-pill-right">' + esc(p.sub) + '</div>' +
       '</div>';
-    }).join('');
+    }).join(''));
   }
 
   function kupSelectWavePeriod(p) {
@@ -1575,28 +1874,66 @@
     var table = kup$('kup-models-table');
     if (!table) return;
     if (!rows || !rows.length) {
-      table.innerHTML = '<tbody><tr><td class="kup-empty">该时段暂无模型调用数据</td></tr></tbody>';
+      if (table.getAttribute('data-mode') !== 'empty') {
+        table.innerHTML = '<tbody><tr><td class="kup-empty">该时段暂无模型调用数据</td></tr></tbody>';
+        table.setAttribute('data-mode', 'empty');
+      }
       return;
     }
     var maxT = 1;
     rows.forEach(function(m) { if ((m.tokens || 0) > maxT) maxT = m.tokens; });
-    var head = '<thead><tr><th>模型</th><th>占比</th><th>调用</th><th>输入 Token</th><th>输出 Token</th><th>缓存率</th><th>总 Token</th></tr></thead>';
-    var body = '<tbody>' + rows.map(function(m) {
+    var bodyRows = rows.map(function(m) {
       var pct = maxT > 0 ? ((m.tokens || 0) / maxT * 100) : 0;
       var full = m.model || m.raw_name || m.name || '';
       var name = m.name || (full ? full.split('/').pop() : '--');
       var cp = (m.cache_pct != null) ? m.cache_pct : null;
-      return '<tr>' +
-        '<td><div class="kup-model-cell"><span class="kup-model-name" title="' + esc(full) + '">' + esc(name) + '</span></div></td>' +
-        '<td><div class="kup-model-cell"><span class="bar"><i style="width:' + pct.toFixed(1) + '%"></i></span><span class="pct">' + pct.toFixed(1) + '%</span></div></td>' +
-        '<td class="kup-mono">' + kupFmt(m.calls) + '</td>' +
-        '<td class="kup-mono">' + esc(m.in_fmt || m.input_fmt || (m.input != null ? kupFmtK(m.input) : '--')) + '</td>' +
-        '<td class="kup-mono">' + esc(m.out_fmt || m.output_fmt || (m.output != null ? kupFmtK(m.output) : '--')) + '</td>' +
-        '<td><span class="' + kupRank(cp) + '">' + (cp != null ? cp + '%' : '--') + '</span></td>' +
-        '<td class="kup-mono" style="font-weight:700;color:var(--kup-accent2)">' + esc(m.tokens_fmt || kupFmt(m.tokens)) + '</td>' +
-      '</tr>';
-    }).join('') + '</tbody>';
-    table.innerHTML = head + body;
+      return {
+        name: name, full: full, pct: pct, calls: kupFmt(m.calls),
+        in: m.in_fmt || m.input_fmt || (m.input != null ? kupFmtK(m.input) : '--'),
+        out: m.out_fmt || m.output_fmt || (m.output != null ? kupFmtK(m.output) : '--'),
+        cpCls: kupRank(cp), cpTxt: (cp != null ? cp + '%' : '--'),
+        tokens: m.tokens_fmt || kupFmt(m.tokens)
+      };
+    });
+    var tbody = table.querySelector('tbody');
+    var trs = tbody ? tbody.querySelectorAll('tr') : [];
+    var rebuild = !tbody || table.getAttribute('data-mode') !== 'list' || trs.length !== bodyRows.length;
+    if (rebuild) {
+      var head = '<thead><tr><th>模型</th><th>占比</th><th>调用</th><th>输入 Token</th><th>输出 Token</th><th>缓存率</th><th>总 Token</th></tr></thead>';
+      var body = '<tbody>' + bodyRows.map(function(r) {
+        return '<tr>' +
+          '<td><div class="kup-model-cell"><span class="kup-model-name" title="' + esc(r.full) + '">' + esc(r.name) + '</span></div></td>' +
+          '<td><div class="kup-model-cell"><span class="bar"><i style="width:' + r.pct.toFixed(1) + '%"></i></span><span class="pct">' + r.pct.toFixed(1) + '%</span></div></td>' +
+          '<td class="kup-mono">' + r.calls + '</td>' +
+          '<td class="kup-mono">' + esc(r.in) + '</td>' +
+          '<td class="kup-mono">' + esc(r.out) + '</td>' +
+          '<td><span class="' + r.cpCls + '">' + r.cpTxt + '</span></td>' +
+          '<td class="kup-mono" style="font-weight:700;color:var(--kup-accent2)">' + esc(r.tokens) + '</td>' +
+        '</tr>';
+      }).join('') + '</tbody>';
+      table.innerHTML = head + body;
+      table.setAttribute('data-mode', 'list');
+      return;
+    }
+    // 就地更新
+    trs.forEach(function(tr, i) {
+      var r = bodyRows[i];
+      var tds = tr.querySelectorAll('td');
+      if (tds.length < 7) return;
+      var nameEl = tds[0].querySelector('.kup-model-name');
+      if (nameEl && nameEl.textContent !== r.name) { nameEl.textContent = r.name; nameEl.title = r.full; }
+      var barI = tds[1].querySelector('.bar i');
+      var pctEl = tds[1].querySelector('.pct');
+      var pctTxt = r.pct.toFixed(1) + '%';
+      if (barI) barI.style.width = pctTxt;
+      if (pctEl && pctEl.textContent !== pctTxt) pctEl.textContent = pctTxt;
+      if (tds[2].textContent !== r.calls) tds[2].textContent = r.calls;
+      if (tds[3].textContent !== r.in) tds[3].textContent = r.in;
+      if (tds[4].textContent !== r.out) tds[4].textContent = r.out;
+      var sp = tds[5].querySelector('span');
+      if (sp && (sp.textContent !== r.cpTxt || sp.className !== r.cpCls)) { sp.textContent = r.cpTxt; sp.className = r.cpCls; }
+      if (tds[6].textContent !== r.tokens) tds[6].textContent = r.tokens;
+    });
   }
 
   function kupRenderSessions() {
@@ -1604,24 +1941,55 @@
     if (!table) return;
     var rows = state.sessions || [];
     if (!rows.length) {
-      table.innerHTML = '<tbody><tr><td class="kup-empty">暂无会话数据</td></tr></tbody>';
+      if (table.getAttribute('data-mode') !== 'empty') {
+        table.innerHTML = '<tbody><tr><td class="kup-empty">暂无会话数据</td></tr></tbody>';
+        table.setAttribute('data-mode', 'empty');
+      }
       return;
     }
-    var head = '<thead><tr><th>会话</th><th>Token</th><th>调用</th><th>缓存率</th><th>估算成本</th><th>最近活动</th></tr></thead>';
-    var body = '<tbody>' + rows.map(function(s) {
+    // 表头只建一次；行数不变就地更新 td 文本，避免重建导致列宽/滚动位置抖动
+    var bodyRows = rows.map(function(s) {
       var cp = parseInt(s.cache_pct, 10);
       var key = s.key || s.id || '';
       var short = s.short || s.short_id || (key.length > 8 ? key.slice(0, 8) : key);
-      return '<tr>' +
-        '<td class="kup-mono" title="' + esc(key) + '">' + esc(short) + '</td>' +
-        '<td class="kup-mono" style="font-weight:600">' + esc(s.tokens_fmt || '--') + '</td>' +
-        '<td class="kup-mono">' + kupFmt(s.calls) + '</td>' +
-        '<td><span class="' + kupRank(cp) + '">' + (s.cache_pct != null ? s.cache_pct : '--') + '%</span></td>' +
-        '<td class="kup-mono">' + esc(s.cost_fmt || '--') + '</td>' +
-        '<td class="kup-mono" style="color:var(--kup-muted)">' + esc(s.last || '--') + '</td>' +
-      '</tr>';
-    }).join('') + '</tbody>';
-    table.innerHTML = head + body;
+      return {
+        key: key, short: short, tokens: s.tokens_fmt || '--', calls: kupFmt(s.calls),
+        cp: cp, cpCls: kupRank(cp), cpTxt: (s.cache_pct != null ? s.cache_pct : '--') + '%',
+        cost: s.cost_fmt || '--', last: s.last || '--'
+      };
+    });
+    var tbody = table.querySelector('tbody');
+    var trs = tbody ? tbody.querySelectorAll('tr') : [];
+    var rebuild = !tbody || table.getAttribute('data-mode') !== 'list' || trs.length !== bodyRows.length;
+    if (rebuild) {
+      var head = '<thead><tr><th>会话</th><th>Token</th><th>调用</th><th>缓存率</th><th>估算成本</th><th>最近活动</th></tr></thead>';
+      var body = '<tbody>' + bodyRows.map(function(r) {
+        return '<tr>' +
+          '<td class="kup-mono" title="' + esc(r.key) + '">' + esc(r.short) + '</td>' +
+          '<td class="kup-mono" style="font-weight:600">' + esc(r.tokens) + '</td>' +
+          '<td class="kup-mono">' + r.calls + '</td>' +
+          '<td><span class="' + r.cpCls + '">' + r.cpTxt + '</span></td>' +
+          '<td class="kup-mono">' + esc(r.cost) + '</td>' +
+          '<td class="kup-mono" style="color:var(--kup-muted)">' + esc(r.last) + '</td>' +
+        '</tr>';
+      }).join('') + '</tbody>';
+      table.innerHTML = head + body;
+      table.setAttribute('data-mode', 'list');
+      return;
+    }
+    // 就地更新
+    trs.forEach(function(tr, i) {
+      var r = bodyRows[i];
+      var tds = tr.querySelectorAll('td');
+      if (tds.length < 6) return;
+      if (tds[0].textContent !== r.short) { tds[0].textContent = r.short; tds[0].title = r.key; }
+      if (tds[1].textContent !== r.tokens) tds[1].textContent = r.tokens;
+      if (tds[2].textContent !== r.calls) tds[2].textContent = r.calls;
+      var sp = tds[3].querySelector('span');
+      if (sp && (sp.textContent !== r.cpTxt || sp.className !== r.cpCls)) { sp.textContent = r.cpTxt; sp.className = r.cpCls; }
+      if (tds[4].textContent !== r.cost) tds[4].textContent = r.cost;
+      if (tds[5].textContent !== r.last) tds[5].textContent = r.last;
+    });
   }
 
   function kupRenderDaily() {
@@ -1629,19 +1997,44 @@
     if (!table) return;
     var rows = (state.days30 || []).slice().reverse();
     if (!rows.length) {
-      table.innerHTML = '<tbody><tr><td class="kup-empty">暂无每日记录</td></tr></tbody>';
+      if (table.getAttribute('data-mode') !== 'empty') {
+        table.innerHTML = '<tbody><tr><td class="kup-empty">暂无每日记录</td></tr></tbody>';
+        table.setAttribute('data-mode', 'empty');
+      }
       return;
     }
-    var head = '<thead><tr><th>日期</th><th>总 Token</th><th>调用次数</th><th>估算成本</th></tr></thead>';
-    var body = '<tbody>' + rows.map(function(d) {
-      return '<tr>' +
-        '<td class="kup-mono">' + esc(d.date) + '</td>' +
-        '<td class="kup-mono" style="font-weight:600">' + esc(d.tokens_fmt || kupFmt(d.tokens)) + '</td>' +
-        '<td class="kup-mono">' + kupFmt(d.calls) + '</td>' +
-        '<td class="kup-mono">' + esc(d.cost_fmt || ('¥' + (d.cost || 0))) + '</td>' +
-      '</tr>';
-    }).join('') + '</tbody>';
-    table.innerHTML = head + body;
+    var bodyRows = rows.map(function(d) {
+      return {
+        date: d.date, tokens: d.tokens_fmt || kupFmt(d.tokens), calls: kupFmt(d.calls),
+        cost: d.cost_fmt || ('¥' + (d.cost || 0))
+      };
+    });
+    var tbody = table.querySelector('tbody');
+    var trs = tbody ? tbody.querySelectorAll('tr') : [];
+    var rebuild = !tbody || table.getAttribute('data-mode') !== 'list' || trs.length !== bodyRows.length;
+    if (rebuild) {
+      var head = '<thead><tr><th>日期</th><th>总 Token</th><th>调用次数</th><th>估算成本</th></tr></thead>';
+      var body = '<tbody>' + bodyRows.map(function(r) {
+        return '<tr>' +
+          '<td class="kup-mono">' + esc(r.date) + '</td>' +
+          '<td class="kup-mono" style="font-weight:600">' + esc(r.tokens) + '</td>' +
+          '<td class="kup-mono">' + r.calls + '</td>' +
+          '<td class="kup-mono">' + esc(r.cost) + '</td>' +
+        '</tr>';
+      }).join('') + '</tbody>';
+      table.innerHTML = head + body;
+      table.setAttribute('data-mode', 'list');
+      return;
+    }
+    trs.forEach(function(tr, i) {
+      var r = bodyRows[i];
+      var tds = tr.querySelectorAll('td');
+      if (tds.length < 4) return;
+      if (tds[0].textContent !== r.date) tds[0].textContent = r.date;
+      if (tds[1].textContent !== r.tokens) tds[1].textContent = r.tokens;
+      if (tds[2].textContent !== r.calls) tds[2].textContent = r.calls;
+      if (tds[3].textContent !== r.cost) tds[3].textContent = r.cost;
+    });
   }
 
   function kupRenderAll() {
@@ -1700,7 +2093,7 @@
             </div>
           </div>
           <div class="kup-shell" data-theme="dark">
-            <div class="kup-app">
+            <div class="kup-app" id="kup-app">
               <header class="kup-topbar">
                 <div class="kup-brand">
                   <div class="kup-brand-mark">⚡</div>
@@ -1786,8 +2179,8 @@
       `;
       document.body.appendChild(modal);
 
-      modal.querySelector('#kup-close').onclick = () => modal.classList.remove('active');
-      modal.onclick = (e) => { if (e.target === modal) modal.classList.remove('active'); };
+      modal.querySelector('#kup-close').onclick = closePanel;
+      modal.onclick = (e) => { if (e.target === modal) closePanel(); };
       modal.querySelector('#kup-theme-btn').onclick = () => {
         kupApplyTheme(kupTheme === 'dark' ? 'light' : 'dark');
       };
@@ -1806,9 +2199,38 @@
       });
       kupInitTheme();
     }
-    modal.classList.add('active');
-    kupRenderAll();
+    kuLayerShow(modal, 'active');
+    // 骨架占位：首次打开在重渲染完成前覆盖一层 shimmer，DOM/事件保持原样
+    var app = modal.querySelector('#kup-app');
+    var shell = modal.querySelector('.kup-shell');
+    if (app && shell && !app._kuRendered && !modal.querySelector('.kup-skel-overlay')) {
+      var skel = document.createElement('div');
+      skel.className = 'kup-skel-overlay';
+      skel.innerHTML = '<div class="kup-skel">' +
+        '<div class="kup-skel-row" style="width:42%"></div>' +
+        '<div class="kup-skel-row" style="width:86%"></div>' +
+        '<div class="kup-skel-row" style="width:64%"></div>' +
+        '<div class="kup-skel-row" style="width:74%"></div>' +
+        '<div class="kup-skel-row" style="width:55%"></div></div>';
+      shell.appendChild(skel);
+    }
+    // 重渲染放到下一帧 / 空闲时，让面板动画先起来（点击即时响应）
+    kuScheduleIdle(function() {
+      try {
+        kupRenderAll();
+        if (app) app._kuRendered = true;
+      } finally {
+        // 渲染异常也必须摘掉骨架层，否则白板永久盖住面板
+        var sk = modal.querySelector('.kup-skel-overlay');
+        if (sk) sk.remove();
+      }
+    });
     if (kupUpdateInfo === null) kupCheckUpdate(true);
+  }
+
+  function closePanel() {
+    var modal = document.getElementById(PANEL_MODAL_ID);
+    kuLayerHide(modal, 'active');
   }
 
   /* ================================================================
@@ -1963,16 +2385,17 @@
 
   function openModelModal() {
     var overlay = ensureModelOverlay();
-    overlay.classList.add('visible');
+    kuLayerShow(overlay, 'visible');
     isModelModalOpen = true;
-    kmmRenderModalCards();
+    // 卡片渲染走空闲回调，overlay 先淡入
+    kuScheduleIdle(function() { kmmRenderModalCards(); });
     fetchModels();
     if (!apiAlive) {
       kmmToast('⚠️ 后台服务离线：当前为缓存数据只读展示', true);
     }
   }
   function closeModelModal() {
-    if (kmmOverlayEl) kmmOverlayEl.classList.remove('visible');
+    if (kmmOverlayEl) kuLayerHide(kmmOverlayEl, 'visible');
     isModelModalOpen = false;
   }
 
@@ -2179,8 +2602,8 @@
     document.body.appendChild(o);
     kprOverlayEl = o;
     var $q = function(id) { return o.querySelector('#' + id); };
-    $q('kpr-cancel').onclick = function() { o.classList.remove('visible'); };
-    o.onclick = function(e) { if (e.target === o) o.classList.remove('visible'); };
+    $q('kpr-cancel').onclick = function() { kuLayerHide(o, 'visible'); };
+    o.onclick = function(e) { if (e.target === o) kuLayerHide(o, 'visible'); };
     $q('kpr-mode-volume').onclick = function() { kprSetMode('volume'); };
     $q('kpr-mode-call').onclick = function() { kprSetMode('per_call'); };
     $q('kpr-save').onclick = function() { kprSave(false); };
@@ -2209,7 +2632,7 @@
     o.querySelector('#kpr-cache-write').value = (p && p.cache_write != null) ? p.cache_write : '';
     o.querySelector('#kpr-price').value = (p && p.price != null) ? p.price : 0;
     kprSetMode(p ? p.mode : 'volume');
-    o.classList.add('visible');
+    kuLayerShow(o, 'visible');
     if (!apiAlive) kmmToast('⚠️ 后台服务离线，无法保存', true);
   };
 
@@ -2231,7 +2654,7 @@
     }).then(function(r) { return r.json(); }).then(function(data) {
       if (data.success) {
         kmmToast(reset ? '已恢复默认计价' : '价格已保存');
-        kprOverlayEl.classList.remove('visible');
+        kuLayerHide(kprOverlayEl, 'visible');
         fetchModels();
       } else kmmToast(data.message || '保存失败', true);
     }).catch(function() { kmmToast('保存失败: 后台服务未响应', true); });
@@ -2411,18 +2834,42 @@
         state = u;
         lastDataTime = parseTimeMs(d.time) || parseTimeMs(u.updated_at);
         serviceOnline = (lastDataTime > 0 && (Date.now() - lastDataTime) <= STALE_MS) || apiAlive;
-        updateDOM();
-        kupRenderAll();
+        if (kuDataChanged(u)) {
+          updateDOM();
+          kupRenderAll();
+        }
       }
     } else if (d.usage && d.usage.error) {
       serviceOnline = false;
       applyServiceFlag();
     }
     if (d.models) {
-      modelsData = d.models;
-      if (isModelModalOpen) kmmRenderModalCards();
-      updateDOM();
+      var mSig;
+      try { mSig = JSON.stringify(d.models); } catch (e) { mSig = null; }
+      if (mSig !== null && mSig !== kuLastModelsSig) {
+        kuLastModelsSig = mSig;
+        modelsData = d.models;
+        if (isModelModalOpen) kmmRenderModalCards();
+        updateDOM();
+      }
     }
+  }
+
+  // 数据签名：忽略每次写盘都会变的时间戳，内容未变则跳过重渲染（避免周期性抖动）
+  var kuLastSig = '';
+  var kuLastModelsSig = '';
+  var kuLastOnline = null;
+  function kuDataChanged(u) {
+    var sig;
+    try {
+      sig = JSON.stringify(u, function(k, v) {
+        return (k === 'updated_at' || k === 'time') ? undefined : v;
+      });
+    } catch (e) { return true; }
+    var changed = sig !== kuLastSig || kuLastOnline !== serviceOnline;
+    kuLastSig = sig;
+    kuLastOnline = serviceOnline;
+    return changed;
   }
 
   // 数据文件重写后的实时回调（链式：不覆盖其他 widget 的回调）
@@ -2460,8 +2907,10 @@
             if (!serviceOnline) {
               serviceOnline = lastDataTime > 0 && (Date.now() - lastDataTime) <= STALE_MS;
             }
-            updateDOM();
-            kupRenderAll();
+            if (kuDataChanged(u)) {
+              updateDOM();
+              kupRenderAll();
+            }
           }
         }
       }

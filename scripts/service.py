@@ -236,12 +236,15 @@ def migrate_legacy():
 
 # 注入标签统一由 ensure_injection/_INJECT_RE 管理（widget 带 ?v=mtime 版本号）
 _INJECT_RE = re.compile(r'\s*<script src="/assets/kimi-(embedded|usage)-(data|widget)\.js[^"]*"></script>\s*')
+# 旧套件残留的根路径注入（/kimi-usage-widget.js 等非 /assets/ 前缀）——会与新版卡片
+# 争用同一 DOM 容器且不渲染模型/会话行，必须一并清掉，不能只靠 _INJECT_RE
+_LEGACY_ROOT_INJECT_RE = re.compile(r'\s*<script src="/kimi-[a-z-]*(?:data|widget)\.js[^"]*"></script>\s*')
 
 
 def strip_legacy_injections():
     try:
         html = io.open(INDEX_HTML, encoding='utf-8').read()
-        new_html = _INJECT_RE.sub('\n', html)
+        new_html = _LEGACY_ROOT_INJECT_RE.sub('\n', _INJECT_RE.sub('\n', html))
         if new_html != html:
             io.open(INDEX_HTML, 'w', encoding='utf-8').write(new_html)
     except Exception:
@@ -264,7 +267,7 @@ def ensure_injection():
         return
     try:
         html = io.open(INDEX_HTML, encoding='utf-8').read()
-        new_html = _INJECT_RE.sub('\n', html)
+        new_html = _LEGACY_ROOT_INJECT_RE.sub('\n', _INJECT_RE.sub('\n', html))
         data_tag = '<script src="/assets/kimi-usage-data.js"></script>'
         widget_tag = _widget_tag()
         block = '  %s\n  %s\n' % (data_tag, widget_tag)

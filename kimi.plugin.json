@@ -1,10 +1,17 @@
 {
   "name": "kimi-code-usage",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "description": "Kimi Code 用量面板：侧栏实时卡片 + 全屏报表 + 模型能力管理，桌面端内一体化",
   "author": "Kimi Code Community",
   "license": "MIT",
-  "keywords": ["usage", "tokens", "cost", "dashboard", "models", "quota"],
+  "keywords": [
+    "usage",
+    "tokens",
+    "cost",
+    "dashboard",
+    "models",
+    "quota"
+  ],
   "skills": "./skills/",
   "commands": "./commands/",
   "systemPromptPath": "./SYSTEM.md",
