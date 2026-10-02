@@ -153,7 +153,8 @@ def _input(u):
 
 def _new_bucket():
     return {'tokens': 0, 'cost': 0.0, 'input': 0, 'output': 0,
-            'cache_read': 0, 'cache_create': 0, 'records': 0}
+            'cache_read': 0, 'cache_create': 0, 'records': 0,
+            'cache_reported': False}
 
 
 def _add(bucket, u, cost=None):
@@ -163,11 +164,19 @@ def _add(bucket, u, cost=None):
     bucket['output'] += u.get('output', 0)
     bucket['cache_read'] += u.get('inputCacheRead', 0)
     bucket['cache_create'] += u.get('inputCacheCreation', 0)
+    if u.get('inputCacheRead') or u.get('inputCacheCreation'):
+        bucket['cache_reported'] = True
     bucket['records'] += 1
 
 
 def _hit(b):
     return (b['cache_read'] / b['input']) if b.get('input') else 0.0
+
+
+def _fix_cache_reported(b):
+    """老版本持久化档没有 cache_reported：已有非零缓存量即视为上游会上报。"""
+    if not b.get('cache_reported') and (b.get('cache_read') or b.get('cache_create')):
+        b['cache_reported'] = True
 
 
 class _Agg(object):
@@ -420,6 +429,7 @@ class UsageScanner(object):
             rows = [{'model': m, 'tokens': b['tokens'], 'cost': b['cost'],
                      'input': b['input'], 'output': b['output'],
                      'cache_read': b['cache_read'], 'cache_create': b['cache_create'],
+                     'cache_reported': b.get('cache_reported', False),
                      'records': b['records'], 'calls': b['records'],
                      'hit': _hit(b)} for m, b in mdict.items()]
             rows.sort(key=lambda r: -r['tokens'])
@@ -508,10 +518,12 @@ class UsageScanner(object):
                 for m, b in (st.get('models_today') or {}).items():
                     nb = _new_bucket()
                     nb.update({k: v for k, v in b.items() if k in nb})
+                    _fix_cache_reported(nb)
                     self._agg.models_today[m] = nb
             for m, b in (st.get('models_all') or {}).items():
                 nb = _new_bucket()
                 nb.update({k: v for k, v in b.items() if k in nb})
+                _fix_cache_reported(nb)
                 self._agg.models_all[m] = nb
             for dk, b in (st.get('daily') or {}).items():
                 nb = _new_bucket()
@@ -521,6 +533,7 @@ class UsageScanner(object):
                 for m, b in mdict.items():
                     nb = _new_bucket()
                     nb.update({k: v for k, v in b.items() if k in nb})
+                    _fix_cache_reported(nb)
                     self._agg.daily_models.setdefault(dk, {})[m] = nb
             for dk, hmap in (st.get('hourly') or {}).items():
                 for h, cell in hmap.items():
@@ -528,6 +541,7 @@ class UsageScanner(object):
             for sk, b in (st.get('sessions') or {}).items():
                 nb = _new_bucket()
                 nb.update({k: v for k, v in b.items() if k in nb or k == 'last'})
+                _fix_cache_reported(nb)
                 self._sess[sk] = nb
             sp = st.get('speed') or {}
             self._speed_out = int(sp.get('out') or 0)

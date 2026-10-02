@@ -38,9 +38,9 @@
     const top = rows[0];
     if (!top || !top.model || top.model === '--') return '';
     const name = String(top.model).split('/').pop();
-    const cp = (top.cache_pct != null) ? top.cache_pct : 0;
+    const cp = kupCacheTxt(top);
     return esc(name) + ' · <b>' + esc(top.tokens_fmt || fmtTok(top.tokens))
-      + '</b> <span class="c">' + esc(cp) + '%</span>'
+      + '</b> <span class="c">' + esc(cp) + '</span>'
       + ' <span class="m">' + esc(top.cost_fmt || '--') + '</span>';
   }
 
@@ -1233,7 +1233,7 @@
         const sTok = card.querySelector('#ku-sess-tokens');
         if (sTok) sTok.textContent = s.tokens_fmt || '--';
         const sCache = card.querySelector('#ku-sess-cache');
-        if (sCache) sCache.textContent = (s.cache_pct != null ? s.cache_pct : '--') + '%';
+        if (sCache) sCache.textContent = kupCacheTxt(s);
         const sCost = card.querySelector('#ku-sess-cost');
         if (sCost) sCost.textContent = s.cost_fmt || '--';
         // 只在会话 key 上滑入弹详情
@@ -1241,7 +1241,7 @@
           return kuPopRow('会话 ID', sKey || '--') +
             kuPopRow('Token', s.tokens_fmt || '--') +
             kuPopRow('调用次数', (s.calls != null ? s.calls : '--') + ' 次') +
-            kuPopRow('缓存率', (s.cache_pct != null ? s.cache_pct : '--') + '%') +
+            kuPopRow('缓存率', kupCacheTxt(s)) +
             kuPopRow('估算成本', s.cost_fmt || '--') +
             (s.last ? kuPopRow('最近活动', s.last) : '');
         }, '会话详情');
@@ -1309,7 +1309,7 @@
         var costEl = item.querySelector('.ku-m-cost');
         if (nameEl) { var nm = m.name || (full ? full.split('/').pop() : '--'); if (nameEl.textContent !== nm) nameEl.textContent = nm; }
         if (tokEl) { var t = m.tokens_fmt || '--'; if (tokEl.textContent !== t) tokEl.textContent = t; }
-        if (cacheEl) { var c = (m.cache_pct != null ? m.cache_pct : '--') + '%'; if (cacheEl.textContent !== c) cacheEl.textContent = c; }
+        if (cacheEl) { var c = kupCacheTxt(m); if (cacheEl.textContent !== c) cacheEl.textContent = c; }
         if (costEl) { var co = m.cost_fmt || '--'; if (costEl.textContent !== co) costEl.textContent = co; }
       });
       return;
@@ -1322,7 +1322,7 @@
       return `<div class="ku-model-item" data-i="${i}" title="${esc(full)}">
         <span class="ku-m-name">${esc(name)}</span>
         <span class="ku-m-tokens">${esc(m.tokens_fmt)}</span>
-        <span class="ku-m-cache">${m.cache_pct != null ? m.cache_pct : '--'}%</span>
+        <span class="ku-m-cache">${kupCacheTxt(m)}</span>
         <span class="ku-m-cost">${esc(m.cost_fmt)}</span>
       </div>`;
     }).join('');
@@ -1335,7 +1335,7 @@
         return kuPopRow('模型', m.model || m.raw_name || m.name || '--') +
           kuPopRow('Token', m.tokens_fmt || '--') +
           kuPopRow('调用次数', (m.calls != null ? m.calls : '--') + ' 次') +
-          kuPopRow('缓存率', (m.cache_pct != null ? m.cache_pct : '--') + '%') +
+          kuPopRow('缓存率', kupCacheTxt(m)) +
           kuPopRow('估算成本', m.cost_fmt || '--');
       }, '模型调用明细');
     });
@@ -1545,6 +1545,11 @@
     if (pct >= 70) return 'kup-tag';
     if (pct >= 40) return 'kup-tag warn';
     return 'kup-tag low';
+  }
+  // 上游不回传缓存字段（如反代渠道）时显示 —，而不是误报 0%
+  function kupCacheTxt(m) {
+    if (m && m.cache_reported === false) return '—';
+    return (m && m.cache_pct != null) ? m.cache_pct + '%' : '--';
   }
   function kupShowErr(msg) {
     var b = kup$('kup-err');
@@ -1886,12 +1891,13 @@
       var pct = maxT > 0 ? ((m.tokens || 0) / maxT * 100) : 0;
       var full = m.model || m.raw_name || m.name || '';
       var name = m.name || (full ? full.split('/').pop() : '--');
-      var cp = (m.cache_pct != null) ? m.cache_pct : null;
+      var cp = (m.cache_reported === false) ? null
+        : ((m.cache_pct != null) ? m.cache_pct : null);
       return {
         name: name, full: full, pct: pct, calls: kupFmt(m.calls),
         in: m.in_fmt || m.input_fmt || (m.input != null ? kupFmtK(m.input) : '--'),
         out: m.out_fmt || m.output_fmt || (m.output != null ? kupFmtK(m.output) : '--'),
-        cpCls: kupRank(cp), cpTxt: (cp != null ? cp + '%' : '--'),
+        cpCls: kupRank(cp), cpTxt: kupCacheTxt(m),
         tokens: m.tokens_fmt || kupFmt(m.tokens)
       };
     });
@@ -1949,12 +1955,12 @@
     }
     // 表头只建一次；行数不变就地更新 td 文本，避免重建导致列宽/滚动位置抖动
     var bodyRows = rows.map(function(s) {
-      var cp = parseInt(s.cache_pct, 10);
+      var cp = (s.cache_reported === false) ? null : parseInt(s.cache_pct, 10);
       var key = s.key || s.id || '';
       var short = s.short || s.short_id || (key.length > 8 ? key.slice(0, 8) : key);
       return {
         key: key, short: short, tokens: s.tokens_fmt || '--', calls: kupFmt(s.calls),
-        cp: cp, cpCls: kupRank(cp), cpTxt: (s.cache_pct != null ? s.cache_pct : '--') + '%',
+        cp: cp, cpCls: kupRank(cp), cpTxt: kupCacheTxt(s),
         cost: s.cost_fmt || '--', last: s.last || '--'
       };
     });
@@ -2748,10 +2754,11 @@
         if (ds < startStr || ds > todayStr) return;
         (dailyModels[k] || []).forEach(function(m) {
           var key = m.model || '?';
-          var acc = byModel[key] || (byModel[key] = { model: key, tokens: 0, input: 0, output: 0, calls: 0, cost: 0, cache_read: 0 });
+          var acc = byModel[key] || (byModel[key] = { model: key, tokens: 0, input: 0, output: 0, calls: 0, cost: 0, cache_read: 0, cache_reported: false });
           acc.tokens += m.tokens || 0; acc.input += m.input || 0; acc.output += m.output || 0;
           acc.calls += (m.records != null ? m.records : m.calls) || 0; acc.cost += m.cost || 0;
           acc.cache_read += m.cache_read || 0;
+          if (m.cache_reported) acc.cache_reported = true;
         });
       });
       var rows = Object.keys(byModel).map(function(k) {
@@ -2772,6 +2779,7 @@
         key: key, short: key.replace(/^session_/, '').slice(0, 8),
         tokens: s.tokens || 0, tokens_fmt: fmtTok(s.tokens), calls: s.records || 0,
         cache_pct: Math.round((s.hit || 0) * 1000) / 10,
+        cache_reported: (s.cache_reported !== false),
         cost: s.cost || 0, cost_fmt: fmtCost(s.cost),
         last: s.last ? fmtDateTime(s.last).slice(5) : '--'
       };
@@ -2782,6 +2790,7 @@
           model: m.model || '--', tokens: m.tokens || 0, tokens_fmt: fmtTok(m.tokens),
           calls: (m.calls != null ? m.calls : m.records) || 0,
           cache_pct: (m.cache_pct != null ? m.cache_pct : (m.hit != null ? Math.round(m.hit * 1000) / 10 : 0)),
+          cache_reported: (m.cache_reported !== false),
           cost: m.cost || 0, cost_fmt: fmtCost(m.cost),
           input: m.input || 0, output: m.output || 0,
           in_fmt: (m.in_fmt != null) ? m.in_fmt : fmtTok(m.input),

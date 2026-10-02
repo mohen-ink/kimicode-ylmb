@@ -354,9 +354,13 @@ def _models_in_range(daily_models, start_key, end_key):
             continue
         for m, b in mdict.items():
             a = acc.setdefault(m, {'tokens': 0, 'cost': 0.0, 'input': 0, 'output': 0,
-                                   'cache_read': 0, 'cache_create': 0, 'records': 0})
+                                   'cache_read': 0, 'cache_create': 0, 'records': 0,
+                                   'cache_reported': False})
             for f in a:
-                a[f] += b.get(f, 0)
+                if f == 'cache_reported':
+                    a[f] = a[f] or bool(b.get(f))
+                else:
+                    a[f] += b.get(f, 0)
     return acc
 
 
@@ -379,6 +383,7 @@ def _model_rows(rows):
             'model': r['model'], 'tokens': r['tokens'], 'tokens_fmt': _fmt_tokens(r['tokens']),
             'calls': r.get('calls', r.get('records', 0)),
             'cache_pct': round(r.get('hit', 0.0) * 100, 1),
+            'cache_reported': r.get('cache_reported', True),
             'cost': round(cost, 1), 'cost_fmt': _fmt_cost(cost),
             'input': int(r.get('input', 0)), 'output': int(r.get('output', 0)),
             'in_fmt': _fmt_tokens(r.get('input', 0)), 'out_fmt': _fmt_tokens(r.get('output', 0)),
@@ -401,6 +406,7 @@ def _session_rows(rows):
             'key': key, 'short': short,
             'tokens': r['tokens'], 'tokens_fmt': _fmt_tokens(r['tokens']),
             'calls': r.get('records', 0), 'cache_pct': round(r['hit'] * 100, 1),
+            'cache_reported': r.get('cache_reported', True),
             'cost': round(r['cost'], 1), 'cost_fmt': _fmt_cost(r['cost']),
             'last': r.get('last', 0),
         })
@@ -541,6 +547,7 @@ def build_dashboard(snap, official):
         'session': ({
             'key': sess.get('key', ''), 'tokens_fmt': _fmt_tokens(sess.get('tokens', 0)),
             'calls': sess.get('records', 0), 'cache_pct': round(sess.get('hit', 0) * 100, 1),
+            'cache_reported': sess.get('cache_reported', True),
             'cost_fmt': _fmt_cost(sess.get('cost', 0.0)),
         } if sess else None),
         'quota': quota,
