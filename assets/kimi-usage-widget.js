@@ -1164,6 +1164,13 @@
     #kud-modal .kud-tip { font-size: 11.5px; color: var(--color-text-faint, #94a3b8); margin-top: 8px; }
     #kud-modal .kud-foot { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
     #kud-modal .kud-foot button { padding: 8px 20px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; }
+    #kud-notes { margin-top: 12px; max-height: 38vh; overflow-y: auto; padding: 10px 12px; border-radius: 10px;
+      background: var(--color-surface-sunken, #eef0f2); font-size: 12px; line-height: 1.65; color: var(--color-text-secondary, #64748b); }
+    #kud-notes .kud-n-h { margin-top: 8px; font-weight: 700; color: var(--color-text, #1f2329); }
+    #kud-notes .kud-n-h:first-child { margin-top: 0; }
+    #kud-notes .kud-n-li { padding-left: 2px; }
+    #kud-notes .kud-n-p { margin-bottom: 4px; }
+    #kud-modal { width: 440px; }
     #kud-cancel { background: var(--color-surface-sunken, #eef0f2); color: var(--color-text-secondary, #64748b); }
     #kud-ok { background: var(--color-accent, #1a88ff); color: #fff; }
     #kmm-toast {
@@ -2374,7 +2381,8 @@
       o.id = 'kud-overlay';
       o.innerHTML = '<div id="kud-modal">' +
         '<h3>发现新版本</h3>' +
-        '<div class="kud-ver">当前版本 v<span id="kud-cur"></span><br>最新版本 <b>v<span id="kud-new"></span></b></div>' +
+        '<div class="kud-ver">当前版本 v<span id="kud-cur"></span><br>最新版本 <b>v<span id="kud-new"></span></b><span id="kud-date" style="margin-left:8px;font-size:11.5px;color:var(--color-text-faint,#94a3b8);"></span></div>' +
+        '<div id="kud-notes"></div>' +
         '<div class="kud-tip">更新后后台服务会自动重启，几秒钟后恢复。</div>' +
         '<div class="kud-foot"><button id="kud-cancel">稍后</button><button id="kud-ok">立即更新</button></div>' +
         '</div>';
@@ -2384,6 +2392,16 @@
     }
     o.querySelector('#kud-cur').textContent = info.current;
     o.querySelector('#kud-new').textContent = info.latest;
+    o.querySelector('#kud-date').textContent = info.released ? '发布于 ' + info.released : '';
+    var nb = o.querySelector('#kud-notes');
+    nb.innerHTML = '';
+    (info.notes || []).forEach(function(n) {
+      var d = document.createElement('div');
+      d.className = 'kud-n-' + n.t;
+      d.textContent = (n.t === 'li' ? '• ' : '') + n.text;
+      nb.appendChild(d);
+    });
+    nb.style.display = (info.notes && info.notes.length) ? 'block' : 'none';
     o.querySelector('#kud-ok').onclick = function() { kuLayerHide(o, 'visible'); onOk(); };
     kuLayerShow(o, 'visible');
   }
@@ -2546,10 +2564,33 @@
     var kw = filterEl ? filterEl.value.trim().toLowerCase() : '';
     container.innerHTML = '';
     var au = modelsData.effort_audit || {};
-    if (au.error || au.warn) {
+    var ign = modelsData.dismissed_count || 0;
+    var fixable = 0;
+    (modelsData.models || []).forEach(function(m) {
+      (m.effort_issues || []).forEach(function(it) {
+        if (!it.dismissed && it.level !== 'info' && it.fix && it.code !== 'no_support_efforts') fixable++;
+      });
+    });
+    if (au.error || au.warn || ign) {
       var sum = document.createElement('div');
-      sum.style.cssText = 'font-size:12px;padding:8px 12px;border-radius:8px;margin-bottom:8px;border:1px solid color-mix(in srgb,var(--color-warning,#d29922) 40%,transparent);background:color-mix(in srgb,var(--color-warning,#d29922) 10%,transparent);color:var(--color-text,#e5e7eb);';
-      sum.textContent = '思考强度检查：' + (au.error ? au.error + ' 个错误' : '') + (au.error && au.warn ? '、' : '') + (au.warn ? au.warn + ' 个警告' : '') + '，详见各模型卡片';
+      sum.style.cssText = 'font-size:12px;padding:9px 12px;border-radius:10px;margin-bottom:2px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;'
+        + 'border:1px solid color-mix(in srgb,var(--color-warning,#d29922) 40%,transparent);background:color-mix(in srgb,var(--color-warning,#d29922) 10%,transparent);color:var(--color-text,#e5e7eb);';
+      var parts = [];
+      if (au.error) parts.push(au.error + ' 个错误');
+      if (au.warn) parts.push(au.warn + ' 个警告');
+      var txt = document.createElement('span');
+      txt.style.flex = '1';
+      txt.textContent = parts.length ? '思考强度检查：' + parts.join('、') : '思考强度检查：全部通过';
+      sum.appendChild(txt);
+      var mk = function(label, fn) {
+        var bt = document.createElement('button');
+        bt.className = 'kmm-link accent';
+        bt.textContent = label;
+        bt.onclick = fn;
+        sum.appendChild(bt);
+      };
+      if (fixable) mk('一键修复 ' + fixable + ' 项', function() { window.__KMM_ISSUE('', '', 'fix_all'); });
+      if (ign) mk('已忽略 ' + ign + ' 项 · 恢复', function() { window.__KMM_ISSUE('', '', 'unignore_all'); });
       container.appendChild(sum);
     }
 
@@ -2578,15 +2619,17 @@
       var effOutOfList = !!(efforts && m.default_effort && efforts.indexOf(m.default_effort) < 0);
       var selTitle = (m.efforts_source === 'config' ? '档位来自本机配置' : '档位为默认兜底（config.toml 未声明 support_efforts）');
       var issues = m.effort_issues || [];
-      var infoTitle = issues.filter(function(it) { return it.level === 'info'; }).map(function(it) { return it.msg; }).join('\n');
-      var actualHtml = (m.effective_effort && m.has_thinking)
-        ? '<span class="kmm-note" title="' + esc(infoTitle || '主 Agent 实际使用的思考档位') + '">实际生效 ' + esc(m.effective_effort) + (infoTitle ? ' ⓘ' : '') + '</span>'
-        : '';
       var alwaysOn = !!m.always_thinking;
       var a = JSON.stringify(m.alias);
-      var warnHtml = issues.filter(function(it) { return it.level !== 'info'; }).map(function(it) {
+      var warnHtml = issues.filter(function(it) { return it.level !== 'info' && !it.dismissed; }).map(function(it) {
         var c = it.level === 'error' ? 'var(--color-danger,#f85149)' : 'var(--color-warning,#d29922)';
-        return '<div class="kmm-warn" style="color:' + c + ';">' + (it.level === 'error' ? '✖ ' : '⚠ ') + esc(it.msg) + '</div>';
+        var btns = '';
+        if (it.code) {
+          if (it.fix) btns += "<button class=\"kmm-link accent\" onclick='window.__KMM_ISSUE(" + a + ", \"" + it.code + "\", \"fix\")'>" + esc(it.fix) + '</button>';
+          btns += "<button class=\"kmm-link\" onclick='window.__KMM_ISSUE(" + a + ", \"" + it.code + "\", \"ignore\")'>忽略</button>";
+        }
+        return '<div class="kmm-warn" style="color:' + c + ';display:flex;align-items:center;gap:6px;flex-wrap:wrap;">'
+          + '<span style="flex:1;min-width:200px;">' + (it.level === 'error' ? '✖ ' : '⚠ ') + esc(it.msg) + '</span>' + btns + '</div>';
       }).join('');
       var chip = function(cap, label, on, locked, tip) {
         return '<label class="kmm-chip' + (on ? ' on' : '') + (locked ? ' lock' : '') + '"' + (tip ? ' title="' + esc(tip) + '"' : '') + '>'
@@ -2624,9 +2667,8 @@
         + chip('thinking', '思考', !!(m.has_thinking || alwaysOn), alwaysOn, alwaysOn ? '思考常开，不可关闭' : '')
         + chip('tool_use', '工具', !!m.has_tools, false, '')
         + '</div>'
-        + '<div class="kmm-eff"><span class="kmm-eff-label">思考强度</span>' + segHtml
+        + '<div class="kmm-eff"><span class="kmm-eff-label" title="新会话启动时的默认思考强度，会话内仍可随时手动切换">默认强度</span>' + segHtml
         + (effOutOfList ? '<span class="kmm-warn" style="margin:0;color:var(--color-warning,#d29922);">⚠ 当前 ' + esc(m.default_effort) + ' 不在列表</span>' : '')
-        + actualHtml
         + '</div></div>'
         + warnHtml;
       container.appendChild(card);
@@ -2668,6 +2710,21 @@
         fetchModels();
       } else kmmToast(data.message, true);
     } catch (e) { kmmToast('保存失败: 后台服务未响应', true); }
+  };
+
+  window.__KMM_ISSUE = async function(alias, code, action) {
+    if (action === 'fix_all' && !confirm('将自动修复可确定的问题（协议拼写、缺失的思考标签、默认档不在列表等）。修改前会备份并校验 config.toml，继续吗？')) return;
+    if (action === 'fix' && code === 'no_support_efforts' && !confirm('将为该模型写入 support_efforts = low / medium / high / xhigh / max。\n如果上游并不支持其中某些档位，选到它会失败。继续吗？')) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/issue-action`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: action, alias: alias, code: code })
+      });
+      const data = await res.json();
+      kmmToast(data.message, !data.success);
+      if (data.success) fetchModels();
+    } catch (e) { kmmToast('操作失败: 后台服务未响应', true); }
   };
 
   window.__KMM_EFFORT = async function(alias, defaultEffort) {

@@ -74,3 +74,4 @@ new_html = _LEGACY_ROOT_INJECT_RE.sub('\n', _INJECT_RE.sub('\n', html))
 - `scripts/bootstrap.cmd` 必须纯 ASCII + CRLF（`.gitattributes` 已设 `*.cmd -text`），否则 GBK 下 cmd 解析乱码导致服务拉不起来。
 - 每日更新提醒：前端 localStorage（kimi-usage-upd-last/found/mute/ver），24h 最多静默检查一次，只亮红点；「更新提醒」按钮可关闭。
 - 模型管理弹窗重做：胶囊开关 + 分段式思考强度；/api/add-model 不再猜测档位，仅在传入 support_efforts 时写入（并校验）。
+- 更新弹窗显示发布时间与更新内容：服务读取仓库根目录 CHANGELOG.md（`## vX.Y.Z · 日期` 一节）。发版时请先更新 CHANGELOG.md 再改 kimi.plugin.json 版本号。

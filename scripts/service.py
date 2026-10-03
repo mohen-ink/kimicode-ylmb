@@ -45,6 +45,7 @@ LOG_FILE = os.path.join(SCRIPT_DIR, 'service.log')
 
 WIDGET_SRC = os.path.join(ASSETS_SRC, 'kimi-usage-widget.js')
 PRICING_PATH = os.path.join(KIMI_HOME, 'usage-dashboard', 'pricing.json')
+DISMISS_PATH = os.path.join(KIMI_HOME, 'usage-dashboard', 'dismissed-issues.json')
 
 # 自更新源：GitHub 仓库（改源只需改 UPDATE_REPO）
 UPDATE_REPO = 'ziyiclouds-blip/kimicode-ylmb'
@@ -54,6 +55,10 @@ UPDATE_MANIFEST_URL = ('https://api.github.com/repos/%s/contents/kimi.plugin.jso
                        % (UPDATE_REPO, UPDATE_BRANCH))
 UPDATE_MANIFEST_RAW_URL = ('https://raw.githubusercontent.com/%s/%s/kimi.plugin.json'
                            % (UPDATE_REPO, UPDATE_BRANCH))
+UPDATE_CHANGELOG_URL = ('https://api.github.com/repos/%s/contents/CHANGELOG.md?ref=%s'
+                       % (UPDATE_REPO, UPDATE_BRANCH))
+UPDATE_CHANGELOG_RAW_URL = ('https://raw.githubusercontent.com/%s/%s/CHANGELOG.md'
+                            % (UPDATE_REPO, UPDATE_BRANCH))
 UPDATE_ZIP_URL = 'https://codeload.github.com/%s/zip/refs/heads/%s' % (UPDATE_REPO, UPDATE_BRANCH)
 
 
@@ -75,6 +80,21 @@ def load_pricing():
         return d if isinstance(d, dict) else {}
     except Exception:
         return {}
+
+
+def load_dismissed():
+    try:
+        with open(DISMISS_PATH, encoding='utf-8') as f:
+            d = json.load(f)
+        return set(d) if isinstance(d, list) else set()
+    except Exception:
+        return set()
+
+
+def save_dismissed(items):
+    os.makedirs(os.path.dirname(DISMISS_PATH), exist_ok=True)
+    with open(DISMISS_PATH, 'w', encoding='utf-8') as f:
+        json.dump(sorted(items), f, ensure_ascii=False)
 
 
 def save_pricing(alias, entry):
@@ -750,8 +770,15 @@ def analyze_model_effort(alias, m, provider, thinking_cfg):
     g_eff = thinking_cfg.get('effort')
     issues = []
 
-    def add(level, msg):
-        issues.append({'level': level, 'msg': msg})
+    def add(level, msg, code=None, fix=None, fix_value=None):
+        it = {'level': level, 'msg': msg}
+        if code:
+            it['code'] = code
+        if fix:
+            it['fix'] = fix
+        if fix_value is not None:
+            it['fix_value'] = fix_value
+        issues.append(it)
 
     bad = [x for x in sup if x not in EFFORT_LEVELS]
     if bad:
@@ -759,11 +786,15 @@ def analyze_model_effort(alias, m, provider, thinking_cfg):
     if dflt is not None and dflt not in EFFORT_LEVELS:
         add('error', 'default_effort="%s" 不是合法档位（合法值：%s）' % (dflt, '/'.join(EFFORT_LEVELS)))
     if sup and dflt and dflt not in sup:
-        add('error', 'default_effort="%s" 不在 support_efforts %s 内，官方会回退或直接报错' % (dflt, sup))
+        _fx = 'high' if 'high' in sup else sup[-1]
+        add('error', 'default_effort="%s" 不在 support_efforts %s 内，官方会回退或直接报错' % (dflt, sup),
+            'default_not_in_support', '默认档改为 %s' % _fx, _fx)
     if not has_think and (sup or dflt):
-        add('warn', '配置了思考档位，但没有 thinking 能力标签，档位不会生效（可在此开启「深度思考」）')
+        add('warn', '配置了思考档位，但没有 thinking 能力标签，档位不会生效',
+            'no_thinking_tag', '开启深度思考')
     if has_think and not sup:
-        add('warn', '未声明 support_efforts，面板按官方五档兜底展示；实际是否支持取决于上游，建议按上游真实档位补全')
+        add('warn', '未声明 support_efforts，面板按官方五档兜底展示；实际是否支持取决于上游',
+            'no_support_efforts', '写入五档', list(EFFORT_LEVELS))
     if adaptive and ptype and ptype != 'anthropic':
         add('info', 'adaptive_thinking 仅对 anthropic 类型 provider 生效，当前为 %s，该字段会被忽略' % ptype)
 
@@ -784,6 +815,31 @@ def analyze_model_effort(alias, m, provider, thinking_cfg):
     return efforts, source, dflt, actual, issues
 
 
+def _fix_base_url(base):
+    """常见协议拼写错误（htpps:// 等）→ 合法 URL；无法判断则返回 None。"""
+    m = re.match(r'^\s*([A-Za-z]+):?/*(.+)$', str(base))
+    if not m:
+        return None
+    scheme = m.group(1).lower()
+    if not scheme.startswith('ht'):
+        return None
+    return '%s://%s' % ('https' if scheme.endswith('s') else 'http', m.group(2).strip())
+
+
+def update_provider_field_in_text(content, provider, key, value):
+    pattern = r'(\[providers\.(?:"%s"|%s)\])(.*?)(?=\n\[|\Z)' % (re.escape(provider), re.escape(provider))
+    m = re.search(pattern, content, re.DOTALL)
+    if not m:
+        return content, False
+    body = m.group(2)
+    line = _render_toml_kv(key, value)
+    if re.search(r'^[ \t]*%s[ \t]*=' % re.escape(key), body, re.MULTILINE):
+        body = re.sub(r'^[ \t]*%s[ \t]*=.*$' % re.escape(key), lambda _m: line, body, count=1, flags=re.MULTILINE)
+    else:
+        body = body.rstrip('\n') + '\n' + line + '\n'
+    return content[:m.start()] + m.group(1) + body + content[m.end():], True
+
+
 def get_models_data():
     content = get_config_content()
     data = _load_toml(content) or {}
@@ -791,6 +847,8 @@ def get_models_data():
     providers = data.get('providers', {}) or {}
     thinking_cfg = data.get('thinking', {}) or {}
     pricing = load_pricing()
+    dismissed = load_dismissed()
+    dismissed_n = 0
     models = []
     audit = {'error': 0, 'warn': 0, 'info': 0}
     for alias, m in (data.get('models', {}) or {}).items():
@@ -801,8 +859,18 @@ def get_models_data():
         efforts, source, dflt, actual, issues = analyze_model_effort(alias, m, prov_cfg, thinking_cfg)
         base = str(prov_cfg.get('base_url') or '')
         if base and not re.match(r'^https?://', base, re.I):
-            issues.insert(0, {'level': 'error', 'msg': 'provider「%s」的 base_url 协议非法：%s' % (prov, base)})
+            fixed = _fix_base_url(base)
+            bad = {'level': 'error', 'code': 'bad_base_url',
+                   'msg': 'provider「%s」的 base_url 协议非法：%s' % (prov, base)}
+            if fixed:
+                bad['fix'] = '改为 %s' % fixed
+                bad['fix_value'] = fixed
+            issues.insert(0, bad)
         for it in issues:
+            if it['level'] != 'info' and it.get('code') and '%s|%s' % (alias, it['code']) in dismissed:
+                it['dismissed'] = True
+                dismissed_n += 1
+                continue
             audit[it['level']] += 1
         models.append({
             'alias': alias,
@@ -813,7 +881,7 @@ def get_models_data():
             'max_context_size': _effective(m, 'max_context_size') or 250000,
             'capabilities': caps,
             'has_image': 'image_in' in caps,
-            'has_thinking': 'thinking' in caps or adaptive,
+            'has_thinking': 'thinking' in caps or 'always_thinking' in caps,
             'always_thinking': 'always_thinking' in caps,
             'adaptive_thinking': adaptive,
             'has_tools': 'tool_use' in caps,
@@ -831,6 +899,7 @@ def get_models_data():
             'providers': list(providers.keys()),
             'thinking': thinking_cfg,
             'effort_audit': audit,
+            'dismissed_count': dismissed_n,
             'models': models}
 
 
@@ -909,9 +978,13 @@ def update_model_in_text(content, alias, updates, sub=''):
                 handled.add(k)
                 continue
         new_lines.append(line)
+    tail = []
+    while new_lines and not new_lines[-1].strip():
+        tail.append(new_lines.pop())
     for k, v in updates.items():
         if k not in handled:
             new_lines.append(render(k, v))
+    new_lines.extend(tail)
     new_content = content[:m.start()] + header + '\n'.join(new_lines) + content[m.end():]
     return new_content, True
 
@@ -941,6 +1014,27 @@ def update_model_effort_in_text(content, alias, updates):
     if eff:
         new, _ = update_model_in_text(new, alias, eff, sub='overrides' if _is_managed(m, provider) else '')
     return new, None
+
+
+def apply_issue_fix(content, model, issue):
+    """对单个 (模型, 问题) 套用修复，返回 (新内容, 错误信息)。"""
+    code, alias = issue.get('code'), model['alias']
+    if code == 'bad_base_url':
+        if not issue.get('fix_value'):
+            return content, '无法自动判断正确地址，请手动修改 config.toml 中 provider「%s」的 base_url' % model['provider']
+        new, ok = update_provider_field_in_text(content, model['provider'], 'base_url', issue['fix_value'])
+        return (new, None) if ok else (content, '未找到 provider「%s」' % model['provider'])
+    if code == 'no_thinking_tag':
+        caps = list(model['capabilities'])
+        if 'thinking' not in caps:
+            caps.append('thinking')
+        new, ok = update_model_in_text(content, alias, {'capabilities': caps})
+        return (new, None) if ok else (content, '模型 %s 不存在' % alias)
+    if code == 'no_support_efforts':
+        return update_model_effort_in_text(content, alias, {'support_efforts': list(EFFORT_LEVELS)})
+    if code == 'default_not_in_support':
+        return update_model_effort_in_text(content, alias, {'default_effort': issue['fix_value']})
+    return content, '该问题没有自动修复方案'
 
 
 def _global_effort_note(alias, level):
@@ -988,6 +1082,43 @@ def _semver(v):
     return tuple(parts or [0])
 
 
+def parse_changelog(text, version):
+    """取出 CHANGELOG.md 中 `## v<version> · 日期` 一节，返回 (日期, 条目列表)。"""
+    date, items, on = '', [], False
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        m = re.match(r'^##\s+v?([\d.]+)\s*(?:[·\-|]\s*(\S+))?', line)
+        if m:
+            if on:
+                break
+            on = _semver(m.group(1)) == _semver(version)
+            if on:
+                date = m.group(2) or ''
+            continue
+        if not on:
+            continue
+        if line.startswith('### '):
+            items.append({'t': 'h', 'text': line[4:].strip()})
+        elif line.startswith('- '):
+            items.append({'t': 'li', 'text': line[2:].strip()})
+        elif line.strip():
+            items.append({'t': 'p', 'text': line.strip()})
+    return date, items
+
+
+def fetch_release_notes(version):
+    for url in (UPDATE_CHANGELOG_URL, UPDATE_CHANGELOG_RAW_URL):
+        try:
+            req = urllib.request.Request(url,
+                                         headers={'User-Agent': 'kimi-code-usage/%s' % PLUGIN_VERSION,
+                                                  'Accept': 'application/vnd.github.raw+json'})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                return parse_changelog(r.read().decode('utf-8'), version)
+        except Exception:
+            continue
+    return '', []
+
+
 def check_update(force=False):
     """对比 GitHub 清单版本，5 分钟内存缓存。返回 {current, latest, update, error}。"""
     now = time.time()
@@ -1008,6 +1139,7 @@ def check_update(force=False):
                 raise ValueError('清单缺少 version 字段')
             out['latest'] = latest
             out['update'] = _semver(latest) > _semver(PLUGIN_VERSION)
+            out['released'], out['notes'] = fetch_release_notes(latest) if out['update'] else ('', [])
             out['error'] = None
             _UPDATE_CACHE['t'] = now
             _UPDATE_CACHE['data'] = out
@@ -1200,6 +1332,47 @@ class Handler(BaseHTTPRequestHandler):
                 save_pricing(alias, entry)
                 collect_once()
                 return self._json({'success': True, 'message': '%s 按量计价已保存' % alias})
+
+            if path == '/api/issue-action':
+                action = req.get('action', '')
+                alias, code = req.get('alias', ''), req.get('code', '')
+                if action in ('ignore', 'unignore'):
+                    cur = load_dismissed()
+                    key = '%s|%s' % (alias, code)
+                    (cur.add if action == 'ignore' else cur.discard)(key)
+                    save_dismissed(cur)
+                    return self._json({'success': True, 'message': '已忽略' if action == 'ignore' else '已恢复提示'})
+                if action == 'unignore_all':
+                    save_dismissed(set())
+                    return self._json({'success': True, 'message': '已恢复全部提示'})
+                data = get_models_data()
+                content = get_config_content()
+                done, errs = 0, []
+                for mdl in data['models']:
+                    for it in mdl['effort_issues']:
+                        if it.get('dismissed') or not it.get('code') or it['level'] == 'info':
+                            continue
+                        if action == 'fix':
+                            if mdl['alias'] != alias or it['code'] != code:
+                                continue
+                        elif action == 'fix_all':
+                            if it['code'] == 'no_support_efforts' or not it.get('fix'):
+                                continue
+                        else:
+                            return self._json({'success': False, 'message': '未知 action'}, 400)
+                        content, err = apply_issue_fix(content, mdl, it)
+                        if err:
+                            errs.append(err)
+                        else:
+                            done += 1
+                if errs and not done:
+                    return self._json({'success': False, 'message': '；'.join(sorted(set(errs)))}, 400)
+                if not done:
+                    return self._json({'success': True, 'message': '没有需要修复的项'})
+                ok, msg = safe_apply_config(content)
+                if ok and errs:
+                    msg += '（另有未处理：%s）' % '；'.join(sorted(set(errs)))
+                return self._json({'success': ok, 'message': msg if not ok else '已修复 %d 项，会话内 /reload 生效' % done}, 200 if ok else 400)
 
             if path == '/api/auto-enable-all':
                 ok, msg = safe_apply_config(auto_enable_all_in_text(get_config_content()))
