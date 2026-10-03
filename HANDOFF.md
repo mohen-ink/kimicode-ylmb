@@ -75,3 +75,22 @@ new_html = _LEGACY_ROOT_INJECT_RE.sub('\n', _INJECT_RE.sub('\n', html))
 - 每日更新提醒：前端 localStorage（kimi-usage-upd-last/found/mute/ver），24h 最多静默检查一次，只亮红点；「更新提醒」按钮可关闭。
 - 模型管理弹窗重做：胶囊开关 + 分段式思考强度；/api/add-model 不再猜测档位，仅在传入 support_efforts 时写入（并校验）。
 - 更新弹窗显示发布时间与更新内容：服务读取仓库根目录 CHANGELOG.md（`## vX.Y.Z · 日期` 一节）。发版时请先更新 CHANGELOG.md 再改 kimi.plugin.json 版本号。
+
+## v3.2.3 变更
+
+- 更新弹窗显示发布时间与更新内容：检查更新命中新版时，弹窗内列出 CHANGELOG 中该版本一段（`## vX.Y.Z · 日期` 标题 + bullet），确认前用户能看清要装的是什么。
+- 思考强度问题一键修复 / 忽略：`effort_issues` 命中的条目支持「修复」（写入合法 default + overrides）与「忽略」（加入本地白名单不再提示）；修复调用 `kimi doctor config` 校验通过后落盘。
+- 思考开关显示修复：`adaptive_thinking` 未声明 `thinking` 标签的模型之前会被错标为已开启；现按实际支持列表严格判定。
+- 移除「实际生效」徽标：模型列表改为默认强度 + 会话内即时切换，去掉误导性的生效标记。
+- 汇总 2026-10-04 全部更新（含 v3.2.2 已列项）。
+
+## v3.2.4 变更
+
+- 首装不显示面板修复：`get_dist_dir()` 增加运行中进程兜底——非默认盘安装时，从正在跑的服务进程检出 `desktop-dist` 实际路径并写回 `desktop_path.txt`；之前首装到非 C 盘时面板永远不出现。
+- 首装不提示装 Python 修复：`bootstrap.cmd` 在无 Python 环境分支改调 `scripts/need-python.ps1`，向 `index.html` 注入一张静态占位卡片（标明需安装 Python）；`service.py` 起来后经 `_NEEDPY_INJECT_RE` 自动把占位摘掉，无需手动清理。
+- `spawn_daemon` / `apply_update` 拒绝 `WindowsApps` Python 存根：之前会被静默选中导致服务拉不起来且无报错提示。
+- `apply_update` 走 codeload 全量拉取：之前用增量 diff，跨版本新增 UI 文件可能漏拉导致「更新后界面没变化」。
+
+---
+
+当前最新版本：**v3.2.4**（HEAD `646fc93`）。本文件按版本追加，最新段请直接看上方 `## v3.2.4 变更`。
