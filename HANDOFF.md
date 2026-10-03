@@ -65,3 +65,12 @@ new_html = _LEGACY_ROOT_INJECT_RE.sub('\n', _INJECT_RE.sub('\n', html))
 2. `scripts/service.py` — `_LEGACY_ROOT_INJECT_RE` 补丁（可选，防御旧版根路径残留）
 
 标题建议：`fix: sidebar layout overflow, hover detail popover, list re-render flicker, responsive width`
+
+## v3.2.2 变更
+
+- 思考强度审计：`/api/models` 返回 `effective_efforts`（按 support_efforts/overrides 实际生效）、`effort_issues`、`effort_audit`；`/api/update-model` 校验档位合法且 default ∈ support_efforts，托管模型写入 `[models."x".overrides]`。
+- 更新：不再自动检查；点「更新」才请求 `/api/update/check?force=1`，有新版弹窗确认，无新版不弹。检查失败不缓存，api.github.com 失败回退 raw.githubusercontent.com。
+- 热更新：`sync_widget_asset` 改为内容摘要比对；`/api/status` 带 `widget` 摘要，前端发现变化后提示「刷新界面」。
+- `scripts/bootstrap.cmd` 必须纯 ASCII + CRLF（`.gitattributes` 已设 `*.cmd -text`），否则 GBK 下 cmd 解析乱码导致服务拉不起来。
+- 每日更新提醒：前端 localStorage（kimi-usage-upd-last/found/mute/ver），24h 最多静默检查一次，只亮红点；「更新提醒」按钮可关闭。
+- 模型管理弹窗重做：胶囊开关 + 分段式思考强度；/api/add-model 不再猜测档位，仅在传入 support_efforts 时写入（并校验）。

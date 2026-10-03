@@ -75,7 +75,7 @@
   let kupWavePeriod = 'week';
   let kupModelTab = 'today';
   let kupTheme = 'dark';
-  let kupUpdateInfo = null;   // {current, latest, update, error}
+  let kupChecking = false;
   let kupUpdating = false;
 
   function esc(s) {
@@ -969,15 +969,15 @@
       transition: transform 0.19s cubic-bezier(0.25, 0.6, 0.3, 1) 0.02s, opacity 0.16s ease 0.02s;
     }
     #kmm-modal {
-      width: 580px;
+      width: 640px;
       max-width: 90vw;
-      max-height: 80vh;
+      max-height: 86vh;
       transform: translateY(12px) scale(0.975);
       opacity: 0;
       transition: transform 0.15s ease-in, opacity 0.13s ease-in;
       background: var(--color-surface, #1f1f1f);
       border: 1px solid color-mix(in srgb, var(--color-text, #fff) 10%, transparent);
-      border-radius: 12px;
+      border-radius: 16px;
       display: flex;
       flex-direction: column;
       box-shadow: 0 16px 40px rgba(0,0,0,0.4);
@@ -986,60 +986,108 @@
       overflow: hidden;
     }
     .kmm-modal-header {
-      padding: 14px 18px;
-      border-bottom: 1px solid color-mix(in srgb, var(--color-text, #fff) 8%, transparent);
+      padding: 18px 22px 14px;
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 12px;
     }
-    .kmm-modal-title {
-      font-size: 14px;
-      font-weight: 600;
-      display: flex;
-      align-items: center;
-      gap: 8px;
+    .kmm-modal-title { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+    .kmm-modal-title h2 { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: .2px; }
+    .kmm-def-badge { font-size: 11.5px; color: var(--color-text-secondary, #94a3b8); }
+    .kmm-def-badge b { color: var(--color-accent, #1a88ff); font-weight: 600; }
+    .kmm-x {
+      width: 28px; height: 28px; border-radius: 8px; border: none; background: transparent;
+      color: var(--color-text-faint, #94a3b8); font-size: 15px; cursor: pointer; line-height: 1;
     }
+    .kmm-x:hover { background: color-mix(in srgb, var(--color-text, #fff) 8%, transparent); color: var(--color-text, #fff); }
+    .kmm-toolbar { padding: 0 22px 14px; display: flex; gap: 10px; align-items: center; }
+    .kmm-search {
+      flex: 1; min-width: 0; box-sizing: border-box;
+      background: var(--color-surface-sunken, #121212);
+      border: 1px solid transparent; color: var(--color-text, #e2e8f0);
+      border-radius: 9px; padding: 8px 12px; font-size: 12.5px; outline: none; font-family: inherit;
+    }
+    .kmm-search:focus { border-color: var(--color-accent, #1a88ff); }
+    .kmm-tbtn {
+      padding: 8px 14px; border-radius: 9px; font-size: 12.5px; font-weight: 600; cursor: pointer;
+      border: 1px solid color-mix(in srgb, var(--color-text, #fff) 14%, transparent);
+      background: transparent; color: var(--color-text, #e2e8f0); font-family: inherit; white-space: nowrap;
+    }
+    .kmm-tbtn:hover { border-color: var(--color-accent, #1a88ff); color: var(--color-accent, #1a88ff); }
+    .kmm-tbtn.primary { background: var(--color-accent, #1a88ff); border-color: var(--color-accent, #1a88ff); color: #fff; }
+    .kmm-tbtn.primary:hover { filter: brightness(1.08); color: #fff; }
     .kmm-modal-body {
-      padding: 14px 18px;
+      padding: 14px 22px 18px;
       overflow-y: auto;
       display: flex;
       flex-direction: column;
       gap: 10px;
-    }
-    .kmm-card {
-      background: var(--color-surface-raised, #292929);
-      border: 1px solid color-mix(in srgb, var(--color-text, #fff) 8%, transparent);
-      border-radius: 8px;
-      padding: 10px 14px;
-    }
-    .kmm-card.is-default {
-      border-color: color-mix(in srgb, var(--color-accent, #1a88ff) 55%, transparent);
-      background: color-mix(in srgb, var(--color-accent, #1a88ff) 7%, var(--color-surface-raised, #292929));
-    }
-    .kmm-controls-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-      margin-top: 8px;
-      padding-top: 8px;
       border-top: 1px solid color-mix(in srgb, var(--color-text, #fff) 7%, transparent);
     }
-    .kmm-switch { position: relative; display: inline-block; width: 32px; height: 18px; }
-    .kmm-switch input { opacity: 0; width: 0; height: 0; }
-    .kmm-slider {
-      position: absolute; cursor: pointer;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background-color: color-mix(in srgb, var(--color-text, #fff) 22%, transparent);
-      transition: .2s; border-radius: 18px;
+    .kmm-foot {
+      padding: 10px 22px; font-size: 11.5px; color: var(--color-text-faint, #94a3b8);
+      display: flex; justify-content: space-between; gap: 12px;
+      border-top: 1px solid color-mix(in srgb, var(--color-text, #fff) 7%, transparent);
     }
-    .kmm-slider:before {
-      position: absolute; content: "";
-      height: 14px; width: 14px; left: 2px; bottom: 2px;
-      background-color: #fff; transition: .2s; border-radius: 50%;
+    .kmm-card {
+      border: 1px solid color-mix(in srgb, var(--color-text, #fff) 9%, transparent);
+      border-radius: 12px;
+      padding: 13px 16px 12px;
+      background: var(--color-surface-raised, #292929);
+      transition: border-color .15s, box-shadow .15s;
     }
-    input:checked + .kmm-slider { background-color: var(--color-accent, #1a88ff); }
-    input:disabled + .kmm-slider { opacity: .55; cursor: not-allowed; }
-    input:checked + .kmm-slider:before { transform: translateX(14px); }
+    .kmm-card:hover { box-shadow: 0 2px 10px rgba(0,0,0,.06); }
+    .kmm-card.is-default {
+      border-color: color-mix(in srgb, var(--color-accent, #1a88ff) 55%, transparent);
+      background: color-mix(in srgb, var(--color-accent, #1a88ff) 5%, var(--color-surface-raised, #292929));
+    }
+    .kmm-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .kmm-name { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; min-width: 0; }
+    .kmm-name strong { font-size: 14px; font-weight: 700; }
+    .kmm-tag { font-size: 10.5px; padding: 1px 7px; border-radius: 999px; font-weight: 600; white-space: nowrap; }
+    .kmm-tag.cur { background: var(--color-accent, #1a88ff); color: #fff; }
+    .kmm-tag.def { background: color-mix(in srgb, var(--color-warning, #d29922) 22%, transparent); color: var(--color-warning, #b8860b); }
+    .kmm-tag.on  { background: color-mix(in srgb, var(--color-success, #3fb950) 16%, transparent); color: var(--color-success, #2da44e); }
+    .kmm-tag.ad  { background: color-mix(in srgb, var(--color-accent, #1a88ff) 14%, transparent); color: var(--color-accent, #1a88ff); }
+    .kmm-acts { display: flex; gap: 4px; flex-shrink: 0; }
+    .kmm-link {
+      background: transparent; border: none; cursor: pointer; font-size: 12px; font-family: inherit;
+      color: var(--color-text-secondary, #64748b); padding: 3px 8px; border-radius: 7px;
+    }
+    .kmm-link:hover { background: color-mix(in srgb, var(--color-text, #fff) 7%, transparent); color: var(--color-text, #e2e8f0); }
+    .kmm-link.accent { color: var(--color-accent, #1a88ff); }
+    .kmm-meta { margin-top: 3px; font-size: 11.5px; color: var(--color-text-faint, #94a3b8); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .kmm-ctl { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-top: 11px; }
+    .kmm-chips { display: flex; gap: 6px; }
+    .kmm-chip {
+      display: inline-flex; align-items: center; cursor: pointer; user-select: none;
+      padding: 4px 12px; border-radius: 999px; font-size: 12px; font-weight: 500;
+      border: 1px solid color-mix(in srgb, var(--color-text, #fff) 14%, transparent);
+      color: var(--color-text-faint, #94a3b8); background: transparent; transition: all .15s;
+    }
+    .kmm-chip input { display: none; }
+    .kmm-chip.on {
+      color: var(--color-accent, #1a88ff); font-weight: 600;
+      border-color: color-mix(in srgb, var(--color-accent, #1a88ff) 45%, transparent);
+      background: color-mix(in srgb, var(--color-accent, #1a88ff) 10%, transparent);
+    }
+    .kmm-chip.lock { cursor: not-allowed; opacity: .75; }
+    .kmm-eff { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .kmm-eff-label { font-size: 11.5px; color: var(--color-text-faint, #94a3b8); }
+    .kmm-seg {
+      display: inline-flex; padding: 2px; border-radius: 9px; gap: 1px;
+      background: var(--color-surface-sunken, #121212);
+    }
+    .kmm-seg button {
+      border: none; background: transparent; cursor: pointer; font-family: inherit;
+      padding: 3px 10px; border-radius: 7px; font-size: 11.5px; font-weight: 500;
+      color: var(--color-text-secondary, #64748b);
+    }
+    .kmm-seg button:hover { color: var(--color-text, #e2e8f0); }
+    .kmm-seg button.on { background: var(--color-accent, #1a88ff); color: #fff; font-weight: 600; cursor: default; }
+    .kmm-warn { margin-top: 8px; font-size: 11.5px; line-height: 1.5; }
+    .kmm-note { font-size: 11px; color: var(--color-text-faint, #94a3b8); cursor: help; }
     #kpr-overlay {
       position: fixed; inset: 0; z-index: 100002;
       background: rgba(0,0,0,.45); backdrop-filter: blur(3px);
@@ -1090,6 +1138,34 @@
     .kpr-cancel { background: var(--color-surface-sunken, #eef0f2); border: none; color: var(--color-text-secondary, #64748b); }
     .kpr-save { background: var(--color-accent, #1a88ff); border: none; color: #fff; }
     .kpr-reset { background: none; border: none; color: var(--color-text-faint, #94a3b8); margin-right: auto; font-weight: 500; }
+    body.kud-has-update #kup-update-btn, body.kud-has-update #ku-panel-btn, body.kud-has-update #ku-min-panel-btn { position: relative; }
+    body.kud-has-update #kup-update-btn::after, body.kud-has-update #ku-panel-btn::after, body.kud-has-update #ku-min-panel-btn::after {
+      content: ''; position: absolute; top: -3px; right: -3px; width: 8px; height: 8px;
+      border-radius: 50%; background: #ef4444; box-shadow: 0 0 0 2px var(--color-surface-raised, #fff);
+    }
+    #kup-mute-btn { opacity: .75; }
+    #kud-overlay {
+      position: fixed; inset: 0; z-index: 100003;
+      background: rgba(0,0,0,.45); backdrop-filter: blur(3px);
+      display: none; align-items: center; justify-content: center;
+      font-family: system-ui, -apple-system, sans-serif;
+      opacity: 0; transition: opacity 0.17s ease;
+    }
+    #kud-overlay.visible { display: flex; }
+    #kud-overlay.ku-anim-in { opacity: 1; }
+    #kud-modal {
+      width: 380px; max-width: 90vw; box-sizing: border-box;
+      background: var(--color-surface-raised, #ffffff); color: var(--color-text, #1f2329);
+      border-radius: 14px; box-shadow: 0 24px 64px rgba(0,0,0,.35); padding: 24px 26px 20px;
+    }
+    #kud-modal h3 { margin: 0 0 10px; font-size: 17px; font-weight: 700; }
+    #kud-modal .kud-ver { font-size: 13px; color: var(--color-text-secondary, #64748b); line-height: 1.7; }
+    #kud-modal .kud-ver b { color: var(--color-accent, #1a88ff); font-size: 15px; }
+    #kud-modal .kud-tip { font-size: 11.5px; color: var(--color-text-faint, #94a3b8); margin-top: 8px; }
+    #kud-modal .kud-foot { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
+    #kud-modal .kud-foot button { padding: 8px 20px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; }
+    #kud-cancel { background: var(--color-surface-sunken, #eef0f2); color: var(--color-text-secondary, #64748b); }
+    #kud-ok { background: var(--color-accent, #1a88ff); color: #fff; }
     #kmm-toast {
       position: fixed;
       bottom: 24px;
@@ -1351,7 +1427,7 @@
       <div class="ku-expanded-header">
         <div class="ku-title-group" id="ku-title-group" title="点击打开 Kimi Code 用量面板">
           <span class="ku-dot">•</span>
-          <span class="ku-title-text">Kimi Code 用量</span>
+          <span class="ku-title-text">Kimi 用量</span>
         </div>
         <div class="ku-header-actions">
           <button class="ku-btn-panel" id="ku-gear-btn" title="模型与能力配置管理器">⚙</button>
@@ -2093,6 +2169,7 @@
             </div>
             <div class="kup-head-tools">
               <button class="kup-btn" id="kup-update-btn">更新</button>
+              <button class="kup-btn" id="kup-mute-btn"></button>
               <button class="kup-btn" id="kup-theme-btn">切换主题</button>
               <button class="kup-btn kup-btn-primary" id="kup-refresh-btn">刷新</button>
               <button class="kup-close" id="kup-close">&times;</button>
@@ -2194,9 +2271,10 @@
         reloadDataScript();
         fetchData();
         probeService();
-        kupCheckUpdate(true);
       };
       modal.querySelector('#kup-update-btn').onclick = kupUpdateClick;
+      modal.querySelector('#kup-mute-btn').onclick = kupToggleMute;
+      kupMuteRender();
       modal.querySelectorAll('#kup-wave-tabs .kup-tab').forEach(function(t) {
         t.onclick = function() { kupSelectWavePeriod(t.getAttribute('data-period')); };
       });
@@ -2231,7 +2309,6 @@
         if (sk) sk.remove();
       }
     });
-    if (kupUpdateInfo === null) kupCheckUpdate(true);
   }
 
   function closePanel() {
@@ -2240,83 +2317,121 @@
   }
 
   /* ================================================================
-   * 自更新（检查 GitHub 新版本 → 一键更新 → 服务自动重启）
+   * 自更新：仅在点击「更新」后检查 GitHub；有新版本才弹窗，已是最新不弹窗
    * ================================================================ */
-  function kupUpdateBadge() {
+  function kupUpdateBadge(text) {
     var btn = document.getElementById('kup-update-btn');
     if (!btn) return;
-    if (kupUpdating) { btn.textContent = '更新中…'; btn.style.color = ''; return; }
-    if (kupUpdateInfo && kupUpdateInfo.update) {
-      btn.textContent = '⬆ 更新 v' + kupUpdateInfo.latest;
-      btn.style.color = 'var(--color-accent, #1a88ff)';
-      btn.style.borderColor = 'var(--color-accent, #1a88ff)';
-    } else {
-      btn.textContent = '更新';
-      btn.style.color = '';
-      btn.style.borderColor = '';
-    }
+    btn.textContent = text || (kupUpdating ? '更新中…' : '更新');
   }
 
-  function kupCheckUpdate(silent) {
-    return fetch(API_BASE + '/api/update/check', { cache: 'no-store' })
+  var KUP_LAST_KEY = 'kimi-usage-upd-last';
+  var KUP_FOUND_KEY = 'kimi-usage-upd-found';
+  var KUP_MUTE_KEY = 'kimi-usage-upd-mute';
+  function kupLs(k, v) {
+    try {
+      if (v === undefined) return localStorage.getItem(k);
+      if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v);
+    } catch (e) {}
+    return null;
+  }
+  function kupMuted() { return kupLs(KUP_MUTE_KEY) === '1'; }
+  function kupMuteRender() {
+    var b = document.getElementById('kup-mute-btn');
+    if (!b) return;
+    b.textContent = kupMuted() ? '更新提醒：关' : '更新提醒：开';
+    b.title = kupMuted() ? '已关闭每日更新提醒，点击重新开启' : '每日检查一次更新并在按钮上显示红点；点击关闭提醒';
+  }
+  function kupDot(on) { document.body.classList.toggle('kud-has-update', !!on); }
+  function kupToggleMute() {
+    var m = !kupMuted();
+    kupLs(KUP_MUTE_KEY, m ? '1' : null);
+    kupMuteRender();
+    if (m) { kupDot(false); kmmToast('已关闭更新提醒，不会再显示红点（仍可手动点「更新」检查）'); }
+    else { kmmToast('已开启更新提醒'); kupDailyCheck(true); }
+  }
+  // 每日提醒：24 小时内最多静默检查一次，只亮红点，不弹窗
+  function kupDailyCheck(force) {
+    if (kupMuted()) { kupDot(false); return; }
+    var found = kupLs(KUP_FOUND_KEY);
+    var last = parseInt(kupLs(KUP_LAST_KEY) || '0', 10) || 0;
+    if (!force && Date.now() - last < 24 * 3600 * 1000) { kupDot(!!found); return; }
+    fetch(API_BASE + '/api/update/check', { cache: 'no-store' })
       .then(function(r) { return r.json(); })
       .then(function(d) {
-        kupUpdateInfo = d;
-        kupUpdateBadge();
-        if (!silent) {
-          if (d.error) kmmToast('检查更新失败：' + d.error, true);
-          else if (d.update) kmmToast('发现新版本 v' + d.latest + '（当前 v' + d.current + '），点「更新」一键升级');
-          else kmmToast('已是最新版本 v' + d.current);
-        }
-        return d;
+        if (!d || d.error) return;
+        kupLs(KUP_LAST_KEY, String(Date.now()));
+        kupLs(KUP_FOUND_KEY, d.update ? d.latest : null);
+        kupDot(!!d.update && !kupMuted());
       })
-      .catch(function() { if (!silent) kmmToast('检查更新失败：后台服务未响应', true); });
+      .catch(function() {});
+  }
+
+  function kupUpdateDialog(info, onOk) {
+    var o = document.getElementById('kud-overlay');
+    if (!o) {
+      o = document.createElement('div');
+      o.id = 'kud-overlay';
+      o.innerHTML = '<div id="kud-modal">' +
+        '<h3>发现新版本</h3>' +
+        '<div class="kud-ver">当前版本 v<span id="kud-cur"></span><br>最新版本 <b>v<span id="kud-new"></span></b></div>' +
+        '<div class="kud-tip">更新后后台服务会自动重启，几秒钟后恢复。</div>' +
+        '<div class="kud-foot"><button id="kud-cancel">稍后</button><button id="kud-ok">立即更新</button></div>' +
+        '</div>';
+      document.body.appendChild(o);
+      o.onclick = function(e) { if (e.target === o) kuLayerHide(o, 'visible'); };
+      o.querySelector('#kud-cancel').onclick = function() { kuLayerHide(o, 'visible'); };
+    }
+    o.querySelector('#kud-cur').textContent = info.current;
+    o.querySelector('#kud-new').textContent = info.latest;
+    o.querySelector('#kud-ok').onclick = function() { kuLayerHide(o, 'visible'); onOk(); };
+    kuLayerShow(o, 'visible');
+  }
+
+  function kupApplyUpdate() {
+    kupUpdating = true;
+    kupUpdateBadge();
+    fetch(API_BASE + '/api/update/apply', { method: 'POST' })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d.success && d.latest) {
+          kmmToast('正在更新到 v' + d.latest + '，服务重启中…');
+        } else {
+          kmmToast(d.message || '更新失败', !d.success);
+          kupUpdating = false;
+          kupUpdateBadge();
+        }
+      })
+      .catch(function() {
+        // 服务重启时连接被重置属正常——更新大概率已在进行
+        kmmToast('服务重启中，稍后自动恢复');
+      });
+    // 重启后旧页面状态失效：到点复位按钮
+    setTimeout(function() { kupUpdating = false; kupUpdateBadge(); }, 20000);
   }
 
   function kupUpdateClick() {
-    if (kupUpdating) return;
-    var go = function() {
-      kupUpdating = true;
-      kupUpdateBadge();
-      fetch(API_BASE + '/api/update/apply', { method: 'POST' })
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-          if (d.success && d.latest) {
-            kmmToast('正在更新到 v' + d.latest + '，服务重启中…');
-          } else {
-            kmmToast(d.message || '更新失败', !d.success);
-          }
-          if (!(d.success && d.latest)) { kupUpdating = false; kupUpdateBadge(); }
-        })
-        .catch(function() {
-          // 服务重启时连接被重置属正常——更新大概率已在进行
-          kmmToast('服务重启中，稍后自动恢复');
-        });
-      // 更新完成后旧按钮状态失效，等下次探活回来再复位
-      setTimeout(function() {
-        kupUpdating = false;
-        kupUpdateInfo = null;
+    if (kupUpdating || kupChecking) return;
+    kupChecking = true;
+    kupUpdateBadge('检查中…');
+    fetch(API_BASE + '/api/update/check?force=1', { cache: 'no-store' })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        kupChecking = false;
         kupUpdateBadge();
-        kupCheckUpdate(true);
-      }, 20000);
-    };
-    if (kupUpdateInfo === null) {
-      kupCheckUpdate(true).then(function(d) {
-        if (d && d.update) { if (confirm('发现新版本 v' + d.latest + '（当前 v' + d.current + '），立即更新？服务会自动重启。')) go(); }
-        else if (d && d.error) kmmToast('检查更新失败：' + d.error, true);
-        else if (d) kmmToast('已是最新版本 v' + d.current);
+        if (d.error) { kmmToast('检查更新失败：' + d.error, true); return; }
+        kupLs(KUP_LAST_KEY, String(Date.now()));
+        kupLs(KUP_FOUND_KEY, d.update ? d.latest : null);
+        kupDot(!!d.update && !kupMuted());
+        if (d.update) { kupUpdateDialog(d, kupApplyUpdate); return; }
+        kupUpdateBadge('已是最新 ✓');
+        setTimeout(function() { if (!kupUpdating && !kupChecking) kupUpdateBadge(); }, 2000);
+      })
+      .catch(function() {
+        kupChecking = false;
+        kupUpdateBadge();
+        kmmToast('检查更新失败：后台服务未响应', true);
       });
-      return;
-    }
-    if (kupUpdateInfo.update) {
-      if (confirm('更新到 v' + kupUpdateInfo.latest + '？服务会自动重启，几秒钟后恢复。')) go();
-    } else if (kupUpdateInfo.error) {
-      kmmToast('检查更新失败：' + kupUpdateInfo.error, true);
-      kupUpdateInfo = null;
-    } else {
-      kmmToast('已是最新版本 v' + kupUpdateInfo.current);
-      kupCheckUpdate(true);
-    }
   }
 
   /* ================================================================
@@ -2330,27 +2445,20 @@
       <div id="kmm-modal">
         <div class="kmm-modal-header">
           <div class="kmm-modal-title">
-            <span>⚡</span>
-            <span>Kimi 模型与能力配置管理器</span>
-            <span style="font-size:11px;background:var(--color-accent,#1a88ff);color:#fff;padding:2px 6px;border-radius:4px;" id="kmm-modal-default-badge">默认: 加载中</span>
+            <h2>模型与能力</h2>
+            <span class="kmm-def-badge" id="kmm-modal-default-badge">默认：加载中</span>
           </div>
-          <button style="background:none;border:none;color:var(--color-text-faint,#94a3b8);font-size:18px;cursor:pointer;" id="kmm-modal-close-btn">✕</button>
+          <button class="kmm-x" id="kmm-modal-close-btn" title="关闭">✕</button>
         </div>
-        <div style="padding:10px 18px;background:color-mix(in srgb,var(--color-text,#fff) 3%,transparent);display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid color-mix(in srgb,var(--color-text,#fff) 8%,transparent);">
-          <div style="display:flex;gap:8px;align-items:center;">
-            <button style="padding:6px 12px;border-radius:6px;background:var(--color-accent,#1a88ff);color:#fff;border:none;font-size:12px;font-weight:600;cursor:pointer;" id="kmm-modal-auto-all">
-              ⚡ 一键全开所有模型
-            </button>
-            <input id="kmm-modal-filter" placeholder="🔍 过滤模型…" style="background:var(--color-surface-sunken,#121212);border:1px solid color-mix(in srgb,var(--color-text,#fff) 14%,transparent);color:var(--color-text,#cbd5e1);border-radius:6px;padding:5px 8px;font-size:11px;width:130px;outline:none;">
-          </div>
-          <button style="padding:6px 10px;border-radius:6px;background:transparent;border:1px solid color-mix(in srgb,var(--color-text,#fff) 14%,transparent);color:var(--color-text,#cbd5e1);font-size:11px;cursor:pointer;" id="kmm-modal-refresh">
-            🔄 刷新配置
-          </button>
+        <div class="kmm-toolbar">
+          <input class="kmm-search" id="kmm-modal-filter" placeholder="搜索模型、渠道…">
+          <button class="kmm-tbtn" id="kmm-modal-refresh" title="重新读取 config.toml">刷新</button>
+          <button class="kmm-tbtn primary" id="kmm-modal-auto-all" title="为所有模型补全识图 / 思考 / 工具调用能力标签">一键补全能力</button>
         </div>
         <div class="kmm-modal-body" id="kmm-modal-cards"></div>
-        <div style="padding:10px 18px;background:color-mix(in srgb,var(--color-text,#fff) 3%,transparent);border-top:1px solid color-mix(in srgb,var(--color-text,#fff) 8%,transparent);font-size:11px;color:var(--color-text-faint,#94a3b8);display:flex;justify-content:space-between;">
-          <span>💡 修改后自动安全备份并校验，在会话输入 /reload 立即应用</span>
-          <span>服务端口: 39281</span>
+        <div class="kmm-foot">
+          <span>修改会自动备份并校验，在会话中输入 /reload 立即生效</span>
+          <span>端口 39281</span>
         </div>
       </div>
     `;
@@ -2363,7 +2471,7 @@
     $o('kmm-modal-refresh').onclick = fetchModels;
     $o('kmm-modal-filter').oninput = kmmRenderModalCards;
     $o('kmm-modal-auto-all').onclick = async function() {
-      if (!confirm('确定要一键为全部模型补全开启【识图(image_in) + 深度思考(thinking) + 思考强度档位】吗？')) return;
+      if (!confirm('确定要为全部模型补全【识图 + 深度思考 + 工具调用】能力标签吗？（不会改动思考强度档位）')) return;
       try {
         const res = await fetch(`${API_BASE}/api/auto-enable-all`, { method: 'POST' });
         const data = await res.json();
@@ -2430,13 +2538,20 @@
     if (badge) {
       var def = modelsData.default_model || '';
       var defM = (modelsData.models || []).find(function(m) { return m.alias === def; });
-      badge.textContent = '当前默认: ' + ((defM && defM.display_name) || def || '--');
+      badge.innerHTML = '默认：<b>' + esc((defM && defM.display_name) || def || '--') + '</b>';
     }
     var container = $o('kmm-modal-cards');
     if (!container) return;
     var filterEl = $o('kmm-modal-filter');
     var kw = filterEl ? filterEl.value.trim().toLowerCase() : '';
     container.innerHTML = '';
+    var au = modelsData.effort_audit || {};
+    if (au.error || au.warn) {
+      var sum = document.createElement('div');
+      sum.style.cssText = 'font-size:12px;padding:8px 12px;border-radius:8px;margin-bottom:8px;border:1px solid color-mix(in srgb,var(--color-warning,#d29922) 40%,transparent);background:color-mix(in srgb,var(--color-warning,#d29922) 10%,transparent);color:var(--color-text,#e5e7eb);';
+      sum.textContent = '思考强度检查：' + (au.error ? au.error + ' 个错误' : '') + (au.error && au.warn ? '、' : '') + (au.warn ? au.warn + ' 个警告' : '') + '，详见各模型卡片';
+      container.appendChild(sum);
+    }
 
     var lastUsed = (state.cur && state.cur.alias && state.cur.alias !== '--') ? state.cur.alias : '';
     var list = (modelsData.models || []).slice().sort(function(a, b) {
@@ -2454,63 +2569,66 @@
       var card = document.createElement('div');
       card.className = 'kmm-card ' + ((m.is_default || isCur) ? 'is-default' : '');
       var ctxK = Math.round((m.max_context_size || 0) / 1024);
-      // 档位优先级：effective_efforts(服务端上游归一化) > support_efforts > 官方五档兜底
+      // 档位优先级：服务端 effective_efforts（已合并 overrides）> support_efforts > 官方五档兜底
       var rawEfforts = (m.effective_efforts && m.effective_efforts.length) ? m.effective_efforts
                      : (m.support_efforts && m.support_efforts.length) ? m.support_efforts
                      : (m.has_thinking ? ['low', 'medium', 'high', 'xhigh', 'max'] : null);
       var efforts = rawEfforts ? rawEfforts.filter(function(l) { return l !== 'none'; }) : null;
       if (efforts && !efforts.length) efforts = null;
-      if (efforts && m.default_effort && efforts.indexOf(m.default_effort) < 0) efforts = efforts.concat([m.default_effort]);
-      var selTitle = (m.efforts_source === 'upstream') ? '档位来自上游模型清单' : (m.efforts_source === 'config' ? '档位来自本机配置' : '档位为默认兜底');
+      var effOutOfList = !!(efforts && m.default_effort && efforts.indexOf(m.default_effort) < 0);
+      var selTitle = (m.efforts_source === 'config' ? '档位来自本机配置' : '档位为默认兜底（config.toml 未声明 support_efforts）');
+      var issues = m.effort_issues || [];
+      var infoTitle = issues.filter(function(it) { return it.level === 'info'; }).map(function(it) { return it.msg; }).join('\n');
+      var actualHtml = (m.effective_effort && m.has_thinking)
+        ? '<span class="kmm-note" title="' + esc(infoTitle || '主 Agent 实际使用的思考档位') + '">实际生效 ' + esc(m.effective_effort) + (infoTitle ? ' ⓘ' : '') + '</span>'
+        : '';
       var alwaysOn = !!m.always_thinking;
       var a = JSON.stringify(m.alias);
-      card.innerHTML = `
-        <div style="display:flex;justify-content:space-between;align-items:center;">
-          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
-            <span style="font-weight:600;font-size:13px;">${esc(m.display_name || m.alias)}</span>
-            <span style="font-size:10px;padding:2px 5px;background:color-mix(in srgb,var(--color-text,#fff) 8%,transparent);border-radius:4px;color:var(--color-text-secondary,#94a3b8);">${esc(m.provider)}</span>
-            <span style="font-size:10px;color:var(--color-text-faint,#64748b);">${esc(m.model)}</span>
-            <span style="font-size:10px;padding:1px 5px;background:color-mix(in srgb,var(--color-text,#fff) 5%,transparent);border-radius:3px;color:var(--color-text-faint,#64748b);" title="最大上下文">${ctxK}k</span>
-            ${isCur ? '<span style="font-size:10px;background:var(--color-accent,#1a88ff);color:#fff;padding:1px 5px;border-radius:3px;font-weight:bold;">⚡ 使用中</span>' : ''}
-            ${m.is_default ? '<span style="font-size:10px;background:var(--color-warning,#d29922);color:#000;padding:1px 5px;border-radius:3px;font-weight:bold;">★ 默认</span>' : ''}
-            ${alwaysOn ? '<span style="font-size:10px;background:color-mix(in srgb,var(--color-success,#3fb950) 18%,transparent);color:var(--color-success,#3fb950);padding:1px 5px;border-radius:3px;" title="always_thinking=true：思考常开，不可关闭">思考常开</span>' : ''}
-            ${!alwaysOn && m.adaptive_thinking ? '<span style="font-size:10px;background:color-mix(in srgb,var(--color-accent,#1a88ff) 14%,transparent);color:var(--color-accent,#1a88ff);padding:1px 5px;border-radius:3px;" title="adaptive_thinking=true：自适应思考，按模型实际支持档位下发">自适应思考</span>' : ''}
-          </div>
-          <div style="display:flex;gap:6px;align-items:center;">
-            <button style="background:none;border:1px solid color-mix(in srgb,var(--color-text,#fff) 16%,transparent);color:var(--color-text-secondary,#94a3b8);font-size:11px;padding:2px 8px;border-radius:4px;cursor:pointer;" title="${m.pricing ? '自定义计价中' : '未设置，按默认单价估算'}" onclick='window.__KMM_PRICE(${a})'>💰 ${m.pricing ? (m.pricing.mode === 'per_call' ? '按次' : '按量') : '价格'}</button>
-            ${!m.is_default ? `<button style="background:none;border:1px solid color-mix(in srgb,var(--color-text,#fff) 16%,transparent);color:var(--color-accent,#1a88ff);font-size:11px;padding:2px 8px;border-radius:4px;cursor:pointer;" onclick='window.__KMM_SET_DEFAULT(${a})'>设为默认</button>` : ''}
-          </div>
-        </div>
-        <div class="kmm-controls-grid">
-          <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
-            <span class="kmm-switch">
-              <input type="checkbox" ${m.has_image ? 'checked' : ''} onchange='window.__KMM_TOGGLE(${a}, "image_in", this.checked)'>
-              <span class="kmm-slider"></span>
-            </span>
-            <span>识图 (image_in)</span>
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:${alwaysOn ? 'not-allowed' : 'pointer'};" ${alwaysOn ? 'title="思考常开，不可关闭"' : ''}>
-            <span class="kmm-switch">
-              <input type="checkbox" ${m.has_thinking || alwaysOn ? 'checked' : ''} ${alwaysOn ? 'disabled' : ''} onchange='window.__KMM_TOGGLE(${a}, "thinking", this.checked)'>
-              <span class="kmm-slider"></span>
-            </span>
-            <span>深度思考 (thinking)</span>
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
-            <span class="kmm-switch">
-              <input type="checkbox" ${m.has_tools ? 'checked' : ''} onchange='window.__KMM_TOGGLE(${a}, "tool_use", this.checked)'>
-              <span class="kmm-slider"></span>
-            </span>
-            <span>工具调用 (tool_use)</span>
-          </label>
-          <div style="display:flex;align-items:center;gap:6px;font-size:12px;">
-            <span style="color:var(--color-text-faint,#94a3b8);">强度:</span>
-            ${efforts ? `<select title="${selTitle}" style="background:var(--color-surface-sunken,#121212);color:var(--color-text,#fff);border:1px solid color-mix(in srgb,var(--color-text,#fff) 16%,transparent);border-radius:4px;padding:2px 4px;font-size:11px;" onchange='window.__KMM_EFFORT(${a}, this.value)'>
-              ${efforts.map(function(lvl) { return `<option value="${lvl}" ${m.default_effort === lvl ? 'selected' : ''}>${lvl}</option>`; }).join('')}
-            </select>` : '<span style="color:var(--color-text-faint,#475569);font-size:11px;">不支持档位</span>'}
-          </div>
-        </div>
-      `;
+      var warnHtml = issues.filter(function(it) { return it.level !== 'info'; }).map(function(it) {
+        var c = it.level === 'error' ? 'var(--color-danger,#f85149)' : 'var(--color-warning,#d29922)';
+        return '<div class="kmm-warn" style="color:' + c + ';">' + (it.level === 'error' ? '✖ ' : '⚠ ') + esc(it.msg) + '</div>';
+      }).join('');
+      var chip = function(cap, label, on, locked, tip) {
+        return '<label class="kmm-chip' + (on ? ' on' : '') + (locked ? ' lock' : '') + '"' + (tip ? ' title="' + esc(tip) + '"' : '') + '>'
+          + '<input type="checkbox" ' + (on ? 'checked ' : '') + (locked ? 'disabled ' : '')
+          + "onchange='window.__KMM_TOGGLE(" + a + ", \"" + cap + "\", this.checked)'>" + label + '</label>';
+      };
+      var segHtml;
+      if (efforts) {
+        segHtml = '<div class="kmm-seg" title="' + esc(selTitle) + '">'
+          + efforts.map(function(lvl) {
+              var on = m.default_effort === lvl;
+              return '<button class="' + (on ? 'on' : '') + '" ' + (on ? '' : "onclick='window.__KMM_EFFORT(" + a + ", \"" + lvl + "\")'") + '>' + lvl + '</button>';
+            }).join('')
+          + '</div>';
+      } else {
+        segHtml = '<span class="kmm-note">该模型未开启思考</span>';
+      }
+      card.innerHTML =
+        '<div class="kmm-top">'
+        + '<div class="kmm-name"><strong>' + esc(m.display_name || m.alias) + '</strong>'
+        + (isCur ? '<span class="kmm-tag cur">使用中</span>' : '')
+        + (m.is_default ? '<span class="kmm-tag def">默认</span>' : '')
+        + (alwaysOn ? '<span class="kmm-tag on" title="always_thinking=true：思考常开，不可关闭">思考常开</span>' : '')
+        + (!alwaysOn && m.adaptive_thinking ? '<span class="kmm-tag ad" title="adaptive_thinking=true：自适应思考">自适应</span>' : '')
+        + '</div>'
+        + '<div class="kmm-acts">'
+        + '<button class="kmm-link" title="' + (m.pricing ? '自定义计价中' : '未设置，按默认单价估算') + "\" onclick='window.__KMM_PRICE(" + a + ")'>"
+        + (m.pricing ? (m.pricing.mode === 'per_call' ? '按次计价' : '按量计价') : '设置价格') + '</button>'
+        + (!m.is_default ? "<button class=\"kmm-link accent\" onclick='window.__KMM_SET_DEFAULT(" + a + ")'>设为默认</button>" : '')
+        + '</div></div>'
+        + '<div class="kmm-meta">' + esc(m.provider) + ' · ' + esc(m.model) + ' · ' + ctxK + 'k 上下文</div>'
+        + '<div class="kmm-ctl">'
+        + '<div class="kmm-chips">'
+        + chip('image_in', '识图', !!m.has_image, false, '')
+        + chip('thinking', '思考', !!(m.has_thinking || alwaysOn), alwaysOn, alwaysOn ? '思考常开，不可关闭' : '')
+        + chip('tool_use', '工具', !!m.has_tools, false, '')
+        + '</div>'
+        + '<div class="kmm-eff"><span class="kmm-eff-label">思考强度</span>' + segHtml
+        + (effOutOfList ? '<span class="kmm-warn" style="margin:0;color:var(--color-warning,#d29922);">⚠ 当前 ' + esc(m.default_effort) + ' 不在列表</span>' : '')
+        + actualHtml
+        + '</div></div>'
+        + warnHtml;
       container.appendChild(card);
     });
     if (shown === 0) {
@@ -2561,7 +2679,7 @@
       });
       const data = await res.json();
       if (data.success) {
-        kmmToast(`思考强度已设为 ${defaultEffort}`);
+        kmmToast(data.note ? `已设 ${defaultEffort}。${data.note}` : `思考强度已设为 ${defaultEffort}`);
         fetchModels();
       } else kmmToast(data.message, true);
     } catch (e) { kmmToast('更新失败: 后台服务未响应', true); }
@@ -2928,12 +3046,38 @@
     }
   }
 
+  // 热更新提示：插件文件变化后提示刷新界面（不打断、不自动刷新）
+  var widgetDigest = '';
+  function showReloadBanner() {
+    if (document.getElementById('kud-reload')) return;
+    var b = document.createElement('div');
+    b.id = 'kud-reload';
+    b.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:100004;background:#1d4ed8;color:#fff;'
+      + 'padding:10px 14px;border-radius:10px;font:13px/1.4 system-ui,sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.25);'
+      + 'display:flex;gap:10px;align-items:center';
+    b.innerHTML = '<span>用量面板已更新</span>'
+      + '<button style="border:0;border-radius:6px;padding:3px 10px;cursor:pointer;background:#fff;color:#1d4ed8">刷新界面</button>'
+      + '<button style="border:0;background:transparent;color:#fff;cursor:pointer;opacity:.8">稍后</button>';
+    var btns = b.getElementsByTagName('button');
+    btns[0].onclick = function() { location.reload(); };
+    btns[1].onclick = function() { b.remove(); };
+    document.body.appendChild(b);
+  }
+
   // 探活：/api/status
   function probeService() {
     fetch(`${API_BASE}/api/status`, { cache: 'no-store' })
       .then(function(r) { return r.ok ? r.json() : null; })
       .then(function(d) {
         apiAlive = !!(d && (d.status === 'ok' || d.name));
+        if (apiAlive && d.version && kupLs('kimi-usage-upd-ver') !== d.version) {
+          kupLs('kimi-usage-upd-ver', d.version);
+          kupLs(KUP_FOUND_KEY, null); kupLs(KUP_LAST_KEY, null); kupDot(false);
+        }
+        if (apiAlive && d.widget) {
+          if (!widgetDigest) widgetDigest = d.widget;
+          else if (d.widget !== widgetDigest) showReloadBanner();
+        }
         if (apiAlive && !serviceOnline) { serviceOnline = true; applyServiceFlag(); }
       })
       .catch(function() { apiAlive = false; });
@@ -2969,6 +3113,7 @@
     reloadDataScript();
     fetchData();
     probeService();
+    setTimeout(function() { kupDailyCheck(false); }, 5000);
   }
 
   if (document.readyState === 'loading') {
@@ -2982,6 +3127,7 @@
   setInterval(fetchData, 2000);
   setInterval(heartbeatCheck, 3000);
   setInterval(probeService, 10000);
+  setInterval(function() { kupDailyCheck(false); }, 3600 * 1000);
 
   console.log('Kimi Code 用量一体化组件 v3.1 已初始化');
 })();

@@ -19,8 +19,8 @@
   - 近 7 天微缩走势条（Sparkline）、今日/累计模型明细切换、折叠记忆
   - **v3.2**：hover 名称弹详情浮层（模型/会话完整信息）、数据签名比对防每 2s 重渲染抖动、行数不变就地更新、窄宽自适应布局
 - **📈 全尺寸大屏（内嵌渲染，无 iframe）**：波浪面积图 + 调用量柱形（今日逐小时 / 本周 7 天 / 本月 30 天切换）、模型份额表、会话 Top 8、30 天明细表、深浅主题切换。点击卡片标题或「📊 面板」打开。
-- **🛠️ 模型与能力管理器**：`⚙` 打开弹窗，按模型开关识图 `image_in` / 深度思考 `thinking` / 工具调用 `tool_use`，强度档位下拉（按 `support_efforts` 过滤）、一键全开、设为默认、搜索过滤；修改自动备份 `config.toml` 并经 `kimi doctor config` 校验，会话内 `/reload` 生效。
-- **🔄 自动更新**：面板头部「更新」按钮自动比对 GitHub 仓库 `ziyiclouds-blip/kimicode-ylmb` 的版本，有新版本一键下载、覆盖插件文件并自动重启服务（用量数据、价格配置、desktop_path.txt 不受影响）；也可在会话里用 `/update`。
+- **🛠️ 模型与能力管理器**：`⚙` 打开弹窗，按模型开关识图 `image_in` / 深度思考 `thinking` / 工具调用 `tool_use`，强度档位下拉（按 `support_efforts`/`overrides` 有效值过滤，写入前校验 `default_effort ∈ support_efforts`，托管模型写入 `[models.x.overrides]` 防被官方刷新改写；卡片显示「实际生效」档位与配置问题）、一键全开、设为默认、搜索过滤；修改自动备份 `config.toml` 并经 `kimi doctor config` 校验，会话内 `/reload` 生效。
+- **🔄 更新**：点击面板头部「更新」按钮才会弹窗确认——有新版本时一键下载、覆盖插件文件并自动重启服务（用量数据、价格配置、desktop_path.txt 不受影响），已是最新则不弹窗；也可在会话里用 `/update`。另有**每日提醒**：每 24 小时静默检查一次 `ziyiclouds-blip/kimicode-ylmb`，有新版本只在「更新」/「面板」按钮上亮红点、不弹窗；点头部「更新提醒：开/关」可关闭或重新开启。面板文件更新后会提示「刷新界面」（热更新）。
 - **🛡️ 纯本地**：数据不上传；状态保存在 `~/.kimi-code/usage-collector-state.json`，跨重启不丢历史。
 
 ## 架构（v3.x）

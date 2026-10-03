@@ -17,6 +17,7 @@ Kimi Code 用量面板 · 本地服务（单进程）
 启动链：kimi.plugin.json hooks → scripts/bootstrap.cmd → service.py
 （桌面端无需任何开机自启/桌面脚本；服务随会话心跳拉起，随客户端退出自然闲置）
 """
+import hashlib
 import io
 import json
 import os
@@ -51,6 +52,8 @@ UPDATE_BRANCH = 'main'
 # 走 api.github.com 读清单：raw.* 按分支缓存较久，刚发布时容易拿到旧版本号
 UPDATE_MANIFEST_URL = ('https://api.github.com/repos/%s/contents/kimi.plugin.json?ref=%s'
                        % (UPDATE_REPO, UPDATE_BRANCH))
+UPDATE_MANIFEST_RAW_URL = ('https://raw.githubusercontent.com/%s/%s/kimi.plugin.json'
+                           % (UPDATE_REPO, UPDATE_BRANCH))
 UPDATE_ZIP_URL = 'https://codeload.github.com/%s/zip/refs/heads/%s' % (UPDATE_REPO, UPDATE_BRANCH)
 
 
@@ -288,11 +291,24 @@ def sync_widget_asset():
     dest = os.path.join(DIST_ASSETS, 'kimi-usage-widget.js')
     try:
         if (not os.path.exists(dest)
-                or os.path.getsize(dest) != os.path.getsize(WIDGET_SRC)):
+                or os.path.getsize(dest) != os.path.getsize(WIDGET_SRC)
+                or _file_digest(dest) != _file_digest(WIDGET_SRC)):
             os.makedirs(DIST_ASSETS, exist_ok=True)
             shutil.copy2(WIDGET_SRC, dest)
     except Exception:
         pass
+
+
+def _file_digest(path):
+    try:
+        with open(path, 'rb') as f:
+            return hashlib.md5(f.read()).hexdigest()[:12]
+    except Exception:
+        return ''
+
+
+def widget_digest():
+    return _file_digest(WIDGET_SRC)
 
 
 # ---------------- 数据产出 ----------------
@@ -706,6 +722,68 @@ def get_config_content():
         return f.read().decode('utf-8', errors='replace')
 
 
+EFFORT_LEVELS = ('low', 'medium', 'high', 'xhigh', 'max')
+EFFORT_KEYS = ('support_efforts', 'default_effort')
+
+
+def _is_managed(model, provider):
+    """托管/目录导入的模型：官方刷新可能改写其顶层 support_efforts / default_effort。"""
+    name = str(model.get('provider') or '')
+    return name.startswith('managed:') or bool((provider or {}).get('oauth'))
+
+
+def _effective(m, key):
+    """[models.x.overrides] 优先于顶层字段（官方文档：运行时读取有效值）。"""
+    ov = m.get('overrides') or {}
+    return ov[key] if key in ov else m.get(key)
+
+
+def analyze_model_effort(alias, m, provider, thinking_cfg):
+    """按官方文档规则审计单个模型的思考强度配置，返回 (有效档位, 来源, 有效默认档, 实际生效档, 问题列表)。"""
+    ptype = (provider or {}).get('type', '')
+    caps = list(_effective(m, 'capabilities') or [])
+    sup = list(_effective(m, 'support_efforts') or [])
+    dflt = _effective(m, 'default_effort')
+    adaptive = bool(_effective(m, 'adaptive_thinking'))
+    has_think = 'thinking' in caps or 'always_thinking' in caps
+    g_on = thinking_cfg.get('enabled', True) is not False
+    g_eff = thinking_cfg.get('effort')
+    issues = []
+
+    def add(level, msg):
+        issues.append({'level': level, 'msg': msg})
+
+    bad = [x for x in sup if x not in EFFORT_LEVELS]
+    if bad:
+        add('error', 'support_efforts 含非法档位 %s（合法值：%s）' % (bad, '/'.join(EFFORT_LEVELS)))
+    if dflt is not None and dflt not in EFFORT_LEVELS:
+        add('error', 'default_effort="%s" 不是合法档位（合法值：%s）' % (dflt, '/'.join(EFFORT_LEVELS)))
+    if sup and dflt and dflt not in sup:
+        add('error', 'default_effort="%s" 不在 support_efforts %s 内，官方会回退或直接报错' % (dflt, sup))
+    if not has_think and (sup or dflt):
+        add('warn', '配置了思考档位，但没有 thinking 能力标签，档位不会生效（可在此开启「深度思考」）')
+    if has_think and not sup:
+        add('warn', '未声明 support_efforts，面板按官方五档兜底展示；实际是否支持取决于上游，建议按上游真实档位补全')
+    if adaptive and ptype and ptype != 'anthropic':
+        add('info', 'adaptive_thinking 仅对 anthropic 类型 provider 生效，当前为 %s，该字段会被忽略' % ptype)
+
+    efforts = sup if sup else (list(EFFORT_LEVELS) if has_think or adaptive else [])
+    source = 'config' if sup else 'fallback'
+
+    if not g_on:
+        actual = 'off'
+        add('info', '全局 [thinking].enabled=false，所有模型强制关闭思考')
+    elif g_eff and (not sup or g_eff in sup):
+        actual = g_eff
+        if dflt and dflt != g_eff:
+            add('info', '主 Agent 实际使用全局 [thinking].effort="%s"，会覆盖该模型的 default_effort="%s"（子代理才用模型默认值；会话内手动切换除外）' % (g_eff, dflt))
+    else:
+        actual = dflt or (sup[len(sup) // 2] if sup else None)
+        if g_eff and sup and g_eff not in sup:
+            add('info', '全局 [thinking].effort="%s" 不在该模型支持列表内，回退到模型默认档' % g_eff)
+    return efforts, source, dflt, actual, issues
+
+
 def get_models_data():
     content = get_config_content()
     data = _load_toml(content) or {}
@@ -714,29 +792,37 @@ def get_models_data():
     thinking_cfg = data.get('thinking', {}) or {}
     pricing = load_pricing()
     models = []
+    audit = {'error': 0, 'warn': 0, 'info': 0}
     for alias, m in (data.get('models', {}) or {}).items():
-        caps = m.get('capabilities', []) or []
         prov = m.get('provider', '')
-        prov_type = (providers.get(prov, {}) or {}).get('type', '')
-        adaptive = bool(m.get('adaptive_thinking'))
-        efforts = m.get('support_efforts', []) or []
-        if not efforts and ('thinking' in caps or adaptive):
-            # adaptive_thinking（Claude 系）与显式 thinking 模型：官方选择器档位 low..max
-            efforts = ['low', 'medium', 'high', 'xhigh', 'max']
+        prov_cfg = providers.get(prov, {}) or {}
+        caps = _effective(m, 'capabilities') or []
+        adaptive = bool(_effective(m, 'adaptive_thinking'))
+        efforts, source, dflt, actual, issues = analyze_model_effort(alias, m, prov_cfg, thinking_cfg)
+        base = str(prov_cfg.get('base_url') or '')
+        if base and not re.match(r'^https?://', base, re.I):
+            issues.insert(0, {'level': 'error', 'msg': 'provider「%s」的 base_url 协议非法：%s' % (prov, base)})
+        for it in issues:
+            audit[it['level']] += 1
         models.append({
             'alias': alias,
             'provider': prov,
-            'provider_type': prov_type,
+            'provider_type': prov_cfg.get('type', ''),
             'model': m.get('model', ''),
-            'display_name': m.get('display_name', alias),
-            'max_context_size': m.get('max_context_size', 250000),
+            'display_name': _effective(m, 'display_name') or alias,
+            'max_context_size': _effective(m, 'max_context_size') or 250000,
             'capabilities': caps,
             'has_image': 'image_in' in caps,
             'has_thinking': 'thinking' in caps or adaptive,
+            'always_thinking': 'always_thinking' in caps,
             'adaptive_thinking': adaptive,
             'has_tools': 'tool_use' in caps,
-            'support_efforts': efforts,
-            'default_effort': m.get('default_effort', thinking_cfg.get('effort', 'high')),
+            'support_efforts': _effective(m, 'support_efforts') or [],
+            'effective_efforts': efforts,
+            'efforts_source': source,
+            'default_effort': dflt or thinking_cfg.get('effort', 'high'),
+            'effective_effort': actual,
+            'effort_issues': issues,
             'is_default': alias == default_model,
             'pricing': pricing.get(alias) or pricing.get(m.get('model', '')) or None,
         })
@@ -744,6 +830,7 @@ def get_models_data():
     return {'default_model': default_model,
             'providers': list(providers.keys()),
             'thinking': thinking_cfg,
+            'effort_audit': audit,
             'models': models}
 
 
@@ -782,25 +869,36 @@ def safe_apply_config(new_content):
     return True, '配置已校验并应用，会话内 /reload 生效'
 
 
-def update_model_in_text(content, alias, updates):
+def _render_toml_kv(k, v):
+    if isinstance(v, bool):
+        return '%s = %s' % (k, str(v).lower())
+    if isinstance(v, int):
+        return '%s = %d' % (k, v)
+    if isinstance(v, list):
+        return '%s = [ %s ]' % (k, ', '.join('"%s"' % x for x in v))
+    return '%s = "%s"' % (k, v)
+
+
+def update_model_in_text(content, alias, updates, sub=''):
+    """改写 [models.<alias>] 的字段；sub='overrides' 时改写 [models.<alias>.overrides]（不存在则新建）。"""
     escaped = re.escape(alias)
-    pattern = r'(\[models\.(?:"%s"|%s)\])(.*?)(?=\n\[|\Z)' % (escaped, escaped)
+    suffix = r'\.' + re.escape(sub) if sub else ''
+    pattern = r'(\[models\.(?:"%s"|%s)%s\])(.*?)(?=\n\[|\Z)' % (escaped, escaped, suffix)
     m = re.search(pattern, content, re.DOTALL)
+    if not m and sub:
+        main = re.search(r'(\[models\.(?:"%s"|%s)\])(.*?)(?=\n\[|\Z)' % (escaped, escaped), content, re.DOTALL)
+        if not main:
+            return content, False
+        kvs = ''.join(_render_toml_kv(k, v) + '\n' for k, v in updates.items())
+        block = '[models."%s".%s]\n%s' % (alias, sub, kvs)
+        return content[:main.end()].rstrip('\n') + '\n\n' + block + content[main.end():], True
     if not m:
         return content, False
     header, body = m.group(1), m.group(2)
     lines = body.split('\n')
     new_lines = []
     handled = set()
-
-    def render(k, v):
-        if isinstance(v, bool):
-            return '%s = %s' % (k, str(v).lower())
-        if isinstance(v, int):
-            return '%s = %d' % (k, v)
-        if isinstance(v, list):
-            return '%s = [ %s ]' % (k, ', '.join('"%s"' % x for x in v))
-        return '%s = "%s"' % (k, v)
+    render = _render_toml_kv
 
     for line in lines:
         s = line.strip()
@@ -816,6 +914,44 @@ def update_model_in_text(content, alias, updates):
             new_lines.append(render(k, v))
     new_content = content[:m.start()] + header + '\n'.join(new_lines) + content[m.end():]
     return new_content, True
+
+
+def update_model_effort_in_text(content, alias, updates):
+    """思考档位写入：校验合法性与 default ∈ support；托管模型写 overrides 固定。返回 (新内容, 错误信息)。"""
+    data = _load_toml(content) or {}
+    m = (data.get('models', {}) or {}).get(alias)
+    if m is None:
+        return content, '模型 %s 不存在' % alias
+    sup_new = updates.get('support_efforts')
+    dflt_new = updates.get('default_effort')
+    if sup_new is not None and (not isinstance(sup_new, list) or any(x not in EFFORT_LEVELS for x in sup_new)):
+        return content, 'support_efforts 只能包含：%s' % '/'.join(EFFORT_LEVELS)
+    if dflt_new is not None and dflt_new not in EFFORT_LEVELS:
+        return content, 'default_effort 只能是：%s' % '/'.join(EFFORT_LEVELS)
+    sup = sup_new if sup_new is not None else (_effective(m, 'support_efforts') or [])
+    dflt = dflt_new if dflt_new is not None else _effective(m, 'default_effort')
+    if sup and dflt and dflt not in sup:
+        return content, 'default_effort "%s" 不在 support_efforts %s 内' % (dflt, sup)
+    provider = (data.get('providers', {}) or {}).get(m.get('provider'), {}) or {}
+    rest = {k: v for k, v in updates.items() if k not in EFFORT_KEYS}
+    eff = {k: v for k, v in updates.items() if k in EFFORT_KEYS}
+    new = content
+    if rest:
+        new, _ = update_model_in_text(new, alias, rest)
+    if eff:
+        new, _ = update_model_in_text(new, alias, eff, sub='overrides' if _is_managed(m, provider) else '')
+    return new, None
+
+
+def _global_effort_note(alias, level):
+    """全局 [thinking].effort 会覆盖主 Agent 的模型默认档，保存后提示实际生效值。"""
+    try:
+        m = next((x for x in get_models_data()['models'] if x['alias'] == alias), None)
+        if m and m.get('effective_effort') and m['effective_effort'] != level:
+            return '注意：主 Agent 实际使用 %s（被全局 [thinking].effort 覆盖），%s 仅对子代理等场景生效' % (m['effective_effort'], level)
+    except Exception:
+        pass
+    return ''
 
 
 def set_default_model_in_text(content, alias):
@@ -836,12 +972,7 @@ def auto_enable_all_in_text(content):
                 caps.append(cap)
                 changed = True
         if changed:
-            updates = {'capabilities': caps}
-            if 'thinking' in caps or m.get('adaptive_thinking'):
-                # adaptive_thinking（Claude 系）与 thinking 模型补官方五档
-                updates['support_efforts'] = m.get('support_efforts') or ['low', 'medium', 'high', 'xhigh', 'max']
-                updates['default_effort'] = m.get('default_effort') or 'high'
-            cur, _ = update_model_in_text(cur, alias, updates)
+            cur, _ = update_model_in_text(cur, alias, {'capabilities': caps})
     return cur
 
 
@@ -864,19 +995,26 @@ def check_update(force=False):
         return _UPDATE_CACHE['data']
     out = {'current': PLUGIN_VERSION, 'latest': None, 'update': False,
            'repo': 'https://github.com/%s' % UPDATE_REPO, 'error': None}
-    try:
-        req = urllib.request.Request(UPDATE_MANIFEST_URL,
-                                     headers={'User-Agent': 'kimi-code-usage/%s' % PLUGIN_VERSION,
-                                              'Accept': 'application/vnd.github.raw+json'})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            d = json.loads(r.read().decode('utf-8'))
-        latest = str(d.get('version') or '')
-        out['latest'] = latest
-        out['update'] = _semver(latest) > _semver(PLUGIN_VERSION)
-    except Exception as e:
-        out['error'] = '%r' % e
-    _UPDATE_CACHE['t'] = now
-    _UPDATE_CACHE['data'] = out
+    errors = []
+    for url in (UPDATE_MANIFEST_URL, UPDATE_MANIFEST_RAW_URL):
+        try:
+            req = urllib.request.Request(url,
+                                         headers={'User-Agent': 'kimi-code-usage/%s' % PLUGIN_VERSION,
+                                                  'Accept': 'application/vnd.github.raw+json'})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                d = json.loads(r.read().decode('utf-8'))
+            latest = str(d.get('version') or '')
+            if not latest:
+                raise ValueError('清单缺少 version 字段')
+            out['latest'] = latest
+            out['update'] = _semver(latest) > _semver(PLUGIN_VERSION)
+            out['error'] = None
+            _UPDATE_CACHE['t'] = now
+            _UPDATE_CACHE['data'] = out
+            return out
+        except Exception as e:
+            errors.append('%r' % e)
+    out['error'] = ' / '.join(errors)
     return out
 
 
@@ -944,7 +1082,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split('?')[0]
         if path in ('/api/status', '/api/health'):
             self._json({'status': 'ok', 'name': 'kimi-code-usage', 'port': PORT,
-                        'pid': os.getpid(), 'version': PLUGIN_VERSION})
+                        'pid': os.getpid(), 'version': PLUGIN_VERSION,
+                        'widget': widget_digest()})
         elif path == '/api/update/check':
             self._json(check_update(force='force' in self.path))
         elif path in ('/api/usage', '/api/dashboard'):
@@ -996,9 +1135,12 @@ class Handler(BaseHTTPRequestHandler):
                 alias, updates = req.get('alias', ''), req.get('updates', {})
                 if not alias or not updates:
                     return self._json({'success': False, 'message': '缺少参数'}, 400)
-                new_content, _ = update_model_in_text(get_config_content(), alias, updates)
+                new_content, err = update_model_effort_in_text(get_config_content(), alias, updates)
+                if err:
+                    return self._json({'success': False, 'message': err}, 400)
                 ok, msg = safe_apply_config(new_content)
-                return self._json({'success': ok, 'message': msg}, 200 if ok else 400)
+                note = _global_effort_note(alias, updates['default_effort']) if ok and updates.get('default_effort') else ''
+                return self._json({'success': ok, 'message': msg, 'note': note}, 200 if ok else 400)
 
             if path == '/api/add-model':
                 alias = req.get('alias', '').strip()
@@ -1006,13 +1148,25 @@ class Handler(BaseHTTPRequestHandler):
                 model_id = req.get('model', '').strip()
                 if not alias or not provider or not model_id:
                     return self._json({'success': False, 'message': 'alias/provider/model 必填'}, 400)
+                efforts = req.get('support_efforts')
+                effort_lines = ''
+                if efforts:
+                    if (not isinstance(efforts, list)
+                            or any(e not in EFFORT_LEVELS for e in efforts)):
+                        return self._json({'success': False,
+                                           'message': 'support_efforts 只能包含 %s' % '/'.join(EFFORT_LEVELS)}, 400)
+                    dflt = req.get('default_effort') or efforts[0]
+                    if dflt not in efforts:
+                        return self._json({'success': False,
+                                           'message': 'default_effort 不在 support_efforts 内'}, 400)
+                    effort_lines = ('support_efforts = [ %s ]\ndefault_effort = "%s"\n'
+                                    % (', '.join('"%s"' % e for e in efforts), dflt))
                 block = ('\n[models."%s"]\nprovider = "%s"\nmodel = "%s"\n'
                          'max_context_size = %d\ncapabilities = [ "tool_use", "thinking", "image_in" ]\n'
-                         'display_name = "%s"\nsupport_efforts = [ "low", "medium", "high", "max" ]\n'
-                         'default_effort = "high"\n'
+                         'display_name = "%s"\n%s'
                          % (alias, provider, model_id,
                             int(req.get('max_context_size', 250000)),
-                            req.get('display_name', '').strip() or alias))
+                            req.get('display_name', '').strip() or alias, effort_lines))
                 ok, msg = safe_apply_config(get_config_content() + block)
                 return self._json({'success': ok, 'message': msg}, 200 if ok else 400)
 
