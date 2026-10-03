@@ -119,6 +119,33 @@ def log(msg):
 
 
 # ---------------- desktop-dist 定位 ----------------
+def _remember_dist(path):
+    """把探测到的 desktop-dist 路径写回 desktop_path.txt，下次直接用。"""
+    try:
+        with open(os.path.join(SCRIPT_DIR, 'desktop_path.txt'), 'w', encoding='utf-8') as f:
+            f.write(path)
+    except Exception:
+        pass
+
+
+def _dist_from_running_process():
+    """列出正在运行的 Kimi Code.exe，返回其 resources/desktop-dist 候选路径。"""
+    out = []
+    try:
+        q = subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             "Get-Process -Name 'Kimi Code' -ErrorAction SilentlyContinue | "
+             "Select-Object -ExpandProperty Path"],
+            capture_output=True, text=True, timeout=10)
+        for line in (q.stdout or '').splitlines():
+            p = line.strip().strip('"')
+            if p:
+                out.append(os.path.join(os.path.dirname(p), 'resources', 'desktop-dist'))
+    except Exception:
+        pass
+    return out
+
+
 def get_dist_dir():
     cfg = os.path.join(SCRIPT_DIR, 'desktop_path.txt')
     try:
@@ -135,6 +162,11 @@ def get_dist_dir():
     ]
     for c in candidates:
         if c and os.path.isdir(c):
+            return c
+    # 进程兜底：非默认盘/便携安装时按正在运行的 Kimi Code.exe 位置推导
+    for c in _dist_from_running_process():
+        if os.path.isdir(c):
+            _remember_dist(c)
             return c
     return ''
 
@@ -262,12 +294,16 @@ _INJECT_RE = re.compile(r'\s*<script src="/assets/kimi-(embedded|usage)-(data|wi
 # 旧套件残留的根路径注入（/kimi-usage-widget.js 等非 /assets/ 前缀）——会与新版卡片
 # 争用同一 DOM 容器且不渲染模型/会话行，必须一并清掉，不能只靠 _INJECT_RE
 _LEGACY_ROOT_INJECT_RE = re.compile(r'\s*<script src="/kimi-[a-z-]*(?:data|widget)\.js[^"]*"></script>\s*')
+# 无 Python 时注入的"需要 Python"占位卡片——服务起来后要摘掉，否则装了 Python
+# 仍残留一行提示
+_NEEDPY_INJECT_RE = re.compile(r'\s*<script src="/assets/kimi-usage-needpy\.js[^"]*"></script>\s*')
 
 
 def strip_legacy_injections():
     try:
         html = io.open(INDEX_HTML, encoding='utf-8').read()
-        new_html = _LEGACY_ROOT_INJECT_RE.sub('\n', _INJECT_RE.sub('\n', html))
+        new_html = _NEEDPY_INJECT_RE.sub('\n',
+                  _LEGACY_ROOT_INJECT_RE.sub('\n', _INJECT_RE.sub('\n', html)))
         if new_html != html:
             io.open(INDEX_HTML, 'w', encoding='utf-8').write(new_html)
     except Exception:
@@ -290,7 +326,8 @@ def ensure_injection():
         return
     try:
         html = io.open(INDEX_HTML, encoding='utf-8').read()
-        new_html = _LEGACY_ROOT_INJECT_RE.sub('\n', _INJECT_RE.sub('\n', html))
+        new_html = _NEEDPY_INJECT_RE.sub('\n',
+                  _LEGACY_ROOT_INJECT_RE.sub('\n', _INJECT_RE.sub('\n', html)))
         data_tag = '<script src="/assets/kimi-usage-data.js"></script>'
         widget_tag = _widget_tag()
         block = '  %s\n  %s\n' % (data_tag, widget_tag)
@@ -1472,13 +1509,16 @@ def port_is_ours():
 def spawn_daemon():
     """静默拉起常驻服务进程（pythonw 后台）。"""
     py = sys.executable
+    # Microsoft Store 存根（WindowsApps）不能拉起后台服务
+    if 'WindowsApps' in py.replace('/', '\\'):
+        py = ''
     # 优先 pythonw.exe 免窗口
-    cand = os.path.join(os.path.dirname(py), 'pythonw.exe')
-    if os.path.exists(cand):
+    cand = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
+    if not py and os.path.exists(cand):
         py = cand
     for alt in (r'C:\Program Files\python\pythonw.exe', r'C:\Program Files\Python313\pythonw.exe',
                 r'C:\Program Files\Python312\pythonw.exe', r'C:\Program Files\Python311\pythonw.exe'):
-        if not os.path.exists(py) or 'Microsoft\\WindowsApps' in py:
+        if not os.path.exists(py) or 'WindowsApps' in py:
             if os.path.exists(alt):
                 py = alt
     flags = 0

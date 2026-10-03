@@ -2,6 +2,13 @@
 
 > 格式说明：每个版本以 `## vX.Y.Z · 发布日期` 开头；`###` 为分组标题，`-` 为条目。面板里的「发现新版本」弹窗会读取最新版本这一节。
 
+## v3.2.4 · 2026-10-04
+
+### 修复
+- 首次安装不显示面板：Kimi Code 装在非默认盘（如 `D:\Kimi Code`）时 `desktop-dist` 探测失败，导致注入与数据文件都无法落盘。新增「按正在运行的 `Kimi Code.exe` 进程路径兜底」，探测成功后自动写回 `scripts/desktop_path.txt`。
+- 首次安装无 Python 时完全静默：未装 Python 的机器上 hook 只写日志，侧栏什么都看不到。现在 `bootstrap.cmd` 找不到 Python 时会调用 `scripts/need-python.ps1`，向 `desktop-dist` 注入一个静态占位卡片，提示安装 Python 并给出下载链接。
+- `spawn_daemon` 误用 Microsoft Store 的 `python.exe` 存根（`WindowsApps` 重定向），导致 daemon 拉起失败、面板永远离线。现在显式拒绝 `WindowsApps` 路径，继续走 `pythonw.exe` 与常见安装目录。
+
 ## v3.2.3 · 2026-10-04
 
 本次汇总 2026-10-04 当天的全部更新（含 v3.2.2）。
