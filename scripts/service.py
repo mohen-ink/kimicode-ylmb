@@ -1512,13 +1512,16 @@ def spawn_daemon():
     # Microsoft Store 存根（WindowsApps）不能拉起后台服务
     if 'WindowsApps' in py.replace('/', '\\'):
         py = ''
-    # 优先 pythonw.exe 免窗口
+    # 优先同目录的 pythonw.exe 免窗口；存根场景 cand 也是存根，os.path.exists
+    # 为真但 for 循环里的 WindowsApps 检查会把它换掉
     cand = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
     if not py and os.path.exists(cand):
         py = cand
+    elif py and os.path.exists(cand):
+        py = cand
     for alt in (r'C:\Program Files\python\pythonw.exe', r'C:\Program Files\Python313\pythonw.exe',
                 r'C:\Program Files\Python312\pythonw.exe', r'C:\Program Files\Python311\pythonw.exe'):
-        if not os.path.exists(py) or 'WindowsApps' in py:
+        if not py or not os.path.exists(py) or 'WindowsApps' in py:
             if os.path.exists(alt):
                 py = alt
     flags = 0
