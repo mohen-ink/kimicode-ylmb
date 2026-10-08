@@ -34,6 +34,8 @@ from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit, unquote, quote
 
+_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
 try:
     import mobile_usage as _mobile_usage
 except ImportError:                          # 仅本脚本被单独复制时降级
@@ -423,7 +425,7 @@ def _enum_lan_addresses():
             "(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
             "Where-Object {$_.PrefixOrigin -ne 'WellKnown'} | "
             "Select-Object -ExpandProperty IPAddress) -join \"`n\""
-        ], capture_output=True, text=True, timeout=15)
+        ], capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW)
         for line in (q.stdout or '').splitlines():
             add(line.strip())
     except Exception:

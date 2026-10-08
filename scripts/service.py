@@ -37,6 +37,8 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
 PORT = 39281
 PLUGIN_ROOT = os.environ.get('KIMI_PLUGIN_ROOT') or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -179,7 +181,7 @@ def _dist_from_running_process():
             ['powershell', '-NoProfile', '-Command',
              "Get-Process -Name 'Kimi Code' -ErrorAction SilentlyContinue | "
              "Select-Object -ExpandProperty Path"],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW)
         for line in (q.stdout or '').splitlines():
             p = line.strip().strip('"')
             if p:
@@ -262,7 +264,7 @@ def _legacy_daemon_pids():
             'powershell', '-NoProfile', '-Command',
             "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'python.*\\.py' }"
             " | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
-        ], capture_output=True, text=True, timeout=20)
+        ], capture_output=True, text=True, timeout=20, creationflags=_NO_WINDOW)
         rows = json.loads(q.stdout or '[]')
         if isinstance(rows, dict):
             rows = [rows]
@@ -286,7 +288,7 @@ def _kill_legacy_processes():
     for pid in _legacy_daemon_pids():
         try:
             subprocess.run(['taskkill', '/PID', str(pid), '/F'],
-                           capture_output=True, timeout=10)
+                           capture_output=True, timeout=10, creationflags=_NO_WINDOW)
             log('killed legacy model-manager daemon pid %d' % pid)
         except Exception:
             pass
@@ -300,7 +302,7 @@ def kill_port_owner():
     try:
         out = subprocess.run(
             ['netstat', '-ano', '-p', 'tcp'],
-            capture_output=True, text=True, timeout=15).stdout or ''
+            capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW).stdout or ''
         pids = []
         for line in out.splitlines():
             parts = line.split()
@@ -311,7 +313,7 @@ def kill_port_owner():
             try:
                 if _daemon_pid_verified(pid):
                     subprocess.run(['taskkill', '/PID', str(pid), '/F'],
-                                   capture_output=True, timeout=10)
+                                   capture_output=True, timeout=10, creationflags=_NO_WINDOW)
                     log('killed stale own daemon on %d (pid %s)' % (PORT, pid))
                 else:
                     log('port %d held by foreign pid %s; refusing to kill' % (PORT, pid))
@@ -362,7 +364,7 @@ def migrate_legacy():
                 except OSError:
                     pass
         subprocess.run(['reg', 'delete', r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
-                        '/v', 'KimiCodePlugin', '/f'], capture_output=True, timeout=10)
+                        '/v', 'KimiCodePlugin', '/f'], capture_output=True, timeout=10, creationflags=_NO_WINDOW)
         # 摘除 index.html 中的旧注入标签
         if INDEX_HTML and os.path.exists(INDEX_HTML):
             strip_legacy_injections()
@@ -1135,7 +1137,7 @@ def safe_apply_config(new_content):
     kimi = shutil.which('kimi') or shutil.which('kimi.cmd') or 'kimi'
     try:
         res = subprocess.run([kimi, 'doctor', 'config', CONFIG_NEW_PATH],
-                             capture_output=True, text=True, timeout=30)
+                             capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW)
         if res.returncode != 0:
             try:
                 os.remove(CONFIG_NEW_PATH)
@@ -2295,7 +2297,7 @@ def _daemon_pid_verified(pid):
         q = subprocess.run([
             'powershell', '-NoProfile', '-Command',
             "(Get-CimInstance Win32_Process -Filter 'ProcessId=%s').CommandLine" % pid
-        ], capture_output=True, text=True, timeout=15)
+        ], capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW)
         argv = _parse_cmdline((q.stdout or '').strip())
         if len(argv) != 2:
             return False
@@ -2358,7 +2360,7 @@ def restart_service():
                 return 2
             else:
                 subprocess.run(['taskkill', '/PID', str(pid2), '/F'],
-                               capture_output=True, timeout=10)
+                               capture_output=True, timeout=10, creationflags=_NO_WINDOW)
                 for _ in range(40):
                     if _port_free():
                         break

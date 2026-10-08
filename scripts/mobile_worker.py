@@ -180,7 +180,7 @@ def _icacls(args):
     exe = os.path.join(os.environ.get('SystemRoot') or r'C:\Windows',
                        'System32', 'icacls.exe')
     try:
-        r = subprocess.run([exe] + args, capture_output=True, timeout=15)
+        r = subprocess.run([exe] + args, capture_output=True, timeout=15, creationflags=_NO_WINDOW)
     except (OSError, subprocess.SubprocessError):
         raise MobileBridgeError('worker ACL 设置失败')
     if r.returncode != 0:
