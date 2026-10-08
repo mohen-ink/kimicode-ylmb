@@ -300,6 +300,18 @@ _USAGE_ENTRY_HTML = (
     'color:#a8a8b3;border:1px solid #33333d;font:13px system-ui,sans-serif;'
     'text-decoration:none;opacity:.85">用量</a>').encode('utf-8')
 
+# 局域网是明文 HTTP＝非安全上下文，浏览器不提供 crypto.randomUUID，原生前端
+# 渲染输入区时会抛错。仅在缺失时补一个基于 getRandomValues 的实现。
+_RANDOM_UUID_SHIM = (
+    b'<script>(function(){var c=window.crypto;'
+    b'if(!c||typeof c.randomUUID==="function"||!c.getRandomValues)return;'
+    b'c.randomUUID=function(){var b=new Uint8Array(16);c.getRandomValues(b);'
+    b'b[6]=b[6]&15|64;b[8]=b[8]&63|128;var h=[];'
+    b'for(var i=0;i<16;i++)h.push((b[i]+256).toString(16).slice(1));'
+    b'return h.slice(0,4).join("")+"-"+h.slice(4,6).join("")+"-"'
+    b'+h.slice(6,8).join("")+"-"+h.slice(8,10).join("")+"-"'
+    b'+h.slice(10).join("")};})();</script>')
+
 # ---------- M6：代理面同源可执行内容防护 ----------
 # 经 /fs/*、/files/{id}、/media 取回的内容由本地工作区决定，被 agent 写成
 # HTML/SVG 时浏览器会当同源文档执行——加 sandbox + attachment 降级。
@@ -2347,6 +2359,8 @@ class _LanHandler(BaseHTTPRequestHandler):
                     # 仅 SPA index（非 /api/ 路径）追加同源 /mobile/usage 入口；
                     # /api/ 提供的 HTML 内容保持字节不变
                     if not raw_path.startswith('/api/'):
+                        if b'<head>' in data:
+                            data = data.replace(b'<head>', b'<head>' + _RANDOM_UUID_SHIM, 1)
                         if b'</body>' in data:
                             data = data.replace(b'</body>', _USAGE_ENTRY_HTML + b'</body>', 1)
                         else:
