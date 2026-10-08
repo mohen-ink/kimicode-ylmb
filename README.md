@@ -23,11 +23,12 @@
 - **📈 全尺寸大屏（内嵌渲染，无 iframe）**：波浪面积图 + 调用量柱形（今日逐小时 / 本周 7 天 / 本月 30 天切换）、模型份额表、会话 Top 8、30 天明细表、深浅主题切换。点击卡片标题或「📊 面板」打开。
 - **🛠️ 模型与能力管理器**：`⚙` 打开弹窗，按模型开关识图 `image_in` / 深度思考 `thinking` / 工具调用 `tool_use`，默认强度分段按钮（按 `support_efforts`/`overrides` 有效值过滤，写入前校验 `default_effort ∈ support_efforts`，托管模型写入 `[models.x.overrides]` 防被官方刷新改写；卡片显示配置问题）、一键全开、设为默认、搜索过滤；修改自动备份 `config.toml` 并经 `kimi doctor config` 校验，会话内 `/reload` 生效。
 - **🔄 更新**：面板**不会自动更新**。点面板头部「更新」按钮才会请求检查——有新版本时弹窗显示发布时间与更新内容（取自 `CHANGELOG.md`），**需你点击确认**才会下载、覆盖插件文件并自动重启服务（用量数据、价格配置、desktop_path.txt 不受影响）；已是最新则不弹窗。会话里也可用 `/update`。另有**每日提醒**：每 24 小时静默检查一次 `ziyiclouds-blip/kimicode-ylmb`，有新版本只在「更新」/「面板」按钮上亮红点、不弹窗；点头部「更新提醒：开/关」可关闭或重新开启。正式版面板文件更新后会提示「刷新界面」。**带本地预览标记的安装形态**（清单 `localPreview: true` 或版本带 `-local`）会拦截 GitHub 自更新（检查返回 `blocked: true` / `reason: "local_preview"`，应用返回 HTTP 409；`scripts/updater.py` 自身也有同样的纵深防御，退出码 5），需要按发布说明手动安装；GitHub 上发布的 `3.3.3` 清单为纯数字版本，不含该标记。CSS-only 自动样式更新只覆盖固定样式文件，不代表通用 JS 热重载。
-- **📱 手机远程连接（可选，外网预览）**：侧栏「手机」浮层提供**外网（Cloudflare Quick Tunnel）**连接。加载状态、打开浮层都不会自动安装组件或开启连接；手机端使用 Kimi 原生手机 SPA，桥只负责配对与受限转发。
+- **📱 手机远程连接（可选，预览）**：侧栏「手机」浮层顶部是**三段模式切换块**：**内网**（局域网明文 HTTP）、**CF 隧道**（Cloudflare Quick Tunnel）、**中继服务器**（占位，尚未开放）。加载状态、打开浮层都不会自动安装组件或开启连接；手机端使用 Kimi 原生手机 SPA，桥只负责配对与受限转发。
   - 明确同意后安装固定版本的 Cloudflare 连接器，再单独同意第三方中继并开启；准备好后生成临时 HTTPS 配对链接与离线二维码，供不在同一 WiFi 的手机浏览器使用。不是 P2P，不使用个人 VPS。
   - **配对码 10 分钟一次性**：配对码只出现在 URL fragment，10 分钟有效、成功兑换一台设备即销毁；「生成新二维码」作废旧码签新码（不影响已连设备）；停止吊销全部配对/会话/隧道。
   - 二维码由 vendored `qrcodegen.js`（Project Nayuki，MIT）离线生成；QR 失败可复制链接。
-  - 检测到旧版局域网连接或官方中继仍在运行时，浮层只提示并提供停止入口（LAN 用「停止连接」，官方中继用专用按钮「停止官方中继」），绝不代为切换。
+  - **内网模式**：不经过 Cloudflare、无需下载组件；选择本机一块 RFC1918 内网网卡并确认「明文 HTTP、仅可信 Wi-Fi」后开启，生成 `http://<内网IP>:<端口>/mobile/pair#pair=…` 配对链接与二维码（端口从 39282 起取空闲）。手机须与电脑在同一可信 Wi-Fi。
+  - **模式锁定**：桥开启期间切换块锁定为当前运行模式，需先停止才能切换；关闭状态下切换只保存前端偏好（`localStorage: kur-mode`），不发请求。检测到官方中继仍在运行时，浮层只提示并提供「停止官方中继」入口，绝不代为切换。
 - **🛡️ 用量采集纯本地**：用量采集仍在本机进行。开启手机连接后，会话流量会经 Cloudflare 第三方中继转发，会话本身不再「纯本地」。
 
 ## 手机远程连接（外网，预览功能）
@@ -66,7 +67,7 @@
 - **固定组件而非任意可执行文件**：仅官方 [cloudflare/cloudflared 2026.9.3 Windows AMD64 发布文件](https://github.com/cloudflare/cloudflared/releases/download/2026.9.3/cloudflared-windows-amd64.exe)，大小 `55366080` 字节，SHA256 `f096265ec2fcbe9bb6e2d64268db167ced3fcbb83d894bdb9e2fcdb26f2ea7e2`；完整 [Apache-2.0 许可证随插件打包](assets/vendor/cloudflared-2026.9.3-LICENSE)（`11357` 字节，SHA256 `58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd`，安装先校验包内许可证再下载 EXE）。不接受用户传入 URL、命令或外网绑定参数。Python ≥3.8 标准库实现，不新增 pip/npm 依赖。
 - **组件存储在插件树外**：`KIMI_HOME/usage-dashboard/runtime/cloudflared/2026.9.3`；插件更新不覆盖此目录。
 - **本地预览形态禁止 GitHub 自更新**：带 `localPreview: true` 与 `-local` 后缀的安装形态保留其自更新拦截；检查返回 `blocked: true` / `reason: "local_preview"`，应用返回 HTTP 409。**`scripts/updater.py` 自身也有 `local_build_blocked()` 纵深防御**（清单 `localPreview`/版本 `-local`/清单缺版本一律拒，一个文件都不动，退出码 5），不依赖调用方自觉。GitHub 上发布的 `3.3.3` 清单为纯数字版本、不带该标记。
-- **旧版通道**：检测到旧版局域网连接仍在运行时浮层提供「停止连接」入口；检测到官方中继仍在运行时，浮层给出专用按钮**「停止官方中继」**（`#kur-legacy-stop`，调 `KimiRemoteAPI.setEnabled(false)`），同样不代为开关。官方中继是 Kimi Code 官方功能，需付费会员与同一 Kimi 账号。**UI 只保留外网单一路径，但后端仍接受 `mode='lan'`**（`start` 接口未移除该分支）；带 `X-Kimi-Mobile-Control: 1` 的本机进程仍可直接请求 LAN 监听。
+- **旧版通道**：检测到旧版局域网连接仍在运行时浮层提供「停止连接」入口；检测到官方中继仍在运行时，浮层给出专用按钮**「停止官方中继」**（`#kur-legacy-stop`，调 `KimiRemoteAPI.setEnabled(false)`），同样不代为开关。官方中继是 Kimi Code 官方功能，需付费会员与同一 Kimi 账号。内网（`mode='lan'`）已重新进入 UI 的模式切换块，不再作为"旧版通道"处理。
 
 ### 手机控制面接口合同（供集成排查）
 
@@ -149,7 +150,7 @@ kimi-code-usage/
 ├── LICENSE / README.md / SYSTEM.md
 ├── assets/
 │   ├── kimi-usage-widget.js    # 侧栏卡片+大屏+模型弹窗（注入链最后一个脚本）
-│   ├── kimi-remote-widget.js   # 手机浮层（外网 Cloudflare 连接预览）
+│   ├── kimi-remote-widget.js   # 手机浮层（内网 / CF 隧道 / 中继占位 模式切换）
 │   ├── kimi-remote-api.js      # 官方 /api/v1/remote-control 适配层（仅探测旧版官方中继）
 │   ├── kimi-mobile-api.js      # 手机控制面适配层（/api/mobile/*）
 │   ├── kimi-remote-qr.js       # QR→SVG 桥接（依赖 vendor/qrcodegen.js）

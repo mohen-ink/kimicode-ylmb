@@ -382,12 +382,14 @@ def _is_rfc1918(host):
 
 _LAN_ADDR_CACHE = {'t': 0.0, 'addrs': []}
 _LAN_ADDR_CACHE_TTL = 10.0     # status 轮询频繁，网卡列表缓存 10s
+_LAN_ADDR_EMPTY_TTL = 3.0      # 空结果也缓存（避免无网络时每次轮询都跑 PowerShell），但更短便于联网后尽快恢复
 
 
 def local_lan_addresses():
     """本机 RFC1918 IPv4 候选网卡地址（多网卡由 UI 显式选择，不绑 0.0.0.0）。"""
     now = time.time()
-    if _LAN_ADDR_CACHE['addrs'] and now - _LAN_ADDR_CACHE['t'] < _LAN_ADDR_CACHE_TTL:
+    ttl = _LAN_ADDR_CACHE_TTL if _LAN_ADDR_CACHE['addrs'] else _LAN_ADDR_EMPTY_TTL
+    if _LAN_ADDR_CACHE['t'] and now - _LAN_ADDR_CACHE['t'] < ttl:
         return list(_LAN_ADDR_CACHE['addrs'])
     addrs = _enum_lan_addresses()
     _LAN_ADDR_CACHE['t'] = now

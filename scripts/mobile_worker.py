@@ -1011,6 +1011,10 @@ class MobileWorkerClient(object):
                'owner_origin': '', 'device_count': 0,
                'connector': connector, 'tunnel': {'state': 'off'},
                'pair_state': 'missing'}
+        try:
+            out['addresses'] = local_lan_addresses()
+        except Exception:
+            out['addresses'] = []
         notice = self._failure_notice()
         if notice:
             out['worker_notice'] = notice
