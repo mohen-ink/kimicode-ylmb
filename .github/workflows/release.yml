@@ -1,0 +1,51 @@
+name: Release on tag
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from manifest
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $manifest = Get-Content kimi.plugin.json -Raw | ConvertFrom-Json
+          $ver = $manifest.version
+          if ($ver -ne $tag.TrimStart('v')) {
+            Write-Error "tag $tag != kimi.plugin.json version $ver"
+            exit 1
+          }
+          echo "version=$ver" >> $env:GITHUB_OUTPUT
+
+      - name: Build zip
+        shell: pwsh
+        run: |
+          $ver = $env:GITHUB_REF_NAME.TrimStart('v')
+          $name = "kimicode-ylmb-$ver"
+          $zip = "$name.zip"
+          git archive --format=zip --prefix="$name/" HEAD -o $zip
+          $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$sha  $zip" | Out-File -Encoding ascii "$zip.sha256"
+          echo "zip=$zip" >> $env:GITHUB_OUTPUT
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $ver = $tag.TrimStart('v')
+          $notes = (Get-Content CHANGELOG.md -Raw) -split "(?m)^## " | Where-Object { $_ -match "^v$([regex]::Escape($ver))\b" } | Select-Object -First 1
+          if ($notes) { $notes = "## $notes".Trim() } else { $notes = "$tag" }
+          gh release create $tag "kimicode-ylmb-$ver.zip" "kimicode-ylmb-$ver.zip.sha256" `
+            --title $tag --notes $notes --latest
