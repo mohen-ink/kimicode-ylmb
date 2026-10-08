@@ -1,96 +1,87 @@
-# Kimi Code 用量面板 — 更新交接
+# Kimi Code 用量面板 — 交付与更新交接
 
-基线版本：上游仓库 `ziyiclouds-blip/kimicode-ylmb` **v3.1.0**（HEAD `36cc13af`）
+当前版本 **v3.3.3**（2026-10-08），GitHub Release 以 **Pre-release** 分发。手机远程连接为**预览功能**，公网真机验收尚未完成。
 
-本次改动集中在侧栏小组件（`assets/kimi-usage-widget.js`）与一处注入防御补丁（`scripts/service.py`），其余文件与上游一致。
+- 详细版本条目：[CHANGELOG.md](CHANGELOG.md)
+- 面向用户的说明：[README.md](README.md)
+- 手机远程连接：[工作文档](docs/手机远程连接-工作文档.md) · [合并文档](docs/手机远程连接-合并文档.md) · [最终工作文档](docs/手机远程连接-最终工作文档-20261007.md)
 
----
+## 1. 本版本变更
 
-## 变更内容
+- **新增手机外网连接**：侧栏「手机」浮层使用 Cloudflare Quick Tunnel 生成临时 HTTPS 配对链接与离线二维码；只保留外网单一路径，旧通道仅提示与显式停止；两段独立同意；配对码 10 分钟一次性、可换发；停止即撤销配对/会话/WebSocket/隧道。
+- **新增手机只读用量页**：已配对手机通过同源入口查看用量，只从固定本机用量服务读取白名单字段；用量服务不可用不影响聊天桥。
+- **手机桥迁入独立 worker 进程**：用量后台重启只 detach，已开启连接继续存活；同版本新后台重连接管，旧版本 worker 不接管不擅杀但放行显式停止。
+- **连接与上传修复**：全局配置写窄白名单、匿名与已配对分别限流、multipart 正文标记误判修复、上游异常断开返回受控错误、仅上传路径放宽请求体预算（闲置 120 秒 / 累计 600 秒，上限仍 32 MiB）。
+- **组件与安装稳定性**：真正的 Windows Job 脱离标志、单次受保护 DACL 权限写入、启动失败固定阶段码、IPC 403 句柄失效处理、连接器固定摘要与随包许可证、下载瞬态有限重试 + Python 3.8 超时识别。
+- **界面**：浮层与模型弹窗视觉统一、窄屏二维码尺寸与暗色对比修复、键盘焦点循环、安装入口可恢复隐藏、专用等待预算与错误提示保留。
+- **安全与更新保护**：精确方法与路由白名单、凭据不下发手机、用户 HTML/SVG 强制 sandbox 与附件头、未消费请求体有限排空、更新器本地预览自保护与完整性闸门。
 
-### 1. `assets/kimi-usage-widget.js` — 侧栏卡片重排 + hover 详情弹层 + 跳动修复 + 拉伸适配
+## 2. 版本与基线
 
-| 区块 | 改动 |
+| 项 | 内容 |
 |---|---|
-| 模型行 `#ku-cur-row` | 名称（加粗，可收缩省略）+ 右侧次要灰色小字 `.ku-cur-meta`（思考档位 · 子代理，10px，靠右，超长省略）；不再使用徽章，工具能力等完整信息放在 hover 名称弹出的浮层里 |
-| 会话行 `#ku-sess-row` | 行内显示（短 key / tokens / 缓存 / 成本）；短 key = 去掉 `session_` 前缀后取前 8 位，与 tokens 间留 8px；hover key 弹浮层（完整 ID / Token / 调用 / 缓存 / 成本 / 最近活动） |
-| 模型列表 `.ku-model-item` | 去掉内嵌第二行 `.ku-m-detail`；hover `.ku-m-name` 弹浮层（模型 / Token / 次数 / 缓存 / 成本） |
-| 详情弹层 `.ku-pop` | 新增 `kuBindHoverPop(el, buildRows, title)`：滑入 90ms 弹出、滑出 140ms 自动关，无 ✕ 按钮、无需点击；浮层自身 hover 不消失，`Esc` 可关 |
-| hover 监听只绑一次 | `kuBindHoverPop` 把构建函数/标题挂在元素上（`el._kuPopBuild` / `el._kuPopTitle`），以 `el._kuPopBound` 标记只注册一次 `mouseenter`/`mouseleave`，避免每次刷新叠加监听；浮层已对同一锚点打开时只更新内容，不删除重建 |
-| 数据签名跳过重渲染 | `processData` / `fetchData` 用 `kuDataChanged(u)` 比较去掉 `updated_at`/`time` 后的 JSON 签名（及在线状态），未变化则跳过 `updateDOM()` / `kupRenderAll()`；`models` 数据同样只在变化时刷新。sparkline、最小化行、面板 KPI 卡片/指标条也按 HTML 缓存比对，内容相同不重写 |
-| 跳动修复 | `renderModelsList` 行数不变时就地更新 `textContent`（不再每 2s `innerHTML` 重建 DOM）；`data-mode` 区分 `empty` / `list`；`.ku-min-model` 固定 `min-height`，空态显示淡色 `--` 占位而不是隐藏 |
-| 刷新后最小化栏模型名 | 最小化栏第二行（今日用量最高的模型 · tokens · 缓存 · 成本）的 HTML 缓存到 `localStorage`（`kimi-usage-min-model-html`），刷新后 `createCard` 直接用缓存/现有数据预填，数据到达后再替换，不再出现空白/加载占位；`attachWidget` 新建卡片时重置 `kuLastSig`，保证侧栏重建后的新卡片一定会被完整渲染一次 |
-| 面板表格抖动 | `kupRenderModels` / `kupRenderSessions` / `kupRenderDaily` 同侧栏列表思路：表头只建一次、行数不变就地更新 `td`；`table-layout:fixed` + `td text-overflow:ellipsis` 让列宽稳定不随内容跳变 |
-| 摘要条 | `.ku-summary-strip` 改 `flex-wrap:wrap`，窄窗口换行；`.ku-min-left` 可收缩省略 |
-| 拉伸适配 | `.ku-row-val` 改 `flex:1`、`.ku-row-cost` 改 `margin-left:auto` 右对齐；模型列表列改 `minmax(Npx, auto)` 自适应；缓存条 `max-width:40%` 弹性；sparkline 柱改 `flex:1` 均分宽度；宽侧栏下不再左侧扎堆右侧空 |
-| 死代码清理 | 删除 `ku-pop-trigger` / `ku-cur-badge` / `ku-cur-effort` / `ku-cur-tools` / `ku-cur-sub` / `ku-cur-info` / `ku-sess-info` / `ku-pop-close` / `ku-m-detail` / `ku-cur-detail` / `ku-tag*` / `ku-cur-badges` / `ku-cur-main` / `ku-cur-line1` 相关残留 |
+| 发布版本 | `3.3.3`（纯数字，兼容旧版 CHANGELOG 解析） |
+| 发布形态 | GitHub Release **Pre-release**；手机功能标注预览 |
+| 日期 | 2026-10-08 |
+| Git 基线 | `2760544`（v3.2.5） |
+| 仓库 | https://github.com/ziyiclouds-blip/kimicode-ylmb |
+| 支持环境 | Windows + Python ≥3.8（标准库，无新增 pip/npm 依赖）；外网组件限 Windows AMD64 |
+| 许可证 | 插件 MIT；二维码库 Project Nayuki MIT；cloudflared Apache-2.0（完整文本随包） |
 
-> hover 触发只绑在名称元素上（`#ku-cur-model` / `#ku-sess-key` / `.ku-m-name`），行内其他位置不触发。
+带本地预览标记的安装形态（清单 `localPreview: true` 或版本号带 `-local`）会拦截 GitHub 自更新，从该形态迁移到本发布版本需按发布说明手动安装；本发布源码与任何本机安装目录不承诺逐字节一致。
 
-### 2. `scripts/service.py` — 根路径注入防御补丁（+3 行）
+## 3. 验证状态（如实记录）
 
-上游 `_INJECT_RE` 只清 `/assets/kimi-*.js`，存在旧版残留的根路径注入 `/kimi-usage-widget.js`（非 `/assets/` 前缀）时会与新版卡片争用同一 DOM 容器。
+- 发布隔离回归迁移后 54 个检查项通过（33 个 Python 套件、9 个 Node 套件、12 项静态检查）；Python 540 个用例中 2 个因符号链接权限跳过，另有 1 个已被正向回归取代的历史观察用例未运行；Node 77 条断言通过。
+- 以上为执行计数，包含继承导致的重复，不是去重总数；维护记录中的 82 项与 36 项不再叠加到本次计数。
+- 旧权限子进程、通用启动错误、安装入口永久删除及固定本地版本断言已迁移到对应新合同，历史审核包保持不变。
+- 隔离计数与状态接口返回正常都不替代真机与公网验收。
+- 未验收项：公网端到端（配对→会话→消息往返）、实体手机扫码、真实桌面界面交互与剪贴板、公网上传链路（含蜂窝上行）、真实隧道完整生命周期、真实桌面生命周期接管等。用户曾自报公网连通，用户报告不替代执行者验收。
 
-```python
-_LEGACY_ROOT_INJECT_RE = re.compile(r'\s*<script src="/kimi-[a-z-]*(?:data|widget)\.js[^"]*"></script>\s*')
-# 在两处 _INJECT_RE.sub 处叠一层：
-new_html = _LEGACY_ROOT_INJECT_RE.sub('\n', _INJECT_RE.sub('\n', html))
-```
+## 4. 部署边界
 
-### 3. 未改动文件
+- **源码**：仓库工作区。修改不会影响正在运行的用量服务。
+- **已安装目录**：托管安装目录（形如 `~/.kimi-code/plugins/managed/kimi-code-usage`）。用量服务从该目录加载代码。
+- **重启要求**：Python 服务代码在启动时装入内存，`/plugins reload`、新会话与 hook 心跳都不会替换运行中的服务；改动 `scripts/*.py` 后须在实际安装目录执行 `python scripts/service.py --restart`。仅改文档或样式文件无需重启。
+- **手机桥**：运行在独立 worker 进程中。用量后台重启不中断已开启的手机连接（同版本 worker 被重连接管）；但桥/worker 代码变更需先「停止」手机连接让旧 worker 退出，再重新开启。
+- **桌面注入资产**：由后台按内容摘要自动同步到桌面资源目录，不需要手工复制。
+- **组件目录**：`KIMI_HOME/usage-dashboard/runtime/cloudflared/2026.9.3` 位于插件树外，插件更新不覆盖。
 
-`scanner.py` / `updater.py` / `bootstrap.cmd` / `sync-usage.cmd` / `kimi.plugin.json` / `README.md` / `SYSTEM.md` / `commands/*` / `skills/*` / `dashboard/*` —— 与上游 v3.1.0 一致。
+## 5. 回滚（保留用户数据）
 
----
+回滚只回退插件文件，不动用户数据：
 
-## 验证
+1. 若手机连接已开启，先在浮层点「停止」（撤销配对与隧道，worker 退出）。
+2. 用目标版本的同名文件覆盖已安装目录（或重新 `/plugins install` 目标目录）。
+3. 在实际安装目录执行 `python scripts/service.py --restart`。
+4. 验证：`curl --noproxy '*' -s http://127.0.0.1:39281/api/status` 返回预期版本与进程号。
+5. 需要手机连接时重新开启并重新扫码（旧隧道地址与配对会话随停止失效，属设计语义，不是数据丢失）。
 
-- 语法：括号栈扫描通过（`check_syntax.py`）
-- 服务：`GET /api/status` → `{"version":"3.1.0","status":"ok"}`
+保留项：用量采集状态文件、价格配置、忽略项记录、桌面路径记录、`KIMI_HOME/usage-dashboard/runtime/`（组件与 worker 状态目录）、桌面 `config.toml` 及其时间戳备份。
 
----
+## 6. 更新与预览保护
 
-## 已知残留 / 非缺陷
+- 面板不会自动更新。点「更新」按钮才检查，有新版本弹窗显示发布时间与内容，**需点击确认**才下载并重启服务；也可按发布说明手动覆盖安装。
+- 本地预览形态（清单带 `localPreview` / 版本带 `-local`）会拦截 GitHub 自更新：检查返回 `blocked: true` / `reason: "local_preview"`，应用返回 HTTP 409；更新器自身也有同样的纵深防御（缺少核心运行文件或移动端运行时只给一半时拒绝写入，退出码 5/6）。
+- 退出预览形态需按发布说明安装正式版本。
 
-- `GET /api/quota` 返回空对象（上游数据源本身无配额数据，非本次改动引入）
-- `.ku-pop` 浮层在 <270px 极窄窗口贴边（已兜底 `Math.max(6, …)`）
+## 7. 手机连接的安全提示
 
----
+- **配对链接就是当前电脑 Agent 会话的控制授权**：手机可通过会话提示驱动 Agent 执行命令、读写文件。请勿分享二维码或链接。
+- 手机不能直连终端或机器级管理接口；全局配置写仅限窄白名单键。
+- 外网流量经 Cloudflare TLS 终止，Cloudflare 可见转发内容；**不是 P2P，也不是端到端加密**。
+- Quick Tunnel 使用临时随机地址，停止或重开后可能变化，**不承诺永久链接或可用性 SLA**。
 
-## PR 建议
+## 8. 历史版本
 
-合入上游只需两个文件：
+| 版本 | 日期 | 摘要 |
+|---|---|---|
+| v3.2.5 | 2026-10-04 | `bootstrap.cmd` 恢复 CRLF；`spawn_daemon` 恢复优先同目录 `pythonw.exe` |
+| v3.2.4 | 2026-10-04 | 非默认盘首装不显示面板、无 Python 占位卡片、拒绝 Store 版 Python 存根、更新走全量拉取 |
+| v3.2.3 | 2026-10-04 | 思考强度审计与校验、点击检查更新、每日提醒、更新弹窗读取本文件、模型管理弹窗重做 |
+| v3.2.2 | 2026-10-04 | 思考强度校验、热更新提示、`bootstrap.cmd` 编码修复 |
+| v3.2.1 | — | 反代渠道缓存率误报修复 |
+| v3.2.0 | — | 侧栏重排、hover 详情浮层、防闪烁重渲染、拉伸适配 |
+| v3.1.0 | — | 上游基线（`36cc13af`） |
 
-1. `assets/kimi-usage-widget.js` — 侧栏布局 + hover 弹层 + 跳动修复 + 拉伸适配（主体）
-2. `scripts/service.py` — `_LEGACY_ROOT_INJECT_RE` 补丁（可选，防御旧版根路径残留）
-
-标题建议：`fix: sidebar layout overflow, hover detail popover, list re-render flicker, responsive width`
-
-## v3.2.2 变更
-
-- 思考强度审计：`/api/models` 返回 `effective_efforts`（按 support_efforts/overrides 实际生效）、`effort_issues`、`effort_audit`；`/api/update-model` 校验档位合法且 default ∈ support_efforts，托管模型写入 `[models."x".overrides]`。
-- 更新：不再自动检查；点「更新」才请求 `/api/update/check?force=1`，有新版弹窗确认，无新版不弹。检查失败不缓存，api.github.com 失败回退 raw.githubusercontent.com。
-- 热更新：`sync_widget_asset` 改为内容摘要比对；`/api/status` 带 `widget` 摘要，前端发现变化后提示「刷新界面」。
-- `scripts/bootstrap.cmd` 必须纯 ASCII + CRLF（`.gitattributes` 已设 `*.cmd -text`），否则 GBK 下 cmd 解析乱码导致服务拉不起来。
-- 每日更新提醒：前端 localStorage（kimi-usage-upd-last/found/mute/ver），24h 最多静默检查一次，只亮红点；「更新提醒」按钮可关闭。
-- 模型管理弹窗重做：胶囊开关 + 分段式思考强度；/api/add-model 不再猜测档位，仅在传入 support_efforts 时写入（并校验）。
-- 更新弹窗显示发布时间与更新内容：服务读取仓库根目录 CHANGELOG.md（`## vX.Y.Z · 日期` 一节）。发版时请先更新 CHANGELOG.md 再改 kimi.plugin.json 版本号。
-
-## v3.2.3 变更
-
-- 更新弹窗显示发布时间与更新内容：检查更新命中新版时，弹窗内列出 CHANGELOG 中该版本一段（`## vX.Y.Z · 日期` 标题 + bullet），确认前用户能看清要装的是什么。
-- 思考强度问题一键修复 / 忽略：`effort_issues` 命中的条目支持「修复」（写入合法 default + overrides）与「忽略」（加入本地白名单不再提示）；修复调用 `kimi doctor config` 校验通过后落盘。
-- 思考开关显示修复：`adaptive_thinking` 未声明 `thinking` 标签的模型之前会被错标为已开启；现按实际支持列表严格判定。
-- 移除「实际生效」徽标：模型列表改为默认强度 + 会话内即时切换，去掉误导性的生效标记。
-- 汇总 2026-10-04 全部更新（含 v3.2.2 已列项）。
-
-## v3.2.4 变更
-
-- 首装不显示面板修复：`get_dist_dir()` 增加运行中进程兜底——非默认盘安装时，从正在跑的服务进程检出 `desktop-dist` 实际路径并写回 `desktop_path.txt`；之前首装到非 C 盘时面板永远不出现。
-- 首装不提示装 Python 修复：`bootstrap.cmd` 在无 Python 环境分支改调 `scripts/need-python.ps1`，向 `index.html` 注入一张静态占位卡片（标明需安装 Python）；`service.py` 起来后经 `_NEEDPY_INJECT_RE` 自动把占位摘掉，无需手动清理。
-- `spawn_daemon` / `apply_update` 拒绝 `WindowsApps` Python 存根：之前会被静默选中导致服务拉不起来且无报错提示。
-- `apply_update` 走 codeload 全量拉取：之前用增量 diff，跨版本新增 UI 文件可能漏拉导致「更新后界面没变化」。
-
----
-
-当前最新版本：**v3.2.4**（HEAD `646fc93`）。本文件按版本追加，最新段请直接看上方 `## v3.2.4 变更`。
+手机远程连接的早期预览阶段（`v3.3.0-local` / `v3.3.1-local` / `v3.3.2-local`）仅在作者本机安装、未发布，逐条过程记录不再保留；功能行为以本文件第 1 节、`CHANGELOG.md` 与本文件链接的三份手机文档为准。

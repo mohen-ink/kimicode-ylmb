@@ -21,6 +21,17 @@
   const STORAGE_COLLAPSED_KEY = 'kimi-usage-collapsed-state';
   const API_BASE = 'http://127.0.0.1:39281';
   const STALE_MS = 15000;
+  // 39281 控制面要求自定义头做本机写守卫；所有 API_BASE 请求统一走此封装，
+  // 不拦原生 fetch，也不影响 /kimi-usage.json 静态数据兜底
+  const API_HEADERS = { 'X-Kimi-Usage-Control': '1' };
+  function kapiFetch(url, opts) {
+    opts = opts || {};
+    var h = {};
+    for (var k in API_HEADERS) h[k] = API_HEADERS[k];
+    if (opts.headers) for (var k2 in opts.headers) h[k2] = opts.headers[k2];
+    opts.headers = h;
+    return fetch(url, opts);
+  }
 
   let activeTab = 'today';
   let isCollapsed = false;
@@ -1437,6 +1448,7 @@
           <span class="ku-title-text">Kimi 用量</span>
         </div>
         <div class="ku-header-actions">
+          <button class="ku-btn-panel" id="ku-remote-btn" title="手机远程连接（扫码 / 复制链接）">手机</button>
           <button class="ku-btn-panel" id="ku-gear-btn" title="模型与能力配置管理器">⚙</button>
           <button class="ku-btn-panel" id="ku-panel-btn" title="打开全屏用量仪表盘">
             <span>📊</span>
@@ -1535,6 +1547,7 @@
             <span class="ku-min-pill ku-min-cache" id="ku-min-cache">${(state.today.cache_pct || state.cache.pct || 0)}%</span>
           </div>
           <div class="ku-min-actions">
+            <button class="ku-min-action-btn" id="ku-min-remote-btn" title="手机远程连接">手机</button>
             <button class="ku-min-action-btn" id="ku-min-gear-btn" title="模型管理">⚙</button>
             <button class="ku-min-action-btn" id="ku-min-panel-btn" title="查看全尺寸面板">📊</button>
             <button class="ku-min-action-btn ku-min-btn-plus" id="ku-min-expand-btn" title="展开">+</button>
@@ -1557,7 +1570,8 @@
       try { localStorage.setItem(STORAGE_COLLAPSED_KEY, 'false'); } catch (err) {}
     }
     el.querySelector('#ku-min-bar').onclick = (e) => {
-      if (!e.target.closest('#ku-min-panel-btn') && !e.target.closest('#ku-min-gear-btn')) {
+      if (!e.target.closest('#ku-min-panel-btn') && !e.target.closest('#ku-min-gear-btn')
+          && !e.target.closest('#ku-min-remote-btn')) {
         expandCard();
       }
     };
@@ -1571,6 +1585,13 @@
     el.querySelector('#ku-min-panel-btn').onclick = (e) => { e.stopPropagation(); openPanel(); };
     el.querySelector('#ku-gear-btn').onclick = (e) => { e.stopPropagation(); openModelModal(); };
     el.querySelector('#ku-min-gear-btn').onclick = (e) => { e.stopPropagation(); openModelModal(); };
+    function openRemoteOverlay() {
+      var RW = window.KimiRemoteWidget;
+      if (RW && typeof RW.open === 'function') { RW.open(); return; }
+      kmmToast('远程连接模块未加载（缺少 kimi-remote-widget.js）', true);
+    }
+    el.querySelector('#ku-remote-btn').onclick = (e) => { e.stopPropagation(); openRemoteOverlay(); };
+    el.querySelector('#ku-min-remote-btn').onclick = (e) => { e.stopPropagation(); openRemoteOverlay(); };
 
     const tabToday = el.querySelector('#ku-tab-today');
     const tabCumul = el.querySelector('#ku-tab-cumul');
@@ -2363,7 +2384,7 @@
     var found = kupLs(KUP_FOUND_KEY);
     var last = parseInt(kupLs(KUP_LAST_KEY) || '0', 10) || 0;
     if (!force && Date.now() - last < 24 * 3600 * 1000) { kupDot(!!found); return; }
-    fetch(API_BASE + '/api/update/check', { cache: 'no-store' })
+    kapiFetch(API_BASE + '/api/update/check', { cache: 'no-store' })
       .then(function(r) { return r.json(); })
       .then(function(d) {
         if (!d || d.error) return;
@@ -2409,7 +2430,7 @@
   function kupApplyUpdate() {
     kupUpdating = true;
     kupUpdateBadge();
-    fetch(API_BASE + '/api/update/apply', { method: 'POST' })
+    kapiFetch(API_BASE + '/api/update/apply', { method: 'POST' })
       .then(function(r) { return r.json(); })
       .then(function(d) {
         if (d.success && d.latest) {
@@ -2432,7 +2453,7 @@
     if (kupUpdating || kupChecking) return;
     kupChecking = true;
     kupUpdateBadge('检查中…');
-    fetch(API_BASE + '/api/update/check?force=1', { cache: 'no-store' })
+    kapiFetch(API_BASE + '/api/update/check?force=1', { cache: 'no-store' })
       .then(function(r) { return r.json(); })
       .then(function(d) {
         kupChecking = false;
@@ -2491,7 +2512,7 @@
     $o('kmm-modal-auto-all').onclick = async function() {
       if (!confirm('确定要为全部模型补全【识图 + 深度思考 + 工具调用】能力标签吗？（不会改动思考强度档位）')) return;
       try {
-        const res = await fetch(`${API_BASE}/api/auto-enable-all`, { method: 'POST' });
+        const res = await kapiFetch(`${API_BASE}/api/auto-enable-all`, { method: 'POST' });
         const data = await res.json();
         if (data.success) {
           kmmToast('🎉 全部模型能力已全开并校验通过！');
@@ -2533,7 +2554,7 @@
 
   function fetchModels() {
     // 优先本地服务 API，失败回退 __KIMI_DATA__ 缓存
-    return fetch(`${API_BASE}/api/data`)
+    return kapiFetch(`${API_BASE}/api/data`)
       .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
       .then(function(d) {
         modelsData = d;
@@ -2684,7 +2705,7 @@
   // 全局操作回调（供弹窗内联 onclick/onchange 调用）
   window.__KMM_SET_DEFAULT = async function(alias) {
     try {
-      const res = await fetch(`${API_BASE}/api/set-default`, {
+      const res = await kapiFetch(`${API_BASE}/api/set-default`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ alias: alias })
@@ -2699,7 +2720,7 @@
 
   window.__KMM_TOGGLE = async function(alias, capability, enabled) {
     try {
-      const res = await fetch(`${API_BASE}/api/toggle-capability`, {
+      const res = await kapiFetch(`${API_BASE}/api/toggle-capability`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ alias: alias, capability: capability, enabled: enabled })
@@ -2716,7 +2737,7 @@
     if (action === 'fix_all' && !confirm('将自动修复可确定的问题（协议拼写、缺失的思考标签、默认档不在列表等）。修改前会备份并校验 config.toml，继续吗？')) return;
     if (action === 'fix' && code === 'no_support_efforts' && !confirm('将为该模型写入 support_efforts = low / medium / high / xhigh / max。\n如果上游并不支持其中某些档位，选到它会失败。继续吗？')) return;
     try {
-      const res = await fetch(`${API_BASE}/api/issue-action`, {
+      const res = await kapiFetch(`${API_BASE}/api/issue-action`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: action, alias: alias, code: code })
@@ -2729,7 +2750,7 @@
 
   window.__KMM_EFFORT = async function(alias, defaultEffort) {
     try {
-      const res = await fetch(`${API_BASE}/api/update-model`, {
+      const res = await kapiFetch(`${API_BASE}/api/update-model`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ alias: alias, updates: { default_effort: defaultEffort } })
@@ -2828,7 +2849,7 @@
             cache_hit: parseFloat(kprOverlayEl.querySelector('#kpr-cache-hit').value) || 0,
             cache_write: kprOverlayEl.querySelector('#kpr-cache-write').value === '' ? null : parseFloat(kprOverlayEl.querySelector('#kpr-cache-write').value)
           };
-    fetch(`${API_BASE}/api/set-price`, {
+    kapiFetch(`${API_BASE}/api/set-price`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
@@ -3123,7 +3144,7 @@
 
   // 探活：/api/status
   function probeService() {
-    fetch(`${API_BASE}/api/status`, { cache: 'no-store' })
+    kapiFetch(`${API_BASE}/api/status`, { cache: 'no-store' })
       .then(function(r) { return r.ok ? r.json() : null; })
       .then(function(d) {
         apiAlive = !!(d && (d.status === 'ok' || d.name));

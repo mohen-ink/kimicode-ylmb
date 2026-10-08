@@ -6,3 +6,21 @@ __pycache__/
 assets/kimi-usage.json
 scripts/desktop_path.txt
 scripts/service.log
+
+# mobile worker / daemon runtime state and credentials (never source)
+worker.json
+ipc.secret
+server.token
+
+# scratch experiments (mostly mobile/worker diagnostics and test ZIPs)
+.scratch/
+
+# review-harness run outputs; the harness sources stay tracked
+verification/logs/
+verification/.runtime/
+verification/.runtime-red/
+verification/summary.json
+verification/red_baseline_summary.json
+
+# internal document: keep locally, never publish to GitHub
+docs/DeepSeek-vs-K3-对比报告-20261007.md

@@ -11,18 +11,23 @@ Kimi Code 用量面板 · 本地服务（单进程）
   3. 看护 index.html 注入点（桌面端更新覆盖后自动重注入，清理旧套件残留注入）
   4. HTTP API :39281 模型能力管理（config.toml 安全改写：备份+kimi doctor 校验）
   5. --tick      : hook 调用入口——确保服务在跑、跑一次采集、注入检查，然后退出
+     --restart   : 核实旧 daemon 为本插件 service.py 后停止并拉起新代码（升级后手动换版本用）
      --once      : 只采集+写文件，不常驻（无服务时的降级刷新）
      无参数      : 常驻服务
 
 启动链：kimi.plugin.json hooks → scripts/bootstrap.cmd → service.py
 （桌面端无需任何开机自启/桌面脚本；服务随会话心跳拉起，随客户端退出自然闲置）
 """
+import atexit
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import re
+import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -44,6 +49,17 @@ STATE_FILE = os.path.join(KIMI_HOME, 'usage-collector-state.json')
 LOG_FILE = os.path.join(SCRIPT_DIR, 'service.log')
 
 WIDGET_SRC = os.path.join(ASSETS_SRC, 'kimi-usage-widget.js')
+# 远程控制（本机 QR/链接手机遥控）可选资产，固定顺序即注入顺序：
+# vendor 依赖最先，remote-qr/api 次之，mobile-api 须在 remote-widget 之前，
+# remote-widget 再次，usage-widget 永远最后
+REMOTE_ASSETS = (
+    'vendor/qrcodegen.js',
+    'kimi-remote-qr.js',
+    'kimi-remote-api.js',
+    'kimi-mobile-api.js',
+    'kimi-remote-widget.js',
+)
+REMOTE_STYLE_ASSETS = ('kimi-remote-widget-live.css',)
 PRICING_PATH = os.path.join(KIMI_HOME, 'usage-dashboard', 'pricing.json')
 DISMISS_PATH = os.path.join(KIMI_HOME, 'usage-dashboard', 'dismissed-issues.json')
 
@@ -71,6 +87,33 @@ def plugin_version():
 
 
 PLUGIN_VERSION = plugin_version()
+
+LOCAL_PREVIEW_MSG = '本地预览已禁用 GitHub 自更新，请手动安装确认后的正式版本。'
+
+
+def _local_manifest():
+    try:
+        with open(os.path.join(PLUGIN_ROOT, 'kimi.plugin.json'), encoding='utf-8') as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def _manifest_is_local(d):
+    return d.get('localPreview') is True or '-local' in str(d.get('version') or '')
+
+
+def _is_local_preview():
+    """check_update 拦截条件：清单明确标记本地预览（清单损坏不拦查询，只拦 apply）。"""
+    d = _local_manifest()
+    return bool(d) and _manifest_is_local(d)
+
+
+def _apply_update_blocked():
+    """apply 一律 fail closed：本地预览标记或清单不可读/损坏都拒绝自更新。"""
+    d = _local_manifest()
+    return not d or _manifest_is_local(d)
 
 
 def load_pricing():
@@ -190,21 +233,68 @@ LEGACY_DIR = os.path.join(KIMI_HOME, 'model-manager')
 LEGACY_TAG = os.path.join(KIMI_HOME, 'usage-dashboard', 'legacy-migrated.flag')
 
 
-def _kill_legacy_processes():
-    """无条件清掉旧 model-manager 的 supervisor/server（幂等，flag 后每次也跑，防 supervisor 复活）。"""
+def _python_exe_ok(exe):
+    """argv[0] 是否确认为 python/pythonw 直跑（与 strict restart 同一判别口径）。"""
+    name = os.path.basename(str(exe or '')).lower()
+    return (name in ('python.exe', 'pythonw.exe')
+            or bool(re.match(r'^python3(\.\d+)*\.exe$', name))
+            or os.path.normcase(str(exe or '')) == os.path.normcase(sys.executable))
+
+
+def _is_legacy_daemon_argv(argv):
+    """argv 是否精确为 python 直接运行 LEGACY_DIR 下 server.py/supervisor.py。
+    -c、其他文件副本、路径当参数等一律不匹配。"""
+    if len(argv) != 2 or not _python_exe_ok(argv[0]):
+        return False
+    script = argv[1]
+    if (os.path.basename(script) not in ('server.py', 'supervisor.py')
+            or not os.path.isabs(script)):
+        return False
+    return (os.path.normcase(os.path.dirname(os.path.abspath(script)))
+            == os.path.normcase(os.path.abspath(LEGACY_DIR)))
+
+
+def _legacy_daemon_pids():
+    """枚举 Win32_Process，只返回通过 _is_legacy_daemon_argv 严格核实的 PID。"""
+    out = []
     try:
-        subprocess.run([
+        q = subprocess.run([
             'powershell', '-NoProfile', '-Command',
-            "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'model-manager.*(supervisor|server)\\.py' }"
-            " | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
-        ], capture_output=True, timeout=20)
+            "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'python.*\\.py' }"
+            " | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+        ], capture_output=True, text=True, timeout=20)
+        rows = json.loads(q.stdout or '[]')
+        if isinstance(rows, dict):
+            rows = [rows]
+        for row in rows if isinstance(rows, list) else []:
+            try:
+                pid = int(row.get('ProcessId') or 0)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if pid <= 0 or pid == os.getpid():
+                continue
+            if _is_legacy_daemon_argv(_parse_cmdline(str(row.get('CommandLine') or '').strip())):
+                out.append(pid)
     except Exception:
         pass
+    return out
+
+
+def _kill_legacy_processes():
+    """只停经严格 argv 核实为 LEGACY_DIR\\server.py|supervisor.py 直跑的旧 daemon（幂等，flag 后每次也跑）。
+    非匹配进程（其他副本、-c、路径当参数等）一概不碰。"""
+    for pid in _legacy_daemon_pids():
+        try:
+            subprocess.run(['taskkill', '/PID', str(pid), '/F'],
+                           capture_output=True, timeout=10)
+            log('killed legacy model-manager daemon pid %d' % pid)
+        except Exception:
+            pass
 
 
 def kill_port_owner():
-    """端口被占且不是我们的服务时，按 PID 杀掉占用者。
-    安全阀：占用者进程命令行含本插件 service.py 时绝不杀（防并发 tick 误杀刚拉起的 daemon）。"""
+    """端口被占且 API 无响应时，只杀经 _daemon_pid_verified 核实为本插件 service.py 的
+    残留 daemon（如挂死进程）；陌生占用者一律不杀，只记录冲突日志。"""
     if port_is_ours():
         return
     try:
@@ -219,17 +309,12 @@ def kill_port_owner():
                 pids.append(parts[4])
         for pid in set(pids):
             try:
-                q = subprocess.run([
-                    'powershell', '-NoProfile', '-Command',
-                    "(Get-CimInstance Win32_Process -Filter 'ProcessId=%s').CommandLine" % pid
-                ], capture_output=True, text=True, timeout=15)
-                cl = (q.stdout or '').strip()
-                if 'service.py' in cl and ('kimi-code-usage' in cl or 'kimi-code' in cl):
-                    log('skip kill pid %s: looks like our own service (%s)' % (pid, cl[:120]))
-                    continue
-                subprocess.run(['taskkill', '/PID', pid, '/F'],
-                               capture_output=True, timeout=10)
-                log('killed foreign listener on %d (pid %s)' % (PORT, pid))
+                if _daemon_pid_verified(pid):
+                    subprocess.run(['taskkill', '/PID', str(pid), '/F'],
+                                   capture_output=True, timeout=10)
+                    log('killed stale own daemon on %d (pid %s)' % (PORT, pid))
+                else:
+                    log('port %d held by foreign pid %s; refusing to kill' % (PORT, pid))
             except Exception:
                 pass
     except Exception as e:
@@ -289,7 +374,7 @@ def migrate_legacy():
         log('migrate_legacy error: %r' % e)
 
 
-# 注入标签统一由 ensure_injection/_INJECT_RE 管理（widget 带 ?v=mtime 版本号）
+# 注入标签统一由 ensure_injection/_INJECT_RE 管理（widget 带 ?v=内容摘要版本号）
 _INJECT_RE = re.compile(r'\s*<script src="/assets/kimi-(embedded|usage)-(data|widget)\.js[^"]*"></script>\s*')
 # 旧套件残留的根路径注入（/kimi-usage-widget.js 等非 /assets/ 前缀）——会与新版卡片
 # 争用同一 DOM 容器且不渲染模型/会话行，必须一并清掉，不能只靠 _INJECT_RE
@@ -297,13 +382,18 @@ _LEGACY_ROOT_INJECT_RE = re.compile(r'\s*<script src="/kimi-[a-z-]*(?:data|widge
 # 无 Python 时注入的"需要 Python"占位卡片——服务起来后要摘掉，否则装了 Python
 # 仍残留一行提示
 _NEEDPY_INJECT_RE = re.compile(r'\s*<script src="/assets/kimi-usage-needpy\.js[^"]*"></script>\s*')
+# 远程控制可选资产的托管注入标签（点名清理，不碰任何其他 script 标签）：
+# 源文件被移除/未发布时旧标签必须一并摘掉，避免 404 脚本残留
+_REMOTE_INJECT_RE = re.compile(
+    r'\s*<script src="/assets/(?:vendor/qrcodegen|kimi-remote-(?:qr|api|widget)|kimi-mobile-api)\.js[^"]*"></script>\s*')
 
 
 def strip_legacy_injections():
     try:
         html = io.open(INDEX_HTML, encoding='utf-8').read()
         new_html = _NEEDPY_INJECT_RE.sub('\n',
-                  _LEGACY_ROOT_INJECT_RE.sub('\n', _INJECT_RE.sub('\n', html)))
+                  _REMOTE_INJECT_RE.sub('\n',
+                  _LEGACY_ROOT_INJECT_RE.sub('\n', _INJECT_RE.sub('\n', html))))
         if new_html != html:
             io.open(INDEX_HTML, 'w', encoding='utf-8').write(new_html)
     except Exception:
@@ -311,26 +401,43 @@ def strip_legacy_injections():
 
 
 def _widget_tag():
-    """带 mtime 版本号的注入标签——浏览器/Electron 会缓存无参数 script URL，
-    不加版本号时 widget 更新后用户仍看到旧 UI（如缺价格按钮）。"""
-    try:
-        v = int(os.path.getmtime(WIDGET_SRC))
-    except OSError:
-        v = 0
-    return '<script src="/assets/kimi-usage-widget.js?v=%d"></script>' % v
+    """带内容摘要版本号的注入标签——浏览器/Electron 会缓存无参数 script URL，
+    不加版本号时 widget 更新后用户仍看到旧 UI（如缺价格按钮）。
+    用文件内容 digest 而非 mtime：同一秒内改内容版本号也会变，防同秒旧缓存。"""
+    return '<script src="/assets/kimi-usage-widget.js?v=%s"></script>' % (
+        _file_digest(WIDGET_SRC) or '0')
+
+
+def _remote_tags():
+    # 仅当源/目标文件都存在且内容摘要一致才注入——同步失败时摘标签而不是
+    # 给用户发一份挂了新 ?v 的旧代码
+    tags = []
+    for rel in REMOTE_ASSETS:
+        src = os.path.join(ASSETS_SRC, rel.replace('/', os.sep))
+        dest = os.path.join(DIST_ASSETS, rel.replace('/', os.sep)) if DIST_ASSETS else ''
+        src_d = _file_digest(src)
+        if not src_d:
+            continue
+        dest_d = _file_digest(dest) if dest else ''
+        if src_d != dest_d:
+            log('remote asset not injected (sync incomplete): %s' % rel)
+            continue
+        tags.append('<script src="/assets/%s?v=%s"></script>' % (rel, src_d))
+    return tags
 
 
 def ensure_injection():
-    """自愈：index.html 缺注入标签就补；清掉旧注入与带 ?v= 的重复标签。"""
+    """自愈：index.html 缺注入标签就补；清掉旧注入、远程标签与带 ?v= 的重复标签。"""
     if not INDEX_HTML or not os.path.exists(INDEX_HTML):
         return
     try:
         html = io.open(INDEX_HTML, encoding='utf-8').read()
         new_html = _NEEDPY_INJECT_RE.sub('\n',
-                  _LEGACY_ROOT_INJECT_RE.sub('\n', _INJECT_RE.sub('\n', html)))
+                  _REMOTE_INJECT_RE.sub('\n',
+                  _LEGACY_ROOT_INJECT_RE.sub('\n', _INJECT_RE.sub('\n', html))))
         data_tag = '<script src="/assets/kimi-usage-data.js"></script>'
-        widget_tag = _widget_tag()
-        block = '  %s\n  %s\n' % (data_tag, widget_tag)
+        tags = [data_tag] + _remote_tags() + [_widget_tag()]
+        block = ''.join('  %s\n' % t for t in tags)
         if '</body>' in new_html:
             new_html = new_html.replace('</body>', block + '  </body>')
         else:
@@ -342,7 +449,7 @@ def ensure_injection():
 
 
 def sync_widget_asset():
-    """把插件内的侧栏卡片 JS 同步到 desktop-dist/assets（自愈看护）。"""
+    """把插件内的侧栏卡片 JS 与可选 JS/CSS 同步到 desktop-dist/assets（自愈看护）。"""
     if not DIST_ASSETS or not os.path.exists(WIDGET_SRC):
         return
     dest = os.path.join(DIST_ASSETS, 'kimi-usage-widget.js')
@@ -354,6 +461,19 @@ def sync_widget_asset():
             shutil.copy2(WIDGET_SRC, dest)
     except Exception:
         pass
+    for rel in REMOTE_ASSETS + REMOTE_STYLE_ASSETS:
+        src = os.path.join(ASSETS_SRC, rel.replace('/', os.sep))
+        if not os.path.exists(src):
+            continue                # 可选资产未发布：跳过，不影响既有功能
+        dst = os.path.join(DIST_ASSETS, rel.replace('/', os.sep))
+        try:
+            if (not os.path.exists(dst)
+                    or os.path.getsize(dst) != os.path.getsize(src)
+                    or _file_digest(dst) != _file_digest(src)):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+        except Exception as e:
+            log('remote asset sync failed: %s (%r)' % (rel, e))
 
 
 def _file_digest(path):
@@ -364,8 +484,72 @@ def _file_digest(path):
         return ''
 
 
+def _remote_style_loader():
+    if not DIST_ASSETS:
+        return ''
+    rel = REMOTE_STYLE_ASSETS[0]
+    src_d = _file_digest(os.path.join(ASSETS_SRC, rel))
+    if not src_d or src_d != _file_digest(os.path.join(DIST_ASSETS, rel)):
+        return ''
+    href = json.dumps('/assets/kimi-remote-widget-live.css?v=' + src_d)
+    return ('''(function () {
+  if (typeof document === "undefined" || !document || !document.head) return;
+  var head = document.head;
+  var href = %s;
+  var readyId = "ku-remote-live-style";
+  var pendingId = "ku-remote-live-style-pending";
+  var ready = document.getElementById(readyId);
+  var pending = document.getElementById(pendingId);
+  if (pending && pending.getAttribute("href") !== href) {
+    if (pending.parentNode) pending.parentNode.removeChild(pending);
+    pending = null;
+  }
+  if ((ready && ready.getAttribute("href") === href) ||
+      (pending && pending.getAttribute("href") === href)) return;
+  var link = document.createElement("link");
+  link.id = pendingId;
+  link.rel = "stylesheet";
+  link.href = href;
+  link.onload = function () {
+    if (document.getElementById(pendingId) !== link || link.parentNode !== head) return;
+    var old = document.getElementById(readyId);
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+    link.id = readyId;
+    link.onload = link.onerror = null;
+  };
+  link.onerror = function () {
+    if (document.getElementById(pendingId) !== link || link.parentNode !== head) return;
+    head.removeChild(link);
+    link.onload = link.onerror = null;
+  };
+  head.appendChild(link);
+})();
+''' % href)
+
+
 def widget_digest():
-    return _file_digest(WIDGET_SRC)
+    # 联合摘要：源内容 + 目标(dest)就绪状态 + index.html 注入现状。
+    # 同步失败/恢复、注入缺失/补回都会改变指纹，渲染端据此提示重载。
+    h = hashlib.md5()
+    rels = [('kimi-usage-widget.js',)] + [(rel,) for rel in REMOTE_ASSETS]
+    for (rel,) in rels:
+        src = WIDGET_SRC if rel == 'kimi-usage-widget.js' else os.path.join(
+            ASSETS_SRC, rel.replace('/', os.sep))
+        dst = os.path.join(DIST_ASSETS, rel.replace('/', os.sep)) if DIST_ASSETS else ''
+        h.update(rel.encode('utf-8'))
+        try:
+            with open(src, 'rb') as f:
+                h.update(f.read())
+        except Exception:
+            h.update(b'\x00missing\x00')
+        h.update(b'|dst=' + (_file_digest(dst) or 'none').encode('utf-8'))
+    try:
+        html = io.open(INDEX_HTML, encoding='utf-8').read() if INDEX_HTML else ''
+    except Exception:
+        html = ''
+    for name in ['kimi-usage-data.js'] + [r for (r,) in rels]:
+        h.update(('|inj:%s=%d' % (name, 'src="/assets/%s' % name in html)).encode('utf-8'))
+    return h.hexdigest()[:12]
 
 
 # ---------------- 数据产出 ----------------
@@ -701,6 +885,7 @@ def collect_once():
               % json.dumps({'usage': dash, 'models': mdata,
                             'service': service_alive_flag(),
                             'time': int(time.time() * 1000)}, ensure_ascii=False))
+        js += _remote_style_loader()
         # 侧栏卡片轮询 embedded-data.js；usage-data.js 为 index.html 注入点，两份同源
         safe_write(os.path.join(DIST_ASSETS, 'kimi-usage-data.js'), js)
         safe_write(os.path.join(DIST_ASSETS, 'kimi-embedded-data.js'), js)
@@ -864,6 +1049,9 @@ def _fix_base_url(base):
 
 
 def update_provider_field_in_text(content, provider, key, value):
+    """白名单内单字段改写（键/值类型校验失败直接返回 False）。"""
+    if _valid_field_updates({key: value}, _PROVIDER_FIELD_TYPES, 'provider') is not None:
+        return content, False
     pattern = r'(\[providers\.(?:"%s"|%s)\])(.*?)(?=\n\[|\Z)' % (re.escape(provider), re.escape(provider))
     m = re.search(pattern, content, re.DOTALL)
     if not m:
@@ -975,18 +1163,64 @@ def safe_apply_config(new_content):
     return True, '配置已校验并应用，会话内 /reload 生效'
 
 
+# TOML 安全序列化：字符串一律经 JSON 转义（与 TOML basic string 兼容：
+# 引号/反斜杠/换行/控制字符全部被转义，无法注入表头或键值）。
+def _toml_string(v):
+    return json.dumps(str(v), ensure_ascii=False)
+
+
+def _toml_qkey(v):
+    """表头内 quoted key：models."<v>" —— 引号/反斜杠/控制字符安全。"""
+    return json.dumps(str(v), ensure_ascii=False)
+
+
+_KEY_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_-]{0,63}$')
+
+# 可写字段白名单：未知字段一律拒写，只保留受支持操作。
+_MODEL_FIELD_TYPES = {
+    'capabilities': list, 'support_efforts': list, 'default_effort': str,
+    'provider': str, 'model': str, 'display_name': str, 'max_context_size': int,
+    'adaptive_thinking': bool,
+}
+_MODEL_SUB_WHITELIST = frozenset({'', 'overrides'})
+_PROVIDER_FIELD_TYPES = {'base_url': str, 'type': str}
+
+
+def _valid_field_updates(updates, allowed, label):
+    """updates 必须是非空 dict，键在白名单内且符合 key 语法，值类型匹配。
+    返回 None 通过，否则中文错误信息。"""
+    if not isinstance(updates, dict) or not updates:
+        return '%s更新必须是非空字段字典' % label
+    for k, v in updates.items():
+        if not isinstance(k, str) or not _KEY_RE.match(k) or k not in allowed:
+            return '不支持的%s字段：%r' % (label, k)
+        t = allowed[k]
+        if t is int and isinstance(v, bool):
+            return '字段 %s 类型错误（bool 不是 int）' % k
+        if t is not list and not isinstance(v, t):
+            return '字段 %s 类型错误（需要 %s）' % (k, t.__name__)
+        if t is list and (not isinstance(v, list) or any(not isinstance(x, str) for x in v)):
+            return '字段 %s 必须是字符串数组' % k
+    return None
+
+
 def _render_toml_kv(k, v):
     if isinstance(v, bool):
         return '%s = %s' % (k, str(v).lower())
     if isinstance(v, int):
         return '%s = %d' % (k, v)
     if isinstance(v, list):
-        return '%s = [ %s ]' % (k, ', '.join('"%s"' % x for x in v))
-    return '%s = "%s"' % (k, v)
+        return '%s = [ %s ]' % (k, ', '.join(_toml_string(x) for x in v))
+    return '%s = %s' % (k, _toml_string(v))
 
 
 def update_model_in_text(content, alias, updates, sub=''):
-    """改写 [models.<alias>] 的字段；sub='overrides' 时改写 [models.<alias>.overrides]（不存在则新建）。"""
+    """改写 [models.<alias>] 的字段；sub='overrides' 时改写 [models.<alias>.overrides]（不存在则新建）。
+    未知字段/非法值/非法子表直接拒写（返回原样 + False）。"""
+    if sub not in _MODEL_SUB_WHITELIST:
+        return content, False
+    if _valid_field_updates(updates, _MODEL_FIELD_TYPES, '模型') is not None:
+        return content, False
     escaped = re.escape(alias)
     suffix = r'\.' + re.escape(sub) if sub else ''
     pattern = r'(\[models\.(?:"%s"|%s)%s\])(.*?)(?=\n\[|\Z)' % (escaped, escaped, suffix)
@@ -996,7 +1230,7 @@ def update_model_in_text(content, alias, updates, sub=''):
         if not main:
             return content, False
         kvs = ''.join(_render_toml_kv(k, v) + '\n' for k, v in updates.items())
-        block = '[models."%s".%s]\n%s' % (alias, sub, kvs)
+        block = '[models.%s.%s]\n%s' % (_toml_qkey(alias), sub, kvs)
         return content[:main.end()].rstrip('\n') + '\n\n' + block + content[main.end():], True
     if not m:
         return content, False
@@ -1028,6 +1262,9 @@ def update_model_in_text(content, alias, updates, sub=''):
 
 def update_model_effort_in_text(content, alias, updates):
     """思考档位写入：校验合法性与 default ∈ support；托管模型写 overrides 固定。返回 (新内容, 错误信息)。"""
+    err = _valid_field_updates(updates, _MODEL_FIELD_TYPES, '模型')
+    if err:
+        return content, err
     data = _load_toml(content) or {}
     m = (data.get('models', {}) or {}).get(alias)
     if m is None:
@@ -1086,10 +1323,12 @@ def _global_effort_note(alias, level):
 
 
 def set_default_model_in_text(content, alias):
+    line = 'default_model = %s' % _toml_string(alias)
     if re.search(r'^default_model\s*=', content, re.MULTILINE):
+        # 替换串含 \ 会被 re.sub 按转义解释，必须走 lambda
         return re.sub(r'^default_model\s*=.*$',
-                      'default_model = "%s"' % alias, content, flags=re.MULTILINE)
-    return 'default_model = "%s"\n' % alias + content
+                      lambda _m: line, content, flags=re.MULTILINE)
+    return line + '\n' + content
 
 
 def auto_enable_all_in_text(content):
@@ -1158,6 +1397,9 @@ def fetch_release_notes(version):
 
 def check_update(force=False):
     """对比 GitHub 清单版本，5 分钟内存缓存。返回 {current, latest, update, error}。"""
+    if _is_local_preview():      # 置于缓存与网络之前，force 也不能绕过
+        return {'current': PLUGIN_VERSION, 'latest': None, 'update': False,
+                'blocked': True, 'reason': 'local_preview', 'error': LOCAL_PREVIEW_MSG}
     now = time.time()
     if not force and _UPDATE_CACHE['data'] is not None and now - _UPDATE_CACHE['t'] < 300:
         return _UPDATE_CACHE['data']
@@ -1188,7 +1430,13 @@ def check_update(force=False):
 
 
 def apply_update():
-    """下载新版 zip → 拉起 updater.py 守护进程 → 安排本进程退出（updater 会重新拉起）。"""
+    """下载新版 zip → 拉起 updater.py → detach 手机 worker 后有界退出（updater 会重新拉起 daemon）。
+
+    退出路径只 detach：DETACHED worker 及其中的桥会话/隧道/配对继续存活，
+    新 daemon 经 worker.json 记录重连接管；显式停止手机连接只能走 /api/mobile/stop。
+    """
+    if _apply_update_blocked():  # 先于下载/tempfile/守护进程拉起；清单损坏也 fail closed
+        return False, LOCAL_PREVIEW_MSG
     try:
         req = urllib.request.Request(UPDATE_ZIP_URL,
                                      headers={'User-Agent': 'kimi-code-usage/%s' % PLUGIN_VERSION})
@@ -1214,40 +1462,453 @@ def apply_update():
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          stdin=subprocess.DEVNULL, close_fds=True)
         log('updater spawned, scheduling self-exit for update')
-        # 让 HTTP 响应先发出去再退出
-        threading.Timer(0.8, os._exit, args=(0,)).start()
+        _mobile_begin_shutdown()
+        threading.Timer(0.8, _exit_after_shutdown, args=(0,)).start()
         return True, '更新包已下载，服务正在重启…'
     except Exception as e:
         log('apply_update failed: %r' % e)
         return False, '更新失败：%r' % e
 
 
+# ---------------- 手机连接控制面（独立 mobile worker 进程） ----------------
+# /api/mobile* 在 legacy 路由/body 读取之前分流：本层校验 ORIGINAL 请求的
+# loopback peer / 精确 Host / 关键单值头 / TE / CL / Origin 后，把已核实的
+# method+path+body 交给 MobileWorkerClient——独立 detached worker 进程持有
+# MobileBridgeManager+ConnectorRuntime，daemon 退出/重启不吊销手机会话
+# （begin_shutdown/shutdown 仅 detach，绝不 stop worker），同版本 worker 经
+# 状态记录重连接管。worker 不可用时 fail closed（无放行头），绝不回退 legacy，
+# 也绝不回退进程内 bridge。status/stop 不隐式拉起进程；start/install 显式确保。
+_MOBILE_PREFIX = '/api/mobile'
+_MOBILE = {'mgr': None, 'tried': False}
+_MOBILE_LOCK = threading.Lock()
+_MOBILE_STATE_LOCK = threading.Lock()
+_MOBILE_CLOSING = threading.Event()
+_MOBILE_CONTROL_HEADER = 'X-Kimi-Mobile-Control'
+_MOBILE_TRUSTED_APP_ORIGIN = 'app://renderer'
+_MOBILE_MAX_BODY = 8192
+_MOBILE_ERROR_CODES = frozenset((
+    'CONNECTOR_MISSING', 'CONNECTOR_INSTALL_FAILED', 'CONNECTOR_HASH_MISMATCH',
+    'CONNECTOR_UNSUPPORTED', 'CONNECTOR_BUSY', 'CONSENT_REQUIRED',
+    'TUNNEL_START_FAILED', 'TUNNEL_TIMEOUT', 'TUNNEL_EXITED', 'OWNER_LOST',
+    'START_CANCELLED',
+    # mobile_worker spawn/ensure 阶段码（与 mobile_bridge._MOBILE_ERROR_CODES
+    # 同集合）：只透出固定码，不含 stage/stderr/路径/secret 等诊断细节。
+    'WORKER_STATE_DIR_UNAVAILABLE', 'WORKER_STARTUP_BUSY', 'WORKER_LOCK_HELD',
+    'WORKER_SPAWN_DENIED', 'WORKER_SPAWN_FAILED', 'WORKER_CHILD_EXITED',
+    'WORKER_BOOT_TIMEOUT', 'WORKER_VERSION_MISMATCH',
+))
+
+
+def _mobile_manager():
+    """惰性构造 worker 客户端；只传 kimi_home，永久关闭后不再构造。"""
+    with _MOBILE_STATE_LOCK:
+        if _MOBILE_CLOSING.is_set():
+            return None
+        if _MOBILE['mgr'] is not None:
+            return _MOBILE['mgr']
+    with _MOBILE_LOCK:
+        if _MOBILE_CLOSING.is_set():
+            return None
+        if _MOBILE['mgr'] is None:
+            try:
+                from mobile_worker import MobileWorkerClient
+                _MOBILE['mgr'] = MobileWorkerClient(KIMI_HOME)
+                log('mobile worker client ready (lazy, no worker spawn)')
+            except Exception as e:
+                if not _MOBILE['tried']:
+                    log('mobile worker client unavailable: %r' % e)
+                _MOBILE['tried'] = True
+    return None if _MOBILE_CLOSING.is_set() else _MOBILE['mgr']
+
+
+def _mobile_begin_shutdown():
+    with _MOBILE_STATE_LOCK:
+        mgr = _MOBILE['mgr']
+        try:
+            if mgr is not None:
+                mgr.begin_shutdown()     # detach ONLY：worker 继续存活
+        finally:
+            _MOBILE_CLOSING.set()
+        return mgr
+
+
+def _mobile_fail_closed(handler):
+    """worker 客户端不可用/异常时对 /api/mobile* 的统一拒答：
+    无 Access-Control-Allow-Origin 等放行头，不泄露内部细节。"""
+    body = json.dumps({'error': '手机连接功能暂不可用'},
+                      ensure_ascii=False).encode('utf-8')
+    try:
+        handler.send_response(503)
+        handler.send_header('Content-Type', 'application/json; charset=utf-8')
+        handler.send_header('Content-Length', str(len(body)))
+        handler.send_header('Cache-Control', 'no-store')
+        handler.end_headers()
+        handler.wfile.write(body)
+    except Exception:
+        pass
+
+
+def _mobile_send(handler, code, obj, origin=''):
+    body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+    handler.send_response(code)
+    if origin:
+        handler.send_header('Access-Control-Allow-Origin', origin)
+        handler.send_header('Vary', 'Origin')
+    handler.send_header('Content-Type', 'application/json; charset=utf-8')
+    handler.send_header('Content-Length', str(len(body)))
+    handler.send_header('Cache-Control', 'no-store')
+    handler.send_header('Connection', 'close')
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _mobile_error(handler, origin, code, msg):
+    handler.close_connection = True
+    payload = {'error': msg}
+    if msg in _MOBILE_ERROR_CODES:
+        payload['error_code'] = msg
+    _mobile_send(handler, code, payload, origin)
+
+
+def _mobile_read_body(handler):
+    """控制面小 JSON：CL 已在外层校验为单值纯数字；这里有界读取。"""
+    cls = handler.headers.get_all('Content-Length') or []
+    n = int(cls[0]) if cls else 0
+    if n > _MOBILE_MAX_BODY:
+        raise ValueError('请求体过大')
+    if n == 0:
+        return {}
+    try:
+        handler.connection.settimeout(15.0)
+        raw = handler.rfile.read(n)
+    except Exception:
+        raise ValueError('请求体不完整')
+    if len(raw) != n:
+        raise ValueError('请求体不完整')
+    try:
+        body = json.loads(raw.decode('utf-8'))
+    except Exception:
+        raise ValueError('请求体不是合法 JSON')
+    if not isinstance(body, dict):
+        raise ValueError('请求体格式错误')
+    return body
+
+
+def _mobile_dispatch(handler):
+    """/api/mobile* 前置分流。返回 True 表示请求已终结（含 fail-closed 拒答）。
+
+    先在 ORIGINAL 请求上校验：头解析缺陷、Host/Origin/CL/TE/控制头单值、
+    TE 拒、CL 严格数字、loopback peer、精确 Host（本服务端口）、可信 Origin、
+    自定义控制头——全部通过才把已核实的 method+path+body 交给 worker 客户端
+    （客户端内部以 IPC secret + 重写 Host 访问 worker loopback 控制口）。
+    任何一步失败或客户端异常都拒答，绝不回退 legacy。"""
+    path = handler.path.split('?')[0]
+    if not (path == _MOBILE_PREFIX or path.startswith(_MOBILE_PREFIX + '/')):
+        return False
+    # --- 原始请求基线校验 ---
+    if getattr(handler.headers, 'defects', None):
+        _mobile_error(handler, '', 400, '请求头不合法')
+        return True
+    for h in ('Host', 'Origin', 'Content-Length', 'Transfer-Encoding',
+              _MOBILE_CONTROL_HEADER, 'Content-Type', 'Sec-Fetch-Site'):
+        if len(handler.headers.get_all(h) or []) > 1:
+            _mobile_error(handler, '', 400, '请求头不合法')
+            return True
+    if handler.headers.get_all('Transfer-Encoding'):
+        _mobile_error(handler, '', 400, '请求体格式不被支持')
+        return True
+    _cls = handler.headers.get_all('Content-Length') or []
+    if _cls and not _cls[0].isdigit():
+        _mobile_error(handler, '', 400, '请求头不合法')
+        return True
+    try:
+        peer_ok = ipaddress.ip_address(
+            handler.client_address[0]).is_loopback
+    except Exception:
+        peer_ok = False
+    if not peer_ok:
+        _mobile_error(handler, '', 403, '仅允许本机访问')
+        return True
+    host_hdr = (handler.headers.get('Host') or '').strip().lower()
+    if host_hdr not in _allowed_hosts():
+        _mobile_error(handler, '', 403, 'Host 不被允许')
+        return True
+    origin = (handler.headers.get('Origin') or '').strip()
+    method = handler.command
+    # 可信 app origin（app://renderer）的 cross-site fetch metadata 属正常
+    # （app:// 与 http://loopback 跨 scheme）；其余 cross-site 一律拒
+    if ((handler.headers.get('Sec-Fetch-Site') or '').lower() == 'cross-site'
+            and origin != _MOBILE_TRUSTED_APP_ORIGIN):
+        _mobile_error(handler, '', 403, '跨站请求被拒绝')
+        return True
+    mgr = None if _MOBILE_CLOSING.is_set() else _mobile_manager()
+    if mgr is None or _MOBILE_CLOSING.is_set():
+        _mobile_fail_closed(handler)
+        return True
+    try:
+        trusted = set(mgr._trusted_control_origins())
+    except Exception:
+        trusted = set()
+    trusted.add(_MOBILE_TRUSTED_APP_ORIGIN)
+    if method == 'OPTIONS':
+        if not origin or origin not in trusted:
+            _mobile_error(handler, '', 403, 'Origin 不被允许')
+            return True
+        handler.send_response(204)
+        handler.send_header('Access-Control-Allow-Origin', origin)
+        handler.send_header('Vary', 'Origin')
+        handler.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        handler.send_header('Access-Control-Allow-Headers',
+                            '%s, Content-Type' % _MOBILE_CONTROL_HEADER)
+        handler.send_header('Access-Control-Allow-Private-Network', 'true')
+        handler.send_header('Access-Control-Max-Age', '300')
+        handler.send_header('Content-Length', '0')
+        handler.send_header('Cache-Control', 'no-store')
+        handler.end_headers()
+        return True
+    if origin and origin not in trusted:
+        _mobile_error(handler, '', 403, 'Origin 不被允许')
+        return True
+    if (handler.headers.get(_MOBILE_CONTROL_HEADER) or '') != '1':
+        _mobile_error(handler, origin, 403, '缺少控制头')
+        return True
+    # --- 已核实请求映射到 worker 客户端 ---
+    try:
+        if method == 'GET' and path == _MOBILE_PREFIX + '/status':
+            _mobile_send(handler, 200, mgr.status(), origin)
+        elif method == 'POST' and path == _MOBILE_PREFIX + '/connector/install':
+            body = _mobile_read_body(handler)
+            if set(body) - {'consent', 'consent_version'}:
+                raise ValueError('请求参数不被允许')
+            _mobile_send(handler, 200, mgr.install_connector(
+                body.get('consent'), body.get('consent_version')), origin)
+        elif method == 'POST' and path == _MOBILE_PREFIX + '/start':
+            body = _mobile_read_body(handler)
+            mode = body.get('mode', 'lan')
+            allowed = ({'owner_origin', 'mode', 'relay_consent', 'consent_version'}
+                       if mode == 'internet' else {'owner_origin', 'mode', 'address'})
+            if set(body) - allowed:
+                raise ValueError('请求参数不被允许')
+            _mobile_send(handler, 200, mgr.start(
+                body.get('owner_origin'), body.get('address'), mode,
+                body.get('relay_consent', False), body.get('consent_version')),
+                origin)
+        elif method == 'POST' and path == _MOBILE_PREFIX + '/stop':
+            if _mobile_read_body(handler):
+                raise ValueError('请求参数不被允许')
+            _mobile_send(handler, 200, mgr.stop(), origin)
+        elif method == 'POST' and path == _MOBILE_PREFIX + '/pair/rotate':
+            if _mobile_read_body(handler):
+                raise ValueError('请求参数不被允许')
+            _mobile_send(handler, 200, mgr.pair_rotate(), origin)
+        else:
+            _mobile_error(handler, origin, 404, '接口不存在')
+    except ValueError as e:
+        _mobile_error(handler, origin, 400, str(e))
+    except Exception as e:
+        msg = str(e)
+        if msg in _MOBILE_ERROR_CODES:
+            _mobile_error(handler, origin, 400, msg)
+        elif type(e).__name__ == 'MobileBridgeError':
+            _mobile_error(handler, origin, 400, msg[:160])
+        else:
+            log('mobile control error: %r' % e)
+            _mobile_fail_closed(handler)
+    return True
+
+
+def _mobile_stop():
+    """永久关闭手机控制面：仅 detach——独立 worker 与其中的桥/隧道/配对
+    会话全部继续存活，下个 daemon 实例经状态记录重连接管。显式停止手机
+    连接只能走 /api/mobile/stop。"""
+    try:
+        mgr = _mobile_begin_shutdown()
+        if mgr is not None:
+            mgr.shutdown()               # MobileWorkerClient.shutdown = detach
+    except Exception as e:
+        log('mobile shutdown error: %r' % e)
+
+
+def _exit_after_shutdown(code=0, timeout=3.0):
+    done = threading.Event()
+
+    def cleanup():
+        try:
+            _mobile_stop()
+        finally:
+            done.set()
+
+    try:
+        _mobile_begin_shutdown()
+        threading.Thread(target=cleanup, daemon=True).start()
+        done.wait(timeout)
+    finally:
+        os._exit(code)
+
+
+atexit.register(_mobile_stop)
+
+
+# ---------------- legacy 控制面守卫 ----------------
+# 所有方法：loopback peer + 严格 Host（loopback:PORT 精确端口，防 DNS rebinding）
+# + 单值 Host/Origin/控制头 + headers.defects 拒绝。
+# 读：无 Origin（本机程序）或可信 Origin 放行，其余拒。写：再要求
+# X-Kimi-Usage-Control:1（跨站无法伪造）。可信 Origin = 静态集（app://renderer、
+# 本服务自身 loopback）+ mobile worker（独立进程）对存活桌面 owner 实例的
+# 动态核实（owner 退出/端口复用即不再可信）。CORS 只回显可信 Origin，无 *。
+_CONTROL_HEADER = 'X-Kimi-Usage-Control'
+_SINGLE_HEADERS = ('Host', 'Origin', _CONTROL_HEADER, 'Sec-Fetch-Site')
+_TRUSTED_ORIGINS = frozenset({
+    'app://renderer',
+    'http://127.0.0.1:%d' % PORT,
+    'http://localhost:%d' % PORT,
+})
+
+
+def _allowed_hosts():
+    return {'127.0.0.1:%d' % PORT, 'localhost:%d' % PORT,
+            '[::1]:%d' % PORT, '::1:%d' % PORT}
+
+
 # ---------------- HTTP API ----------------
 class Handler(BaseHTTPRequestHandler):
+    server_version = 'kimi-code-usage'
+    sys_version = ''
+
+    def version_string(self):
+        return self.server_version
+
     def log_message(self, *a):
         pass
 
-    def _cors(self):
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', '*')
-        self.send_header('Access-Control-Allow-Private-Network', 'true')
+    def _loopback_peer(self):
+        try:
+            return ipaddress.ip_address(self.client_address[0]).is_loopback
+        except Exception:
+            return False
+
+    def _strict_host_ok(self):
+        hosts = self.headers.get_all('Host') or []
+        return len(hosts) == 1 and hosts[0].strip().lower() in _allowed_hosts()
+
+    def _origin_ok(self, origin):
+        """可信 Origin：静态集 + mobile worker 对存活桌面 owner 实例的动态核实。"""
+        if origin in _TRUSTED_ORIGINS:
+            return True
+        mgr = _mobile_manager()
+        if mgr is None or not origin:
+            return False
+        try:
+            trusted = mgr._trusted_control_origins()
+        except Exception:
+            return False
+        return origin in trusted
+
+    def _deny(self, code=403):
+        self.close_connection = True
+        body = json.dumps({'error': '来源不可信，已拒绝'},
+                          ensure_ascii=False).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return False
+
+    def _drain_body(self, cap=65536):
+        """超限 body 的有界排空：≤cap 字节、≤1s 超时，随后强制关闭连接。
+        不排空时 Windows 上未读请求体会触发 RST 使错误响应丢失；排空为尽力而为。"""
+        self.close_connection = True
+        try:
+            self.connection.settimeout(1.0)
+            remaining = cap
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 8192))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except Exception:
+            pass
+
+    def _guard_common(self):
+        if not self._loopback_peer() or not self._strict_host_ok():
+            return self._deny()
+        if getattr(self.headers, 'defects', None):
+            return self._deny()
+        for name in _SINGLE_HEADERS:
+            vals = self.headers.get_all(name) or []
+            if len(vals) > 1:
+                return self._deny()
+        self._torigin = (self.headers.get('Origin') or '').strip()
+        return True
+
+    def _guard_read(self):
+        """读守卫：无 Origin（本机程序）/可信 Origin 放行；foreign/null Origin、
+        cross-site 抓取一律拒。"""
+        if not self._guard_common():
+            return False
+        origin = self._torigin
+        if self._origin_ok(origin):
+            return True
+        sfs = (self.headers.get('Sec-Fetch-Site') or '').strip().lower()
+        if sfs == 'cross-site':
+            return self._deny()
+        if not origin:
+            return True
+        return self._deny()
+
+    def _guard_write(self):
+        """写守卫：在读守卫之上再要求自定义控制头，Origin 若存在必须可信。"""
+        if not self._guard_common():
+            return False
+        if (self.headers.get(_CONTROL_HEADER) or '').strip() != '1':
+            return self._deny()
+        origin = self._torigin
+        if not origin:
+            return True
+        if self._origin_ok(origin):
+            return True
+        return self._deny()
+
+    def _cors(self, origin=''):
+        # 仅对可信 Origin 回显精确值，不发 ACAO:*
+        if origin:
+            self.send_header('Access-Control-Allow-Origin', origin)
+            self.send_header('Access-Control-Allow-Private-Network', 'true')
+            self.send_header('Vary', 'Origin')
 
     def _json(self, obj, code=200):
         body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
         self.send_response(code)
-        self._cors()
+        origin = getattr(self, '_torigin', '')
+        self._cors(origin if origin and self._origin_ok(origin) else '')
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_OPTIONS(self):
+        if _mobile_dispatch(self):
+            return
+        if not self._guard_common():
+            return
+        origin = self._torigin
+        if not self._origin_ok(origin):
+            return self._deny()
         self.send_response(200)
-        self._cors()
+        self._cors(origin)
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        # 固定允许头，不回显 Access-Control-Request-Headers
+        self.send_header('Access-Control-Allow-Headers',
+                         'Content-Type, X-Kimi-Usage-Control')
+        self.send_header('Access-Control-Max-Age', '600')
         self.end_headers()
 
     def do_GET(self):
+        if _mobile_dispatch(self):
+            return
+        if not self._guard_read():
+            return
         path = self.path.split('?')[0]
         if path in ('/api/status', '/api/health'):
             self._json({'status': 'ok', 'name': 'kimi-code-usage', 'port': PORT,
@@ -1268,10 +1929,50 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def _method_not_allowed(self):
+        """非 GET/POST/OPTIONS 方法：/api/mobile* 先分流（worker 客户端自答），
+        其余统一 405 JSON（HEAD 不写 body）。"""
+        if _mobile_dispatch(self):
+            return
+        self.close_connection = True
+        body = json.dumps({'error': '方法不被支持'},
+                          ensure_ascii=False).encode('utf-8')
+        self.send_response(405)
+        self.send_header('Allow', 'GET, POST, OPTIONS')
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        if self.command != 'HEAD':
+            self.wfile.write(body)
+
+    def __getattr__(self, name):
+        # BaseHTTPRequestHandler 以 hasattr(self, 'do_<METHOD>') 判支持——
+        # 拦截全部未定义 do_*（PUT/DELETE/PATCH/HEAD 及其他扩展动词），统一 405。
+        if name.startswith('do_'):
+            return self._method_not_allowed
+        raise AttributeError(name)
+
     def do_POST(self):
+        if _mobile_dispatch(self):
+            return
+        if not self._guard_write():
+            return
         path = self.path.split('?')[0]
+        # HTTP framing：TE 一律拒（防请求走私），CL 必须单值纯数字且有界
+        if self.headers.get_all('Transfer-Encoding'):
+            return self._deny(400)
+        cls = self.headers.get_all('Content-Length') or []
+        if len(cls) != 1 or not cls[0].strip().isdigit():
+            return self._deny(400)
+        body_len = int(cls[0].strip())
+        if body_len > 262144:
+            self._drain_body()
+            return self._json({'success': False, 'message': '请求体过大'}, 413)
         try:
-            req = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))).decode('utf-8'))
+            req = json.loads(self.rfile.read(body_len).decode('utf-8'))
+            if not isinstance(req, dict):
+                req = {}
         except Exception:
             req = {}
         try:
@@ -1312,9 +2013,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({'success': ok, 'message': msg, 'note': note}, 200 if ok else 400)
 
             if path == '/api/add-model':
-                alias = req.get('alias', '').strip()
-                provider = req.get('provider', '').strip()
-                model_id = req.get('model', '').strip()
+                alias = str(req.get('alias') or '').strip()
+                provider = str(req.get('provider') or '').strip()
+                model_id = str(req.get('model') or '').strip()
                 if not alias or not provider or not model_id:
                     return self._json({'success': False, 'message': 'alias/provider/model 必填'}, 400)
                 efforts = req.get('support_efforts')
@@ -1328,14 +2029,18 @@ class Handler(BaseHTTPRequestHandler):
                     if dflt not in efforts:
                         return self._json({'success': False,
                                            'message': 'default_effort 不在 support_efforts 内'}, 400)
-                    effort_lines = ('support_efforts = [ %s ]\ndefault_effort = "%s"\n'
-                                    % (', '.join('"%s"' % e for e in efforts), dflt))
-                block = ('\n[models."%s"]\nprovider = "%s"\nmodel = "%s"\n'
+                    effort_lines = ('support_efforts = [ %s ]\ndefault_effort = %s\n'
+                                    % (', '.join(_toml_string(e) for e in efforts), _toml_string(dflt)))
+                try:
+                    max_ctx = int(req.get('max_context_size', 250000))
+                except (TypeError, ValueError):
+                    return self._json({'success': False, 'message': 'max_context_size 必须是整数'}, 400)
+                block = ('\n[models.%s]\nprovider = %s\nmodel = %s\n'
                          'max_context_size = %d\ncapabilities = [ "tool_use", "thinking", "image_in" ]\n'
-                         'display_name = "%s"\n%s'
-                         % (alias, provider, model_id,
-                            int(req.get('max_context_size', 250000)),
-                            req.get('display_name', '').strip() or alias, effort_lines))
+                         'display_name = %s\n%s'
+                         % (_toml_qkey(alias), _toml_string(provider), _toml_string(model_id),
+                            max_ctx,
+                            _toml_string(str(req.get('display_name') or '').strip() or alias), effort_lines))
                 ok, msg = safe_apply_config(get_config_content() + block)
                 return self._json({'success': ok, 'message': msg}, 200 if ok else 400)
 
@@ -1416,6 +2121,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({'success': ok, 'message': msg}, 200 if ok else 400)
 
             if path == '/api/update/apply':
+                if _apply_update_blocked():
+                    return self._json({'success': False, 'code': 'LOCAL_PREVIEW_UPDATE_BLOCKED',
+                                       'message': LOCAL_PREVIEW_MSG}, 409)
                 chk = check_update(force=True)
                 if chk.get('error'):
                     return self._json({'success': False, 'message': '检查更新失败：%s' % chk['error']}, 502)
@@ -1539,6 +2247,149 @@ def spawn_daemon():
         return False
 
 
+def _daemon_status():
+    """活着的用量面板服务 status 字典；查不到返回 None。"""
+    for _ in range(2):
+        try:
+            with _urlopen('http://127.0.0.1:%d/api/status' % PORT, timeout=4) as r:
+                d = json.loads(r.read().decode())
+                if d.get('name') == 'kimi-code-usage':
+                    return d
+        except Exception:
+            time.sleep(0.3)
+    return None
+
+
+def _daemon_pid():
+    try:
+        return int((_daemon_status() or {}).get('pid'))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_cmdline(cl):
+    # Windows 用 CommandLineToArgvW 保证与进程真实 argv 一致（引号/空格不会误判）
+    if os.name == 'nt':
+        try:
+            import ctypes
+            f = ctypes.windll.shell32.CommandLineToArgvW
+            f.restype = ctypes.POINTER(ctypes.c_wchar_p)
+            f.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+            n = ctypes.c_int()
+            p = f(cl, ctypes.byref(n))
+            return [p[i] for i in range(n.value)]
+        except Exception:
+            return []
+    try:
+        return shlex.split(cl)
+    except Exception:
+        return []
+
+
+def _daemon_pid_verified(pid):
+    """严格核实该 PID 就是"当前 service.py 由 Python 直跑"的 daemon，才允许停止。"""
+    try:
+        pid = int(pid)
+        if pid <= 0 or pid == os.getpid():
+            return False
+        q = subprocess.run([
+            'powershell', '-NoProfile', '-Command',
+            "(Get-CimInstance Win32_Process -Filter 'ProcessId=%s').CommandLine" % pid
+        ], capture_output=True, text=True, timeout=15)
+        argv = _parse_cmdline((q.stdout or '').strip())
+        if len(argv) != 2:
+            return False
+        exe = os.path.basename(argv[0]).lower()
+        exe_ok = (exe in ('python.exe', 'pythonw.exe')
+                  or bool(re.match(r'^python3(\.\d+)*\.exe$', exe))
+                  or os.path.normcase(argv[0]) == os.path.normcase(sys.executable))
+        script_ok = (os.path.isabs(argv[1])
+                     and os.path.normcase(os.path.abspath(argv[1]))
+                     == os.path.normcase(os.path.abspath(__file__)))
+        return exe_ok and script_ok
+    except Exception:
+        return False
+
+
+def _port_free():
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('127.0.0.1', PORT))
+            return True
+    except OSError:
+        return False
+
+
+def _wait_spawn_lock():
+    """有界等待 spawn.lock 过期（锁本身 12s 失效）。拿不到就放弃——绝不先杀后抢。"""
+    for _ in range(15):
+        if spawn_lock():
+            return True
+        time.sleep(1.0)
+    return False
+
+
+def restart_service():
+    """--restart：先拿到 spawn_lock，再核实占用者确为本插件 daemon 才停止；
+    等端口释放后走既有 spawn_daemon 拉起当前代码，最后以 name+version 确认。"""
+    refresh_dist_paths()
+    st = _daemon_status()
+    pid = st.get('pid') if st else None
+    if pid is not None and not _daemon_pid_verified(pid):
+        log('restart refused: pid %s not verified as our daemon' % pid)
+        print('restart refused: port %d 响应了用量面板 API，但进程无法核实为当前'
+              ' service.py，不会自动结束。请手动结束后重试。' % PORT)
+        return 2
+    # 先取得 spawn 权再等锁内操作；若期间有别的 tick 在拉起，宁可拒绝也不误杀
+    if not _wait_spawn_lock():
+        print('restart refused: 另一个拉起操作进行中（spawn.lock 未释放），未做任何改动。')
+        return 2
+    try:
+        if pid is not None:
+            st2 = _daemon_status()
+            pid2 = st2.get('pid') if st2 else None
+            if pid2 is None:
+                # 等锁期间旧 daemon 已退出：仍要确认端口没被外来进程抢走
+                if not _port_free():
+                    print('restart refused: 旧 daemon 退出后端口被其他进程占用，未自动处理。')
+                    return 2
+            elif not _daemon_pid_verified(pid2):
+                print('restart refused: 等锁期间端口易主，未核实，未做任何改动。')
+                return 2
+            else:
+                subprocess.run(['taskkill', '/PID', str(pid2), '/F'],
+                               capture_output=True, timeout=10)
+                for _ in range(40):
+                    if _port_free():
+                        break
+                    time.sleep(0.25)
+                else:
+                    print('restart failed: 端口 %d 未释放，请稍后重试。' % PORT)
+                    return 2
+                log('old daemon (pid %s) stopped for restart' % pid2)
+        elif not _port_free():
+            print('restart refused: 端口 %d 被其他进程占用，未自动处理。' % PORT)
+            return 2
+        if spawn_daemon():
+            for _ in range(40):
+                st3 = _daemon_status()
+                if st3 and st3.get('version') == PLUGIN_VERSION:
+                    print('restarted: service v%s is running on 127.0.0.1:%d'
+                          % (st3['version'], PORT))
+                    return 0
+                time.sleep(0.25)
+        print('restart failed: 新服务未能在限定时间内就绪，请查看 scripts/service.log')
+        return 1
+    finally:
+        lock = os.path.join(KIMI_HOME, 'usage-dashboard', 'spawn.lock')
+        try:
+            # 只释放自己刚拿到的锁（内容为我们写入的 pid），不动他人锁
+            if open(lock).read().strip() == str(os.getpid()):
+                os.remove(lock)
+        except Exception:
+            pass
+
+
 def tick():
     """hook 入口：服务不在就拉起；服务在就触发一次采集刷新。"""
     if port_is_ours():
@@ -1633,13 +2484,17 @@ if __name__ == '__main__':
     try:
         if '--tick' in sys.argv:
             sys.exit(tick())
+        if '--restart' in sys.argv:
+            sys.exit(restart_service())
         if '--once' in sys.argv:
             sys.exit(run_once())
         run_server()
     except KeyboardInterrupt:
+        _mobile_stop()
         save_state()
     except Exception as e:
         log('fatal: %r' % e)
+        _mobile_stop()
         try:
             save_state()
         except Exception:
