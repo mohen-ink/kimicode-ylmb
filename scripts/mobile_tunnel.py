@@ -27,7 +27,7 @@ CONNECTOR_URL = ('https://github.com/cloudflare/cloudflared/releases/download/'
 LICENSE_URL = 'https://raw.githubusercontent.com/cloudflare/cloudflared/2026.9.3/LICENSE'
 LICENSE_SIZE = 11357
 LICENSE_SHA256 = '58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd'
-_PACKAGED_LICENSE = (Path(__file__).absolute().parent.parent / 'assets' / 'vendor'
+_PACKAGED_LICENSE = (Path(os.path.realpath(__file__)).parent.parent / 'assets' / 'vendor'
                      / 'cloudflared-2026.9.3-LICENSE')
 CONSENT_VERSION = 'cloudflare-quick-2026-09-v1'
 INSTALL_TIMEOUT = 180.0
@@ -147,7 +147,7 @@ def _download(url, destination, max_bytes, deadline):
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}), _OfficialRedirects(license_file, deadline))
     request = urllib.request.Request(url, headers={
-        'User-Agent': 'kimi-mobile-connector/3.3.2-local', 'Accept-Encoding': 'identity'})
+        'User-Agent': 'kimi-mobile-connector/3.3.6', 'Accept-Encoding': 'identity'})
     with opener.open(request, timeout=min(DOWNLOAD_TIMEOUT, remaining)) as response:
         if not _allowed_download_url(response.geturl(), license_file):
             raise ValueError('download host rejected')
@@ -527,7 +527,7 @@ def _file_change_time(path):
 
 class ConnectorRuntime:
     def __init__(self, kimi_home):
-        self._home = Path(kimi_home).absolute()
+        self._home = Path(os.path.realpath(str(Path(kimi_home).absolute())))
         self._root = self._home / 'usage-dashboard' / 'runtime' / 'cloudflared' / CONNECTOR_VERSION
         self._exe = self._root / 'cloudflared-windows-amd64.exe'
         self._license = self._root / 'LICENSE'
@@ -709,13 +709,16 @@ class ConnectorRuntime:
         timer = threading.Timer(INSTALL_TIMEOUT, self._install_expired, args=(token,))
         timer.daemon = True
         timer.start()
-        error = 'CONNECTOR_HASH_MISMATCH'
+        error = 'CONNECTOR_INSTALL_FAILED'
         try:
             with self._lock:
                 if self._closed or token != self._install_generation:
                     return
-            data = _read_packaged_license()
-            error = 'CONNECTOR_INSTALL_FAILED'
+            try:
+                data = _read_packaged_license()
+            except ValueError:
+                error = 'CONNECTOR_HASH_MISMATCH'
+                raise
             with self._lock:
                 if self._closed or token != self._install_generation:
                     return
