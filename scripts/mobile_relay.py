@@ -61,9 +61,19 @@ RECONNECT_BASE = 1.0         # 掉线重连起始退避（秒）
 RECONNECT_MAX = 30.0         # 掉线重连退避上限（秒）
 RECONNECT_GIVEUP = 300.0     # 连续重连多久仍失败才认 TUNNEL_EXITED（秒）
 MAX_HTTP_BODY = 32 * 1024 * 1024
-MAX_WS_MESSAGE = 4 * 1024 * 1024
+# 本端只用于【读】VPS 经隧道发来的帧，即手机上行方向：服务器公网口的请求体上限
+# MAX_HTTP_BODY=32MiB 经 base64 封装（膨胀约 4/3）约 42.7MiB，故取 48MiB。
+# 下行（电脑→手机）的大响应由本端发出，不收此限；那一侧由服务器的
+# relay_server.TUNNEL_MAX_FRAME（192MiB）约束。取 4MiB 会让稍大的上传
+# （如 32MiB 文件）读帧失败并拆掉隧道。
+MAX_WS_MESSAGE = 48 * 1024 * 1024
 HEADER_MAX = 32 * 1024
 RECV_POLL = 0.5              # socket 轮询步长（让 stop 能及时生效）
+# 发帧超时与读轮询分开：socket 上的超时是【收发共用】的，直接沿用 RECV_POLL
+# 会让超过 0.5s 才发完的帧（3.5MB SPA 主包这类）抛 socket.timeout，send_frame
+# 随即把整条隧道判死 → 手机加载大资源时隧道反复拆建 → 白屏。大帧在公网上
+# 发送需要更长时间，单列一个大超时。
+SEND_TIMEOUT = 60.0
 
 _TOK_ID_RE = frozenset('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-')
 
@@ -73,6 +83,16 @@ def _tok_ok(s, lo=1, hi=64):
 
 
 # ---------------- WebSocket 帧（RFC6455，客户端侧必须掩码） ----------------
+def _mask_payload(data, mask):
+    """RFC6455 掩码。大整数一次异或，MB 级帧比逐字节生成器快两个数量级——
+    掩码是发大帧前的必经步骤，慢在这里会直接顶到发送超时。"""
+    n = len(data)
+    if not n:
+        return b''
+    m = (bytes(mask) * (n // 4 + 1))[:n]
+    return (int.from_bytes(data, 'big') ^ int.from_bytes(m, 'big')).to_bytes(n, 'big')
+
+
 def _ws_frame(opcode, payload, mask=True):
     b0 = 0x80 | opcode
     ln = len(payload)
@@ -86,8 +106,7 @@ def _ws_frame(opcode, payload, mask=True):
     if not mask:
         return head + payload
     mk = secrets.token_bytes(4)
-    masked = bytes(b ^ mk[i % 4] for i, b in enumerate(payload))
-    return head + mk + masked
+    return head + mk + _mask_payload(payload, mk)
 
 
 def _send_all(sock, data):
@@ -104,13 +123,24 @@ class _WSock:
         self.rbuf = bytearray()
         self.alive = True
 
+    def _set_timeout(self, t):
+        try:
+            if self.sock.gettimeout() != t:
+                self.sock.settimeout(t)
+        except Exception:
+            pass
+
     def send_frame(self, opcode, payload=b''):
         if not self.alive:
             return False
         try:
             data = _ws_frame(opcode, payload, mask=self.masked_out)
             with self.wlock:
-                self.sock.sendall(data)
+                self._set_timeout(SEND_TIMEOUT)
+                try:
+                    self.sock.sendall(data)
+                finally:
+                    self._set_timeout(RECV_POLL)
             return True
         except Exception:
             self.alive = False
@@ -124,6 +154,9 @@ class _WSock:
             if not self.alive or time.monotonic() > deadline:
                 return None
             try:
+                # 读与写共用一个 socket 超时；发送路径会临时调大它，这里每次
+                # recv 前复位为轮询步长，保证读不会长时间阻塞、stop 能及时生效。
+                self._set_timeout(RECV_POLL)
                 chunk = self.sock.recv(min(65536, n - len(self.rbuf)))
             except socket.timeout:
                 continue
