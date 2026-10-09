@@ -43,6 +43,8 @@ LOCAL_ONLY_KEEP = frozenset((
     'scripts/mobile_tunnel.py',
     'scripts/mobile_usage.py',
     'scripts/mobile_worker.py',
+    'scripts/mobile_credentials.py',
+    'scripts/mobile_security.py',
 ))
 LOCAL_ONLY_KEEP_PREFIX = ('docs/', 'assets/vendor/')
 # 不完整更新包（缺核心运行文件）一律拒绝：宁可回到旧版本，也不留下半套运行树。
@@ -62,6 +64,8 @@ MOBILE_RUNTIME_GROUP = frozenset((
     'scripts/mobile_tunnel.py',
     'scripts/mobile_usage.py',
     'scripts/mobile_worker.py',
+    'scripts/mobile_credentials.py',
+    'scripts/mobile_security.py',
     'assets/kimi-mobile-api.js',
 ))
 # 退出码：3 = 旧服务未退出，4 = 更新包损坏/应用失败，5 = 本地预览自保护，6 = 更新包不完整

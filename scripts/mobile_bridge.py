@@ -49,7 +49,8 @@ _MOBILE_ERROR_CODES = frozenset((
     'CONNECTOR_MISSING', 'CONNECTOR_INSTALL_FAILED', 'CONNECTOR_HASH_MISMATCH',
     'CONNECTOR_UNSUPPORTED', 'CONNECTOR_BUSY', 'CONSENT_REQUIRED',
     'TUNNEL_START_FAILED', 'TUNNEL_TIMEOUT', 'TUNNEL_EXITED', 'OWNER_LOST',
-    'START_CANCELLED',
+    'START_CANCELLED', 'SERVER_TOKEN_UNAVAILABLE', 'OWNER_AUTH_FAILED',
+    'OWNER_AUTH_CHECK_FAILED',
     'WORKER_STATE_DIR_UNAVAILABLE', 'WORKER_STARTUP_BUSY', 'WORKER_LOCK_HELD',
     'WORKER_SPAWN_DENIED', 'WORKER_SPAWN_FAILED', 'WORKER_CHILD_EXITED',
     'WORKER_BOOT_TIMEOUT', 'WORKER_VERSION_MISMATCH',
@@ -615,26 +616,69 @@ def _parse_owner_origin(raw):
 
 
 def _read_server_token(kimi_home):
-    """运行时读取 server.token（仅进程内存；本函数返回值永不进日志/响应）。"""
+    """只读兼容入口；缺失与不可用不同，不在读取时创建凭据。"""
+    from mobile_credentials import read_server_token, CredentialUnavailable
     try:
-        with open(os.path.join(kimi_home, 'server.token'), 'rb') as f:
-            tok = f.read().decode('utf-8', 'replace').strip()
-        return tok or None
-    except Exception:
-        return None
+        return read_server_token(kimi_home)
+    except CredentialUnavailable:
+        raise MobileBridgeError('SERVER_TOKEN_UNAVAILABLE') from None
+
+
+def _ensure_server_token(kimi_home):
+    from mobile_credentials import ensure_server_token, CredentialUnavailable
+    try:
+        return ensure_server_token(kimi_home)
+    except CredentialUnavailable:
+        raise MobileBridgeError('SERVER_TOKEN_UNAVAILABLE') from None
 
 
 def _owner_responds(host, port, timeout=2.5):
-    """healthz 必须 200——只 2xx 才认 owner 存活。"""
+    """healthz 必须 200；错误或超时不认 owner 存活。"""
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    response = None
     try:
-        conn = http.client.HTTPConnection(host, port, timeout=timeout)
         conn.request('GET', '/api/v1/healthz')
-        r = conn.getresponse()
-        r.read(1024)
-        conn.close()
-        return r.status == 200
-    except Exception:
+        response = conn.getresponse()
+        return response.status == 200
+    except (OSError, http.client.HTTPException):
         return False
+    finally:
+        if response is not None:
+            response.close()
+        conn.close()
+
+
+def _verify_owner_auth(host, port, token, timeout=2.5):
+    """只向已核实的 loopback owner 验证，不跟重定向、不读取/记录正文。"""
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    response = None
+    try:
+        conn.request('GET', '/api/v1/workspaces',
+                     headers={'Authorization': 'Bearer ' + token})
+        response = conn.getresponse()
+        status = response.status
+    except (OSError, http.client.HTTPException, ValueError):
+        raise MobileBridgeError('OWNER_AUTH_CHECK_FAILED') from None
+    finally:
+        if response is not None:
+            response.close()
+        conn.close()
+    if status in (401, 403):
+        raise MobileBridgeError('OWNER_AUTH_FAILED')
+    if status != 200:
+        raise MobileBridgeError('OWNER_AUTH_CHECK_FAILED')
+
+
+def _owner_matches(kimi_home, host, port, inst, creation):
+    """启动期间复核实例身份，防 PID/监听端口复用。"""
+    current = next((i for i in _load_instances(kimi_home)
+                    if i['host'] == host and i['port'] == port), None)
+    return bool(current and current['pid'] == inst['pid']
+                and current.get('server_id') == inst.get('server_id')
+                and _pid_alive(inst['pid']) and _pid_is_desktop(inst['pid'])
+                and _pid_creation_ticks(inst['pid']) == creation
+                and _tcp_listener_pid(host, port) == inst['pid']
+                and _owner_responds(host, port))
 
 
 def _safe_error_text(e):
@@ -959,9 +1003,28 @@ class MobileBridgeManager(object):
                 raise MobileBridgeError('OWNER_LOST')
             if not self.generation_valid(generation, starting=True):
                 raise MobileBridgeError('START_CANCELLED')
-            token = _read_server_token(self.kimi_home)
-            if not token:
+            if not _owner_matches(self.kimi_home, host, port, inst, creation):
                 raise MobileBridgeError('OWNER_LOST')
+            # 与 stop 同锁：只有显式、仍有效的 start 才允许补建凭据。
+            with self._lock:
+                if not self.generation_valid(generation, starting=True):
+                    raise MobileBridgeError('START_CANCELLED')
+                token = _ensure_server_token(self.kimi_home)
+            if not self.generation_valid(generation, starting=True):
+                raise MobileBridgeError('START_CANCELLED')
+            if not _owner_matches(self.kimi_home, host, port, inst, creation):
+                raise MobileBridgeError('OWNER_LOST')
+            auth_error = None
+            try:
+                _verify_owner_auth(host, port, token)
+            except MobileBridgeError as exc:
+                auth_error = str(exc)
+            if not self.generation_valid(generation, starting=True):
+                raise MobileBridgeError('START_CANCELLED')
+            if not _owner_matches(self.kimi_home, host, port, inst, creation):
+                raise MobileBridgeError('OWNER_LOST')
+            if auth_error:
+                raise MobileBridgeError(auth_error)
             httpd, bound_port = self._bind(bind_address)
             httpd.generation = generation
             with self._lock:

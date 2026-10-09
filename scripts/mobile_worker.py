@@ -35,7 +35,7 @@ start 在 worker 未就绪时把该阶段的固定码（WORKER_*，白名单内�
 错误码透出；无阶段诊断的失败仍回退 TUNNEL_START_FAILED，未知阶段一律回退，
 绝不外泄 stderr/路径/secret。
 
-协议 protocol=1，版本 version=3.3.6。本模块只依赖 Python>=3.8 标准库。
+协议 protocol=1，版本 version=3.3.6-token-bootstrap.1。本模块只依赖 Python>=3.8 标准库。
 """
 import ctypes
 import http.client
@@ -59,7 +59,7 @@ from mobile_bridge import (
     _TRUSTED_APP_ORIGIN, local_lan_addresses)
 
 WORKER_PROTOCOL = 1
-WORKER_VERSION = '3.3.6'
+WORKER_VERSION = '3.3.6-token-bootstrap.1'
 WORKER_HEADER = 'X-Kimi-Mobile-Worker'
 WORKER_MAX_BODY = 8192
 SECRET_BYTES = 32
@@ -187,172 +187,17 @@ def _icacls(args):
         raise MobileBridgeError('worker ACL 设置失败')
 
 
-def _current_user_sid():
-    """当前进程 token 的实际用户 SID（OpenProcessToken → TokenUser，
-    显式 64 位句柄类型防截断）。绝不凭 USERNAME 字符串授权——字符串
-    仅作环境探测；实际授权主体以进程真实身份为准（本机/域同名账户
-    时 icacls 账户名解析可能命中另一主体，SID 则唯一）。"""
-    adv = ctypes.windll.advapi32
-    kernel32 = ctypes.windll.kernel32
-    prev_restype = kernel32.GetCurrentProcess.restype
-    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
-    adv.OpenProcessToken.restype = ctypes.c_int
-    adv.OpenProcessToken.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
-                                     ctypes.POINTER(ctypes.c_void_p)]
-    try:
-        token = ctypes.c_void_p()
-        if not adv.OpenProcessToken(kernel32.GetCurrentProcess(),
-                                    0x0008, ctypes.byref(token)):  # TOKEN_QUERY
-            return None
-        try:
-            n = ctypes.c_ulong(0)
-            adv.GetTokenInformation(token, 1, None, 0, ctypes.byref(n))  # TokenUser
-            buf = ctypes.create_string_buffer(n.value)
-            if not adv.GetTokenInformation(token, 1, buf, n, ctypes.byref(n)):
-                return None
-            psid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p)).contents
-            if not psid:
-                return None
-            p = ctypes.c_void_p()
-            if not adv.ConvertSidToStringSidW(psid, ctypes.byref(p)):
-                return None
-            try:
-                return ctypes.wstring_at(p.value)
-            finally:
-                kernel32.LocalFree(p)
-        finally:
-            kernel32.CloseHandle(token)
-    except Exception:
-        return None
-    finally:
-        # 恢复共享 DLL 对象上的 restype：windll.kernel32 是全局缓存的
-        # 同一对象，restype 改动会泄漏给进程内其他裸用该 API 的代码
-        kernel32.GetCurrentProcess.restype = prev_restype
-
-
-_SID_RE = re.compile(r'^S-\d+(-\d+)+$')
-_ADVAPI32 = None
-_KERNEL32 = None
-_SE_FILE_OBJECT = 1                # SE_FILE_OBJECT
-_DACL_SECURITY_INFORMATION = 0x00000004
-_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
-_SDDL_REVISION_1 = 1
-
-
-def _advapi32():
-    """专用 advapi32 句柄（显式 64 位签名）：
-
-    - 用独立 `ctypes.WinDLL` 实例而不是 `ctypes.windll.advapi32`——后者是
-      进程级共享对象，改它的 argtypes/restype 会泄漏给 mobile_bridge 等
-      其它裸用 ctypes 的代码；
-    - 句柄/SID/指针一律 `c_void_p` 语义，防 64 位截断。"""
-    global _ADVAPI32
-    if _ADVAPI32 is None:
-        adv = ctypes.WinDLL('advapi32')
-        convert = adv.ConvertStringSecurityDescriptorToSecurityDescriptorW
-        convert.restype = ctypes.c_int
-        convert.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong,
-                            ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
-        get_dacl = adv.GetSecurityDescriptorDacl
-        get_dacl.restype = ctypes.c_int
-        get_dacl.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
-                             ctypes.POINTER(ctypes.c_void_p),
-                             ctypes.POINTER(ctypes.c_int)]
-        set_named = adv.SetNamedSecurityInfoW
-        set_named.restype = ctypes.c_ulong
-        set_named.argtypes = [ctypes.c_wchar_p, ctypes.c_int, ctypes.c_ulong,
-                              ctypes.c_void_p, ctypes.c_void_p,
-                              ctypes.c_void_p, ctypes.c_void_p]
-        _ADVAPI32 = adv
-    return _ADVAPI32
-
-
-def _local_free(ptr):
-    """释放 API 分配的 SD（LocalFree）。专用 kernel32 句柄，签名显式。"""
-    global _KERNEL32
-    if _KERNEL32 is None:
-        k32 = ctypes.WinDLL('kernel32')
-        k32.LocalFree.restype = ctypes.c_void_p
-        k32.LocalFree.argtypes = [ctypes.c_void_p]
-        _KERNEL32 = k32
-    _KERNEL32.LocalFree(ptr)
-
-
-def _acl_user():
-    """授权主体（`*SID` 形式，供 icacls 风格调用/外部脚本使用）：USERNAME
-    缺失即拒（授权对象不确定时绝不收敛——绝不只授权 SYSTEM 锁死当前用户，
-    也绝不跳过收敛 fail open）；实际授权以当前进程 token 的真实身份 SID
-    下发（本机/域同名账户时账户名解析可能命中另一主体，SID 唯一）。"""
-    user = os.environ.get('USERNAME') or ''
-    if not user:
-        raise MobileBridgeError('worker ACL 授权主体不可用')
-    sid = _current_user_sid()
-    if not sid:
-        raise MobileBridgeError('worker ACL 授权主体不可用')
-    return '*' + sid
-
-
-def _acl_sid():
-    """收敛用的授权主体（纯 SID 文本，无 `*` 前缀）。经 `_acl_user` 取当前
-    进程 token 的真实身份，并**严格校验 SID 形态**：该字符串会被拼进 SDDL，
-    任何越界字符（`)`/`;`/空白等）都可能伪造或追加 ACE，因此不合法一律
-    fail closed——绝不把未校验文本送进安全描述符构造。"""
-    user = _acl_user()
-    sid = user[1:] if user.startswith('*') else user
-    if not _SID_RE.match(sid):
-        raise MobileBridgeError('worker ACL 授权主体不可用')
-    return sid
+# bridge 与 worker 共用安全实现；保留 worker 的异常合同。
+from mobile_security import (
+    _current_user_sid, _acl_user, _acl_sid,
+    _set_protected_dacl as _shared_set_protected_dacl)
 
 
 def _set_protected_dacl(path, is_dir):
-    """**一次 API 调用**把目标 DACL 置为受保护最小授权：当前用户真实 SID +
-    SYSTEM 完全控制（目录带 (OI)(CI)，`D:P` 断继承）。旧授权的移除与新授权
-    的建立发生在同一次 DACL 写入内，不存在"先清空、后重建"的中间空窗。
-
-    任何失败（SID 不可用/非法、SDDL 构造失败、取 DACL 失败、DACL 为空或
-    指针为空、API 返回非零）一律 fail closed：抛 MobileBridgeError，绝不降级
-    为部分收敛、绝不放宽安全边界、绝不重试掩盖（空 DACL 等于人人放行，必须拒）。
-    POSIX 走 `os.chmod`（原子，无 ACL 相位），失败同样 fail closed。"""
-    if os.name != 'nt':
-        try:
-            os.chmod(path, 0o700 if is_dir else 0o600)
-        except OSError:
-            raise MobileBridgeError('worker ACL 设置失败')
-        return
-    sid = _acl_sid()
-    flags = 'OICI' if is_dir else ''
-    sddl = 'D:P(A;%s;FA;;;%s)(A;%s;FA;;;SY)' % (flags, sid, flags)
-    adv = _advapi32()
-    sd = ctypes.c_void_p()
     try:
-        built = adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl, _SDDL_REVISION_1, ctypes.byref(sd), None)
+        _shared_set_protected_dacl(path, is_dir)
     except OSError:
-        raise MobileBridgeError('worker ACL 设置失败')
-    if not built or not sd.value:
-        raise MobileBridgeError('worker ACL 设置失败')
-    try:
-        present = ctypes.c_int(0)
-        dacl = ctypes.c_void_p()
-        defaulted = ctypes.c_int(0)
-        ok = adv.GetSecurityDescriptorDacl(
-            sd, ctypes.byref(present), ctypes.byref(dacl),
-            ctypes.byref(defaulted))
-        # 取 DACL 失败、DACL 不存在，或 present 但指针为空（= 空 DACL，
-        # 直接下发等于人人放行）都必须拒绝，绝不放行
-        if not ok or not present.value or not dacl.value:
-            raise MobileBridgeError('worker ACL 设置失败')
-        rc = adv.SetNamedSecurityInfoW(
-            path, _SE_FILE_OBJECT,
-            _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION,
-            None, None, dacl, None)
-        if rc != 0:
-            raise MobileBridgeError('worker ACL 设置失败')
-    except OSError:
-        # API 调用本身抛错（advapi32 不可用/被挂起）同样是收敛失败
-        raise MobileBridgeError('worker ACL 设置失败')
-    finally:
-        _local_free(sd)
+        raise MobileBridgeError('worker ACL 设置失败') from None
 
 
 def _ensure_dir_acl(path):

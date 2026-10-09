@@ -814,6 +814,9 @@
       TUNNEL_TIMEOUT: '外网通道启动超时，请检查网络。',
       TUNNEL_EXITED: '外网通道已断开，请停止后重新开启。',
       OWNER_LOST: '桌面端服务已断开，连接已撤销。',
+      SERVER_TOKEN_UNAVAILABLE: '手机连接凭据创建或读取失败，请检查目录权限。',
+      OWNER_AUTH_FAILED: '桌面端拒绝手机连接凭据，请停止后重试或升级桌面端。',
+      OWNER_AUTH_CHECK_FAILED: '无法验证桌面端认证，请稍后重试。',
       START_CANCELLED: '连接启动已取消。',
       // worker 启动阶段码（与 mobile_worker stage 表一致，固定中文文案）
       WORKER_STATE_DIR_UNAVAILABLE: '手机连接助手工作目录不可用，请检查插件安装。',
