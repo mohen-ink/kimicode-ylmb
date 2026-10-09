@@ -1,0 +1,23 @@
+# frps v0.67.0; replace this placeholder with a random printable token (32..512 chars).
+# server.crt must chain to the client's private CA and contain the public IPv4 IP SAN.
+bindAddr = "0.0.0.0"
+bindPort = 7000
+proxyBindAddr = "0.0.0.0"
+allowPorts = [{ single = 6000 }]
+maxPortsPerClient = 1
+
+auth.method = "token"
+auth.token = "REPLACE_WITH_A_RANDOM_TOKEN_DO_NOT_USE_THIS_PLACEHOLDER"
+auth.additionalScopes = ["HeartBeats", "NewWorkConns"]
+
+transport.tcpMux = false
+transport.heartbeatTimeout = 30
+transport.tls.force = true
+transport.tls.certFile = "/etc/frp/server.crt"
+transport.tls.keyFile = "/etc/frp/server.key"
+
+webServer.port = 0
+enablePrometheus = false
+log.to = "console"
+log.level = "info"
+log.disablePrintColor = true

@@ -6,6 +6,8 @@ Kimi Code 用量面板 · 手机浏览器桥接（同桌面 owner，显式开启
 Origin；手机面不暴露控制面。LAN 显式绑定所选本机 RFC1918 IPv4，明文 HTTP
 只适合可信局域网。internet 显式同意 Cloudflare 中继后只绑定 127.0.0.1，
 ConnectorRuntime 确认 Quick Tunnel 就绪且 owner 复核通过后才发布 HTTPS 配对链接。
+relay 经显式同意的 frp TCP 中继，亦仅绑定 127.0.0.1；runtime 就绪且 owner
+复核通过后发布 HTTP 公网 IPv4:端口链接（Cookie 不设置 Secure）。
 
 配对码只在 URL fragment，限时且一次性；会话 Cookie 为 HttpOnly/Strict，
 internet 额外设置 Secure。HTTP 精确 method+route allowlist 与 WS 上行消息
@@ -50,7 +52,7 @@ _MOBILE_ERROR_CODES = frozenset((
     'CONNECTOR_UNSUPPORTED', 'CONNECTOR_BUSY', 'CONSENT_REQUIRED',
     'TUNNEL_START_FAILED', 'TUNNEL_TIMEOUT', 'TUNNEL_EXITED', 'OWNER_LOST',
     'START_CANCELLED', 'SERVER_TOKEN_UNAVAILABLE', 'OWNER_AUTH_FAILED',
-    'OWNER_AUTH_CHECK_FAILED',
+    'OWNER_AUTH_CHECK_FAILED', 'RELAY_CONFIG_INVALID',
     'WORKER_STATE_DIR_UNAVAILABLE', 'WORKER_STARTUP_BUSY', 'WORKER_LOCK_HELD',
     'WORKER_SPAWN_DENIED', 'WORKER_SPAWN_FAILED', 'WORKER_CHILD_EXITED',
     'WORKER_BOOT_TIMEOUT', 'WORKER_VERSION_MISMATCH',
@@ -150,6 +152,7 @@ SESSION_TTL_SECONDS = 86400      # 会话 idle TTL 24h（滑动，兼容别名�
 SESSION_MAX_AGE_SECONDS = 604800 # 会话绝对寿命 7d（Cookie Max-Age 也按此签发）
 MAX_DEVICES = 8
 CONTROL_MAX_BODY = 8192
+RELAY_CONTROL_MAX_BODY = 144 * 1024
 CONTROL_DRAIN_CAP = 64 * 1024    # 控制面错误前排空上限：更大 body 直接弃连不读
 PROXY_MAX_REQUEST_BODY = 32 * 1024 * 1024   # 上传文件等正常体积内放行
 PROXY_MAX_RESPONSE_BODY = 128 * 1024 * 1024
@@ -777,9 +780,72 @@ def _project_connector_diagnostics(diag):
             'transport_state': diag['transport_state']}
 
 
+FRP_CONSENT_VERSION = 'frp-tcp-http-v1'
+_PUBLIC_MODES = ('internet', 'relay')
+
+
+def _validate_install_params(consent, consent_version, mode='internet'):
+    if mode not in _PUBLIC_MODES:
+        raise MobileBridgeError('模式无效')
+    version = FRP_CONSENT_VERSION if mode == 'relay' else RELAY_CONSENT_VERSION
+    if consent is not True or consent_version != version:
+        raise MobileBridgeError('CONSENT_REQUIRED')
+
+
+def _validate_start_params(owner_origin, address=None, mode='lan',
+                           relay_consent=False, consent_version=None,
+                           relay_config=None):
+    if mode not in ('lan', 'internet', 'relay'):
+        raise MobileBridgeError('模式无效')
+    if mode in _PUBLIC_MODES:
+        if address is not None:
+            raise MobileBridgeError('外网模式不接受监听地址')
+        _validate_install_params(relay_consent, consent_version, mode)
+    if mode != 'relay' and relay_config is not None:
+        raise MobileBridgeError('请求参数不被允许')
+    config = None
+    if mode == 'relay':
+        try:
+            from mobile_relay import validate_config
+            config = validate_config(relay_config)
+        except ImportError:
+            raise MobileBridgeError('CONNECTOR_MISSING') from None
+        except Exception:
+            raise MobileBridgeError('RELAY_CONFIG_INVALID') from None
+    _parse_owner_origin(owner_origin)
+    return config
+
+
+def _install_body_params(body):
+    if not isinstance(body, dict) or set(body) - {'mode', 'consent', 'consent_version'}:
+        raise MobileBridgeError('请求参数不被允许')
+    args = (body.get('consent'), body.get('consent_version'), body.get('mode', 'internet'))
+    _validate_install_params(*args)
+    return args
+
+
+def _start_body_params(body):
+    if not isinstance(body, dict):
+        raise MobileBridgeError('请求参数不被允许')
+    mode = body.get('mode', 'lan')
+    allowed = ({'owner_origin', 'mode', 'relay_consent', 'consent_version'}
+               if mode in _PUBLIC_MODES else {'owner_origin', 'mode', 'address'})
+    if mode == 'relay':
+        allowed = allowed | {'relay_config'}
+        if set(body) != allowed:
+            raise MobileBridgeError('RELAY_CONFIG_INVALID')
+    if set(body) - allowed:
+        raise MobileBridgeError('请求参数不被允许')
+    args = (body.get('owner_origin'), body.get('address'), mode,
+            body.get('relay_consent', False), body.get('consent_version'),
+            body.get('relay_config'))
+    config = _validate_start_params(*args)
+    return args[:-1] + (config,)
+
+
 # ---------------- 管理器 ----------------
 class MobileBridgeManager(object):
-    """本机控制面与 LAN/internet 手机代理的生命周期管理。状态仅内存持有。"""
+    """本机控制面与 LAN/internet/relay 手机代理的生命周期管理。状态仅内存持有。"""
 
     def __init__(self, kimi_home):
         self.kimi_home = kimi_home
@@ -817,6 +883,13 @@ class MobileBridgeManager(object):
             self._connector = ConnectorRuntime(kimi_home)
         except ImportError:
             self._connector = None
+        try:
+            from mobile_relay import RelayRuntime, RELAY_VERSION
+            self._relay = RelayRuntime(kimi_home)
+            self._relay_version = RELAY_VERSION
+        except ImportError:
+            self._relay = None
+            self._relay_version = ''
 
     # ---------- 连接/WS 限额 ----------
     def try_acquire_conn(self):
@@ -860,17 +933,18 @@ class MobileBridgeManager(object):
                 self._ws_by_sid[sid] = n - 1
 
     @staticmethod
-    def _normalize_connector_status(snapshot):
-        failed = {'state': 'failed', 'version': '2026.9.3',
+    def _normalize_connector_status(snapshot, version='2026.9.3'):
+        failed = {'state': 'failed', 'version': version,
                   'error_code': 'CONNECTOR_INSTALL_FAILED'}
         if not isinstance(snapshot, dict) or not isinstance(snapshot.get('connector'), dict):
             return failed
         connector = snapshot['connector']
         state = connector.get('state')
-        if (state not in ('missing', 'installing', 'installed', 'failed')
-                or connector.get('version') != '2026.9.3'):
+        if (not isinstance(state, str)
+                or state not in ('missing', 'installing', 'installed', 'failed')
+                or connector.get('version') != version):
             return failed
-        out = {'state': state, 'version': '2026.9.3'}
+        out = {'state': state, 'version': version}
         error = connector.get('error_code')
         if error is not None:
             if not isinstance(error, str) or error not in _MOBILE_ERROR_CODES:
@@ -879,6 +953,15 @@ class MobileBridgeManager(object):
         elif state == 'failed':
             out['error_code'] = 'CONNECTOR_INSTALL_FAILED'
         return out
+
+    def _relay_status(self):
+        if self._relay is None:
+            return {'state': 'missing', 'version': self._relay_version}
+        try:
+            return self._normalize_connector_status(self._relay.status(), self._relay_version)
+        except Exception:
+            return {'state': 'failed', 'version': self._relay_version,
+                    'error_code': 'CONNECTOR_INSTALL_FAILED'}
 
     def _connector_status(self):
         if self._connector is None:
@@ -900,6 +983,7 @@ class MobileBridgeManager(object):
             include_lan = self._mode == 'lan' or self._state == 'off'
         addrs = local_lan_addresses() if include_lan else None
         connector, diagnostics = self._connector_status()
+        relay_connector = self._relay_status()
         with self._lock:
             now = time.time()
             live = [s for s in self._sessions.values() if s['expires'] > now]
@@ -907,6 +991,7 @@ class MobileBridgeManager(object):
                 'enabled': self._state == 'on', 'state': self._state,
                 'mode': self._mode, 'owner_origin': self._owner_origin,
                 'device_count': len(live), 'connector': connector,
+                'relay_connector': relay_connector,
                 'tunnel': dict(self._tunnel), 'pair_state': self._pair_state,
             }
             if diagnostics is not None:
@@ -916,7 +1001,8 @@ class MobileBridgeManager(object):
             if self._mode == 'lan':
                 st['address'], st['port'] = self._address, self._port
             best = max(self._pair_tokens.values(), default=0.0)
-            if self._state == 'on' and self._mode == 'internet' and self._tunnel['state'] == 'ready':
+            if (self._state == 'on' and self._mode in _PUBLIC_MODES
+                    and self._tunnel['state'] == 'ready'):
                 st['public_origin'] = self._public_origin
             if self._state == 'on' and best > now:
                 st['url'] = self._pair_url_locked()
@@ -925,17 +1011,21 @@ class MobileBridgeManager(object):
                 st['pair_state'] = 'expired'
             return st
 
-    def install_connector(self, consent, consent_version):
-        if consent is not True or consent_version != RELAY_CONSENT_VERSION:
-            raise MobileBridgeError('CONSENT_REQUIRED')
+    def install_connector(self, consent, consent_version, mode='internet'):
+        _validate_install_params(consent, consent_version, mode)
         with self._connector_lock:
             with self._lock:
                 if self._closing:
                     raise MobileBridgeError('START_CANCELLED')
-            if self._connector is None:
+            runtime = self._relay if mode == 'relay' else self._connector
+            version = self._relay_version if mode == 'relay' else '2026.9.3'
+            if runtime is None:
                 raise MobileBridgeError('CONNECTOR_MISSING')
-            result = self._normalize_connector_status(
-                self._connector.install(consent, consent_version))
+            try:
+                result = self._normalize_connector_status(
+                    runtime.install(consent, consent_version), version)
+            except Exception:
+                raise MobileBridgeError('CONNECTOR_INSTALL_FAILED') from None
             if result.get('error_code'):
                 raise MobileBridgeError(result['error_code'])
             if result['state'] not in ('installed', 'installing'):
@@ -944,14 +1034,14 @@ class MobileBridgeManager(object):
 
     # ---------- 启停 ----------
     def start(self, owner_origin, address=None, mode='lan', relay_consent=False,
-              consent_version=None):
-        if mode not in ('lan', 'internet'):
-            raise MobileBridgeError('模式无效')
-        if mode == 'internet':
-            if address is not None:
-                raise MobileBridgeError('外网模式不接受监听地址')
-            if relay_consent is not True or consent_version != RELAY_CONSENT_VERSION:
-                raise MobileBridgeError('CONSENT_REQUIRED')
+              consent_version=None, relay_config=None):
+        config = _validate_start_params(owner_origin, address, mode, relay_consent,
+                                        consent_version, relay_config)
+        relay_config = None
+        expected_origin = ''
+        if mode == 'relay':
+            from mobile_relay import public_origin
+            expected_origin = public_origin(config)
         host, port = _parse_owner_origin(owner_origin)
         norm_origin = 'http://%s:%d' % (host, port)
         with self._lock:
@@ -961,7 +1051,9 @@ class MobileBridgeManager(object):
                 raise MobileBridgeError('CONNECTOR_BUSY')
             if self._state == 'on':
                 same = (norm_origin == self._owner_origin and mode == self._mode
-                        and (mode == 'internet' or address == self._address))
+                        and (mode == 'internet'
+                             or (mode == 'relay' and expected_origin == self._public_origin)
+                             or (mode == 'lan' and address == self._address)))
                 if not same:
                     raise MobileBridgeError('请先停止再重新开启')
                 generation = None
@@ -970,16 +1062,17 @@ class MobileBridgeManager(object):
                 generation = self._generation
                 self._state = 'starting'
                 self._mode = mode
-                self._tunnel = {'state': 'starting' if mode == 'internet' else 'off'}
+                self._tunnel = {'state': 'starting' if mode in _PUBLIC_MODES else 'off'}
                 self._public_origin = ''
                 self._pair_state = 'missing'
         if generation is None:
+            config = None
             return self.status()
         httpd = None
         published = False
         try:
-            if mode == 'internet':
-                connector, _ = self._connector_status()
+            if mode in _PUBLIC_MODES:
+                connector = self._relay_status() if mode == 'relay' else self._connector_status()[0]
                 if connector.get('error_code'):
                     raise MobileBridgeError(connector['error_code'])
                 if connector['state'] != 'installed':
@@ -1005,7 +1098,6 @@ class MobileBridgeManager(object):
                 raise MobileBridgeError('START_CANCELLED')
             if not _owner_matches(self.kimi_home, host, port, inst, creation):
                 raise MobileBridgeError('OWNER_LOST')
-            # 与 stop 同锁：只有显式、仍有效的 start 才允许补建凭据。
             with self._lock:
                 if not self.generation_valid(generation, starting=True):
                     raise MobileBridgeError('START_CANCELLED')
@@ -1048,22 +1140,30 @@ class MobileBridgeManager(object):
                 self._watch_thread = threading.Thread(
                     target=self._watch_owner, args=(generation,), daemon=True)
                 self._watch_thread.start()
-            if mode == 'internet':
+            if mode in _PUBLIC_MODES:
                 with self._connector_lock:
                     if not self.generation_valid(generation, starting=True):
                         raise MobileBridgeError('START_CANCELLED')
-                    self._connector.start(
-                        bound_port, lambda origin: self._tunnel_ready(generation, origin),
-                        lambda code: self._tunnel_failed(generation, code))
+                    failure = lambda code: self._tunnel_failed(generation, code)
+                    if mode == 'relay':
+                        self._relay.start(bound_port, config,
+                            lambda origin: self._relay_ready(generation, expected_origin, origin),
+                            failure)
+                        config = None
+                    else:
+                        self._connector.start(bound_port,
+                            lambda origin: self._tunnel_ready(generation, origin), failure)
             return self.status()
         except Exception as exc:
             if httpd is not None and not published:
                 httpd.server_close()
             code = str(exc) if str(exc) in _MOBILE_ERROR_CODES else 'TUNNEL_START_FAILED'
             self._stop_generation(generation, code)
-            if isinstance(exc, MobileBridgeError):
+            if isinstance(exc, MobileBridgeError) and mode != 'relay':
                 raise
-            raise MobileBridgeError(code)
+            raise MobileBridgeError(code) from None
+        finally:
+            config = None
 
     def _tunnel_ready(self, generation, origin):
         if (not isinstance(origin, str)
@@ -1082,8 +1182,28 @@ class MobileBridgeManager(object):
             self._state = 'on'
             self._issue_pair_token_locked()
 
+    def _relay_ready(self, generation, expected_origin, origin):
+        with self._lock:
+            if (not self.generation_valid(generation, starting=True)
+                    or self._state != 'starting' or self._mode != 'relay'):
+                return
+        if not isinstance(origin, str) or origin != expected_origin:
+            self._tunnel_failed(generation, 'TUNNEL_START_FAILED')
+            return
+        if not self._owner_still_mine(generation):
+            self._tunnel_failed(generation, 'OWNER_LOST')
+            return
+        with self._lock:
+            if (not self.generation_valid(generation, starting=True)
+                    or self._state != 'starting' or self._mode != 'relay'):
+                return
+            self._public_origin = origin
+            self._tunnel = {'state': 'ready'}
+            self._state = 'on'
+            self._issue_pair_token_locked()
+
     def _tunnel_failed(self, generation, code):
-        code = code if code in _MOBILE_ERROR_CODES else 'TUNNEL_START_FAILED'
+        code = code if isinstance(code, str) and code in _MOBILE_ERROR_CODES else 'TUNNEL_START_FAILED'
         self._stop_generation(generation, code)
 
     def stop(self):
@@ -1097,8 +1217,12 @@ class MobileBridgeManager(object):
         self.begin_shutdown()
         self.stop()
         with self._connector_lock:
-            if self._connector is not None:
-                self._connector.shutdown()
+            for runtime in (self._connector, self._relay):
+                if runtime is not None:
+                    try:
+                        runtime.shutdown()
+                    except Exception:
+                        pass
 
     def _stop_generation(self, expected, error_code=None):
         with self._lock:
@@ -1130,11 +1254,12 @@ class MobileBridgeManager(object):
             except Exception:
                 pass
         with self._connector_lock:
-            if self._connector is not None:
-                try:
-                    self._connector.stop()
-                except Exception:
-                    pass
+            for runtime in (self._connector, self._relay):
+                if runtime is not None:
+                    try:
+                        runtime.stop()
+                    except Exception:
+                        pass
         if httpd is not None:
             try:
                 httpd.shutdown()
@@ -1208,7 +1333,7 @@ class MobileBridgeManager(object):
                 best = tok
         if best is None:
             return None
-        origin = (self._public_origin if self._mode == 'internet'
+        origin = (self._public_origin if self._mode in _PUBLIC_MODES
                   else 'http://%s:%d' % (self._address, self._port))
         return origin + '/mobile/pair#pair=' + best
 
@@ -1420,18 +1545,17 @@ class MobileBridgeManager(object):
         with self._lock:
             if not self.generation_valid(generation):
                 return None
-            if self._mode == 'internet':
+            if self._mode in _PUBLIC_MODES:
                 if self._tunnel['state'] != 'ready' or not self._public_origin:
                     return None
                 return self._mode, self._public_origin
             return self._mode, 'http://%s:%d' % (self._address, self._port)
 
     def internet_rate_ok(self, generation, ip, sid=None):
-        """匿名 'global'+'ip:'(20/1)；sid 经 session_valid 确认后改用
-        'paired:global'(600/30)+'sid:'+sid(120/8)，伪造 sid 只落匿名桶。
-        bucket 值 = (tokens,last,burst,rate)；global 两键不参与逐出。"""
+        """公网匿名聚合桶，CF 另按 IP 分桶；已配对会话使用独立全局与 SID 桶。
+        relay 不信任转发头，无法获知真实 IP；伪造 SID 仍只落匿名聚合桶。"""
         with self._lock:
-            if not self.generation_valid(generation) or self._mode != 'internet':
+            if not self.generation_valid(generation) or self._mode not in _PUBLIC_MODES:
                 return False
             if sid is not None and self.session_valid(sid, generation):
                 keys = (('paired:global', PAIRED_GLOBAL_RATE_BURST,
@@ -1439,8 +1563,9 @@ class MobileBridgeManager(object):
                         ('sid:' + sid, PAIRED_SID_RATE_BURST,
                          PAIRED_SID_RATE_PER_SECOND))
             else:
-                keys = (('global', INTERNET_RATE_BURST, INTERNET_RATE_PER_SECOND),
-                        ('ip:' + ip, INTERNET_RATE_BURST, INTERNET_RATE_PER_SECOND))
+                keys = (('global', INTERNET_RATE_BURST, INTERNET_RATE_PER_SECOND),)
+                if self._mode == 'internet':
+                    keys += (('ip:' + ip, INTERNET_RATE_BURST, INTERNET_RATE_PER_SECOND),)
             now = time.monotonic()
             for key, burst, rate in keys:
                 if key not in self._rate_buckets:
@@ -1545,20 +1670,11 @@ class MobileBridgeManager(object):
                 self._control_json(handler, origin, self.status())
             elif method == 'POST' and path == CONTROL_PREFIX + '/connector/install':
                 body = self._control_body(handler)
-                if set(body) - {'consent', 'consent_version'}:
-                    raise MobileBridgeError('请求参数不被允许')
-                self._control_json(handler, origin, self.install_connector(
-                    body.get('consent'), body.get('consent_version')))
+                self._control_json(handler, origin, self.install_connector(*_install_body_params(body)))
             elif method == 'POST' and path == CONTROL_PREFIX + '/start':
                 body = self._control_body(handler)
-                mode = body.get('mode', 'lan')
-                allowed = ({'owner_origin', 'mode', 'relay_consent', 'consent_version'}
-                           if mode == 'internet' else {'owner_origin', 'mode', 'address'})
-                if set(body) - allowed:
-                    raise MobileBridgeError('请求参数不被允许')
-                self._control_json(handler, origin, self.start(
-                    body.get('owner_origin'), body.get('address'), mode,
-                    body.get('relay_consent', False), body.get('consent_version')))
+                self._control_json(handler, origin, self.start(*_start_body_params(body)))
+                body = None
             elif method == 'POST' and path == CONTROL_PREFIX + '/stop':
                 if self._control_body(handler):
                     raise MobileBridgeError('请求参数不被允许')
@@ -1586,7 +1702,7 @@ class MobileBridgeManager(object):
         if not cls or not _is_strict_digits(cls[0]):
             raise MobileBridgeError('请求头不合法')
         n = int(cls[0])
-        if n > CONTROL_MAX_BODY:
+        if n > RELAY_CONTROL_MAX_BODY:
             raise MobileBridgeError('请求体过大')
         if n == 0:
             return {}
@@ -1597,11 +1713,14 @@ class MobileBridgeManager(object):
         finally:
             handler._mb_body_done = True
         try:
-            body = json.loads(raw.decode('utf-8'))
+            body = json.loads(raw.decode('utf-8'), object_pairs_hook=_json_no_dup_object)
         except Exception:
             raise MobileBridgeError('请求体不是合法 JSON')
         if not isinstance(body, dict):
             raise MobileBridgeError('请求体格式错误')
+        if n > CONTROL_MAX_BODY and (body.get('mode') != 'relay'
+                                     or handler.path != CONTROL_PREFIX + '/start'):
+            raise MobileBridgeError('请求体过大')
         return body
 
     def _send(self, handler, code, body, ctype='application/json; charset=utf-8'):
@@ -1918,7 +2037,7 @@ class _LanHandler(BaseHTTPRequestHandler):
             self._err(503, '手机连接尚未就绪或已停止')
             return False
         mode, expected_origin = context
-        self._internet = mode == 'internet'
+        self._secure_cookie = mode == 'internet'
         self._client_ip = self.client_address[0]
         # HTTP 只解析头部；这两种邮件正文完整性标记不代表 HTTP 头非法。
         if any(type(d) not in (StartBoundaryNotFoundDefect, MultipartInvariantViolationDefect)
@@ -1944,20 +2063,28 @@ class _LanHandler(BaseHTTPRequestHandler):
         if host_hdr != expected_origin.split('://', 1)[1]:
             self._err(403, 'Host 不被允许')
             return False
-        if self._internet:
+        if mode in _PUBLIC_MODES:
             if not _is_loopback_ip(self.client_address[0]):
                 self._err(403, '请求来源不被允许')
                 return False
-            cf_ip = self.headers.get('CF-Connecting-IP')
-            if cf_ip is not None:
-                try:
-                    normalized = str(ipaddress.ip_address(cf_ip))
-                    if '%' in cf_ip or cf_ip != normalized:
-                        raise ValueError()
-                except ValueError:
+            if mode == 'relay':
+                if any(name.lower().startswith(('cf-', 'x-forwarded-'))
+                       or name.lower() in ('forwarded', 'x-real-ip')
+                       for name in self.headers.keys()):
                     self._err(400, '请求头不合法')
                     return False
-                self._client_ip = normalized
+                self._client_ip = 'relay'
+            else:
+                cf_ip = self.headers.get('CF-Connecting-IP')
+                if cf_ip is not None:
+                    try:
+                        normalized = str(ipaddress.ip_address(cf_ip))
+                        if '%' in cf_ip or cf_ip != normalized:
+                            raise ValueError()
+                    except ValueError:
+                        self._err(400, '请求头不合法')
+                        return False
+                    self._client_ip = normalized
             if not self.mgr.internet_rate_ok(self._generation, self._client_ip,
                                              self._session_sid()):
                 self._err(429, '尝试过于频繁，请稍后再试')
@@ -2063,7 +2190,7 @@ class _LanHandler(BaseHTTPRequestHandler):
         self.send_header('Set-Cookie',
                          '%s=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d%s'
                          % (SESSION_COOKIE, sid, SESSION_MAX_AGE_SECONDS,
-                            '; Secure' if self._internet else ''))
+                            '; Secure' if self._secure_cookie else ''))
         self.send_header('X-Content-Type-Options', 'nosniff')
         self._end_headers()
         self.wfile.write(payload)
@@ -2962,7 +3089,7 @@ p{line-height:1.7;color:#a8a8b3;font-size:.9em}
 <h1>Kimi Code 手机配对</h1>
 <p id="msg">正在配对…</p>
 <p style="font-size:.78em">配对后这台手机可通过 Kimi Code 操作本机会话（含文件与命令权限）。
-仅在自己的可信设备上配对；外网模式经 Cloudflare 中继，局域网模式仅用于可信网络。
+仅在自己的可信设备上配对；Cloudflare 外网模式经其 HTTPS 中继，frp 中继的手机侧为明文 HTTP，局域网模式仅用于可信网络。
 二维码/链接等同授权凭证，不要分享给他人。</p>
 </div>
 <script>

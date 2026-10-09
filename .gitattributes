@@ -1,2 +1,3 @@
 *.cmd -text
 assets/vendor/cloudflared-2026.9.3-LICENSE -text
+assets/vendor/frp-*-LICENSE -text whitespace=-blank-at-eof

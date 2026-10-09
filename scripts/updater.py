@@ -41,6 +41,7 @@ LOCAL_ONLY_KEEP = frozenset((
     'assets/kimi-remote-widget-live.css',
     'scripts/mobile_bridge.py',
     'scripts/mobile_tunnel.py',
+    'scripts/mobile_relay.py',
     'scripts/mobile_usage.py',
     'scripts/mobile_worker.py',
     'scripts/mobile_credentials.py',
@@ -62,11 +63,13 @@ PACKAGE_REQUIRED = frozenset((
 MOBILE_RUNTIME_GROUP = frozenset((
     'scripts/mobile_bridge.py',
     'scripts/mobile_tunnel.py',
+    'scripts/mobile_relay.py',
     'scripts/mobile_usage.py',
     'scripts/mobile_worker.py',
     'scripts/mobile_credentials.py',
     'scripts/mobile_security.py',
     'assets/kimi-mobile-api.js',
+    'assets/vendor/frp-0.67.0-LICENSE',
 ))
 # 退出码：3 = 旧服务未退出，4 = 更新包损坏/应用失败，5 = 本地预览自保护，6 = 更新包不完整
 GUARD_LOCAL_PREVIEW = 5

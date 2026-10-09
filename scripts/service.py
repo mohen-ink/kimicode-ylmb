@@ -1493,7 +1493,7 @@ _MOBILE_ERROR_CODES = frozenset((
     'CONNECTOR_UNSUPPORTED', 'CONNECTOR_BUSY', 'CONSENT_REQUIRED',
     'TUNNEL_START_FAILED', 'TUNNEL_TIMEOUT', 'TUNNEL_EXITED', 'OWNER_LOST',
     'START_CANCELLED', 'SERVER_TOKEN_UNAVAILABLE', 'OWNER_AUTH_FAILED',
-    'OWNER_AUTH_CHECK_FAILED',
+    'OWNER_AUTH_CHECK_FAILED', 'RELAY_CONFIG_INVALID',
     # mobile_worker spawn/ensure 阶段码（与 mobile_bridge._MOBILE_ERROR_CODES
     # 同集合）：只透出固定码，不含 stage/stderr/路径/secret 等诊断细节。
     'WORKER_STATE_DIR_UNAVAILABLE', 'WORKER_STARTUP_BUSY', 'WORKER_LOCK_HELD',
@@ -1577,7 +1577,8 @@ def _mobile_read_body(handler):
     """控制面小 JSON：CL 已在外层校验为单值纯数字；这里有界读取。"""
     cls = handler.headers.get_all('Content-Length') or []
     n = int(cls[0]) if cls else 0
-    if n > _MOBILE_MAX_BODY:
+    from mobile_bridge import RELAY_CONTROL_MAX_BODY
+    if n > RELAY_CONTROL_MAX_BODY:
         raise ValueError('请求体过大')
     if n == 0:
         return {}
@@ -1589,11 +1590,15 @@ def _mobile_read_body(handler):
     if len(raw) != n:
         raise ValueError('请求体不完整')
     try:
-        body = json.loads(raw.decode('utf-8'))
+        from mobile_bridge import _json_no_dup_object
+        body = json.loads(raw.decode('utf-8'), object_pairs_hook=_json_no_dup_object)
     except Exception:
         raise ValueError('请求体不是合法 JSON')
     if not isinstance(body, dict):
         raise ValueError('请求体格式错误')
+    if n > _MOBILE_MAX_BODY and (body.get('mode') != 'relay'
+                                or handler.path != _MOBILE_PREFIX + '/start'):
+        raise ValueError('请求体过大')
     return body
 
 
@@ -1681,21 +1686,13 @@ def _mobile_dispatch(handler):
             _mobile_send(handler, 200, mgr.status(), origin)
         elif method == 'POST' and path == _MOBILE_PREFIX + '/connector/install':
             body = _mobile_read_body(handler)
-            if set(body) - {'consent', 'consent_version'}:
-                raise ValueError('请求参数不被允许')
-            _mobile_send(handler, 200, mgr.install_connector(
-                body.get('consent'), body.get('consent_version')), origin)
+            from mobile_bridge import _install_body_params
+            _mobile_send(handler, 200, mgr.install_connector(*_install_body_params(body)), origin)
         elif method == 'POST' and path == _MOBILE_PREFIX + '/start':
             body = _mobile_read_body(handler)
-            mode = body.get('mode', 'lan')
-            allowed = ({'owner_origin', 'mode', 'relay_consent', 'consent_version'}
-                       if mode == 'internet' else {'owner_origin', 'mode', 'address'})
-            if set(body) - allowed:
-                raise ValueError('请求参数不被允许')
-            _mobile_send(handler, 200, mgr.start(
-                body.get('owner_origin'), body.get('address'), mode,
-                body.get('relay_consent', False), body.get('consent_version')),
-                origin)
+            from mobile_bridge import _start_body_params
+            _mobile_send(handler, 200, mgr.start(*_start_body_params(body)), origin)
+            body = None
         elif method == 'POST' and path == _MOBILE_PREFIX + '/stop':
             if _mobile_read_body(handler):
                 raise ValueError('请求参数不被允许')
@@ -1715,7 +1712,7 @@ def _mobile_dispatch(handler):
         elif type(e).__name__ == 'MobileBridgeError':
             _mobile_error(handler, origin, 400, msg[:160])
         else:
-            log('mobile control error: %r' % e)
+            log('mobile control error')
             _mobile_fail_closed(handler)
     return True
 

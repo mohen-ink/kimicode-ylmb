@@ -35,7 +35,7 @@ start 在 worker 未就绪时把该阶段的固定码（WORKER_*，白名单内�
 错误码透出；无阶段诊断的失败仍回退 TUNNEL_START_FAILED，未知阶段一律回退，
 绝不外泄 stderr/路径/secret。
 
-协议 protocol=1，版本 version=3.3.6-token-bootstrap.1。本模块只依赖 Python>=3.8 标准库。
+协议 protocol=1，版本 version=3.3.7-frp.1。本模块只依赖 Python>=3.8 标准库。
 """
 import ctypes
 import http.client
@@ -56,10 +56,12 @@ from mobile_bridge import (
     MobileBridgeError, MobileBridgeManager, _is_loopback_ip, _is_rfc1918,
     _is_strict_digits, _load_instances, _pid_alive, _pid_creation_ticks,
     _pid_is_desktop, _proc_image_name, _tcp_listener_pid,
-    _TRUSTED_APP_ORIGIN, local_lan_addresses)
+    _TRUSTED_APP_ORIGIN, local_lan_addresses, _validate_install_params,
+    _validate_start_params, _install_body_params, _start_body_params,
+    _json_no_dup_object, RELAY_CONTROL_MAX_BODY)
 
 WORKER_PROTOCOL = 1
-WORKER_VERSION = '3.3.6-token-bootstrap.1'
+WORKER_VERSION = '3.3.7-frp.1'
 WORKER_HEADER = 'X-Kimi-Mobile-Worker'
 WORKER_MAX_BODY = 8192
 SECRET_BYTES = 32
@@ -852,10 +854,18 @@ class MobileWorkerClient(object):
                 ConnectorRuntime(self.kimi_home).status())
         except Exception:
             connector = {'state': 'missing', 'version': '2026.9.3'}
+        relay_version = ''
+        try:
+            from mobile_relay import RelayRuntime, RELAY_VERSION
+            relay_version = RELAY_VERSION
+            relay_connector = MobileBridgeManager._normalize_connector_status(
+                RelayRuntime(self.kimi_home).status(), relay_version)
+        except Exception:
+            relay_connector = {'state': 'missing', 'version': relay_version}
         out = {'enabled': False, 'state': 'off', 'mode': 'lan',
                'owner_origin': '', 'device_count': 0,
-               'connector': connector, 'tunnel': {'state': 'off'},
-               'pair_state': 'missing'}
+               'connector': connector, 'relay_connector': relay_connector,
+               'tunnel': {'state': 'off'}, 'pair_state': 'missing'}
         try:
             out['addresses'] = local_lan_addresses()
         except Exception:
@@ -878,7 +888,7 @@ class MobileWorkerClient(object):
                             timeout=5.0)
         except MobileBridgeError:
             st = None
-        if not isinstance(st, dict) or st.get('state') not in ('off', 'on'):
+        if not isinstance(st, dict) or st.get('state') not in ('off', 'starting', 'on', 'stopping'):
             st = self._local_off_status()
         st['worker_notice'] = self._old_upgrade_notice(version)
         return st
@@ -913,24 +923,28 @@ class MobileWorkerClient(object):
         return 'TUNNEL_START_FAILED'
 
     def start(self, owner_origin, address=None, mode='lan', relay_consent=False,
-              consent_version=None):
-        # 参数校验先于一切副作用（含拉起 worker）：坏参数必须透出桥的中文
-        # 校验错误，绝不吞成 TUNNEL_START_FAILED。
-        if mode not in ('lan', 'internet'):
-            raise MobileBridgeError('mode 不被支持')
+              consent_version=None, relay_config=None):
+        config = _validate_start_params(owner_origin, address, mode, relay_consent,
+                                        consent_version, relay_config)
+        relay_config = None
         if mode == 'lan':
             if not isinstance(address, str) or not _is_rfc1918(address):
                 raise MobileBridgeError('请选择一个本机局域网 IPv4 地址')
             if address not in local_lan_addresses():
                 raise MobileBridgeError('所选地址不是本机网卡地址')
         body = {'owner_origin': owner_origin, 'mode': mode}
-        if mode == 'internet':
+        if mode in ('internet', 'relay'):
             body['relay_consent'] = relay_consent
             body['consent_version'] = consent_version
+            if mode == 'relay':
+                body['relay_config'] = config
         else:
             body['address'] = address
-        st = self._invoke('POST', '/api/mobile/start', body,
-                          ensure=True, timeout=90.0, write=True)
+        try:
+            st = self._invoke('POST', '/api/mobile/start', body,
+                              ensure=True, timeout=90.0, write=True)
+        finally:
+            body = config = None
         if st is None:
             if self._closing:
                 raise MobileBridgeError('START_CANCELLED')
@@ -979,9 +993,11 @@ class MobileWorkerClient(object):
             pass
         self._drop()
 
-    def install_connector(self, consent, consent_version):
+    def install_connector(self, consent, consent_version, mode='internet'):
+        _validate_install_params(consent, consent_version, mode)
         st = self._invoke('POST', '/api/mobile/connector/install',
-                          {'consent': consent, 'consent_version': consent_version},
+                          {'mode': mode, 'consent': consent,
+                           'consent_version': consent_version},
                           ensure=True, timeout=240.0, write=True)
         if st is None:
             if self._closing:
@@ -1115,7 +1131,7 @@ class _WorkerHandler(BaseHTTPRequestHandler):
         if not cls:
             raise MobileBridgeError('请求头不合法')
         n = int(cls[0])
-        if n > WORKER_MAX_BODY:
+        if n > RELAY_CONTROL_MAX_BODY:
             raise MobileBridgeError('请求体过大')
         if n == 0:
             return {}
@@ -1131,11 +1147,14 @@ class _WorkerHandler(BaseHTTPRequestHandler):
                 raise MobileBridgeError('请求体不完整')
             out.extend(chunk)
         try:
-            body = json.loads(bytes(out).decode('utf-8'))
+            body = json.loads(bytes(out).decode('utf-8'), object_pairs_hook=_json_no_dup_object)
         except Exception:
             raise MobileBridgeError('请求体不是合法 JSON')
         if not isinstance(body, dict):
             raise MobileBridgeError('请求体格式错误')
+        if n > WORKER_MAX_BODY and (body.get('mode') != 'relay'
+                                    or self.path != '/api/mobile/start'):
+            raise MobileBridgeError('请求体过大')
         return body
 
     def do_GET(self):
@@ -1165,20 +1184,11 @@ class _WorkerHandler(BaseHTTPRequestHandler):
                 self._json(self.mgr.stop())
             elif cmd == 'POST' and path == '/api/mobile/start':
                 body = self._body()
-                mode = body.get('mode', 'lan')
-                allowed = ({'owner_origin', 'mode', 'relay_consent', 'consent_version'}
-                           if mode == 'internet' else {'owner_origin', 'mode', 'address'})
-                if set(body) - allowed:
-                    raise MobileBridgeError('请求参数不被允许')
-                self._json(self.mgr.start(
-                    body.get('owner_origin'), body.get('address'), mode,
-                    body.get('relay_consent', False), body.get('consent_version')))
+                self._json(self.mgr.start(*_start_body_params(body)))
+                body = None
             elif cmd == 'POST' and path == '/api/mobile/connector/install':
                 body = self._body()
-                if set(body) - {'consent', 'consent_version'}:
-                    raise MobileBridgeError('请求参数不被允许')
-                self._json(self.mgr.install_connector(
-                    body.get('consent'), body.get('consent_version')))
+                self._json(self.mgr.install_connector(*_install_body_params(body)))
             elif cmd == 'POST' and path == '/api/mobile/pair/rotate':
                 if self._body():
                     raise MobileBridgeError('请求参数不被允许')
