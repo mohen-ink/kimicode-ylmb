@@ -1202,6 +1202,25 @@
       transition: all .15s ease;
     }
     .ku-mode-edit:hover { background: var(--color-accent, #1a88ff); color: #fff; border-color: var(--color-accent, #1a88ff); }
+    .ku-mode-lock { border: 1px solid color-mix(in srgb, var(--color-text-faint, #94a3b8) 30%, transparent);
+      background: transparent; cursor: pointer; font-size: 10.5px; font-weight: 600; padding: 2px 7px;
+      border-radius: 6px; color: var(--color-text-faint, #94a3b8); font-family: inherit; line-height: 1.5;
+      transition: all .15s ease; flex-shrink: 0; }
+    .ku-mode-lock:hover { color: var(--color-accent, #1a88ff); border-color: color-mix(in srgb, var(--color-accent, #1a88ff) 40%, transparent);
+      background: color-mix(in srgb, var(--color-accent, #1a88ff) 7%, transparent); }
+    .ku-mode-lock.on { color: var(--color-warning, #d29922); border-color: color-mix(in srgb, var(--color-warning, #d29922) 45%, transparent);
+      background: color-mix(in srgb, var(--color-warning, #d29922) 12%, transparent); }
+    .ku-mode-lock.on:hover { background: color-mix(in srgb, var(--color-warning, #d29922) 20%, transparent); }
+    .ku-mode-lock:disabled { opacity: .5; cursor: wait; }
+    .ku-mode-lock-badge { display: inline-block; font-size: 10px; color: var(--color-warning, #d29922);
+      background: color-mix(in srgb, var(--color-warning, #d29922) 12%, transparent);
+      padding: 1px 6px; border-radius: 5px; margin-left: 5px; vertical-align: 1px; font-weight: 600; }
+    .ku-host-model-locked { opacity: .45 !important; pointer-events: none !important; cursor: not-allowed !important; filter: grayscale(.4); }
+    /* 只置灰视觉、不锁事件的容器命中：包住可交互控件时用这条，绝不冻输入/发送 */
+    .ku-host-model-locked-v { opacity: .5 !important; filter: grayscale(.35); }
+    /* 命中元素若意外包住输入框，仍放行内部可编辑子元素，避免整框被冻住 */
+    .ku-host-model-locked textarea, .ku-host-model-locked input,
+    .ku-host-model-locked [contenteditable="true"] { pointer-events: auto !important; opacity: 1 !important; filter: none !important; cursor: text !important; }
     .ku-mode-range { width: 100%; margin: 8px 0 0; accent-color: var(--color-accent, #1a88ff); cursor: pointer; -webkit-appearance: none; appearance: none; height: 20px; background: transparent; }
     .ku-mode-range::-webkit-slider-runnable-track { height: 5px; border-radius: 3px; background: color-mix(in srgb, var(--color-accent, #1a88ff) 18%, color-mix(in srgb, var(--color-text,#000) 7%, transparent)); }
     .ku-mode-range::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 17px; height: 17px; margin-top: -6px; border-radius: 50%; background: var(--color-accent, #1a88ff); border: 2.5px solid var(--color-surface, #fff); box-shadow: 0 1px 6px rgba(0,0,0,.28), 0 0 0 0 color-mix(in srgb, var(--color-accent, #1a88ff) 0%, transparent); transition: transform .15s ease, box-shadow .2s ease; }
@@ -1556,6 +1575,7 @@
           <div class="ku-mode-top">
             <span class="ku-row-label">模式</span>
             <span class="ku-mode-name" id="ku-mode-name">--</span>
+            <button class="ku-mode-lock" id="ku-mode-lock" title="锁定当前档：发送框模型被固定为本档主模型，后端守护自动改回">锁定</button>
             <button class="ku-mode-edit" id="ku-mode-edit" title="自定义各档主模型与挂件">编辑</button>
           </div>
           <input type="range" class="ku-mode-range" id="ku-mode-range" min="0" max="3" step="0.02" value="0" title="拖动切换干活模式，松手生效">
@@ -2706,6 +2726,7 @@
       nameEl.textContent = (act + 1) + '/' + modes.length + ' · ' + modes[act].name;
       desc.innerHTML = kmdModeDesc(modes[act]);
     }
+    kmdRenderLock(card);
   }
 
   var kmdDragging = false;
@@ -2794,6 +2815,149 @@
       });
   }
 
+  /* ---- 档位锁定 ---- */
+  var kmdLockBusy = false;
+  var kmdHostObs = null;          // MutationObserver 盯宿主 SPA 重挂选择器
+
+  function kmdIsLocked() {
+    var l = kmdData && kmdData.locked;
+    return !!(l && l.locked);
+  }
+  function kmdLockedIndex() {
+    var l = kmdData && kmdData.locked;
+    return (l && typeof l.index === 'number') ? l.index : null;
+  }
+
+  // 尽力找宿主发送框的模型选择器并禁用。宿主是 Kimi Code 桌面端 SPA，
+  // 没有稳定 class 契约——多选择器 + MutationObserver 重挂，找不到就只挂提示。
+  function kmdHostLockApply() {
+    var locked = kmdIsLocked();
+    var hit = 0;
+    // 只锁「模型切换器」叶子控件，绝不碰输入区容器/祖先——
+    // 之前给容器加 pointer-events:none 会把里面的 textarea 也冻结，导致整框打不了字。
+    var sels = [
+      '[role="combobox"]', '[aria-haspopup="listbox"]',
+      'button[class*="model" i]', 'button[class*="selector" i]',
+      '[class*="model-select" i]', '[class*="modelSelect" i]',
+      '[class*="chat-model" i]'
+    ];
+    var cand = [];
+    sels.forEach(function(s) {
+      try { document.querySelectorAll(s).forEach(function(n) { cand.push(n); }); } catch (e) {}
+    });
+    // 兜底：文本像「模型名 · Medium/High」的叶子可点元素（不含 input/textarea 后代、
+    // 不是大容器），在底部输入区附近。
+    if (!cand.length) {
+      var pool = document.querySelectorAll('button, [role="button"], [class*="trigger" i]');
+      pool.forEach(function(n) {
+        if (n.querySelector('textarea,input,[contenteditable="true"]')) return;
+        if (n.children.length > 4) return;              // 大容器不锁，只锁叶子
+        var t = (n.textContent || '').trim();
+        if (t && t.length < 40 && /medium|high|low|xhigh|max|opus|gpt|claude|swe|mimo|kimi|deepseek/i.test(t)
+            && n.getBoundingClientRect().top > window.innerHeight * 0.5) {
+          cand.push(n);
+        }
+      });
+    }
+    cand.forEach(function(n) {
+      // 安全闸：命中元素若包住/就是输入框，跳过，绝不锁。
+      if (n.tagName === 'TEXTAREA' || n.tagName === 'INPUT'
+          || n.isContentEditable
+          || n.querySelector('textarea,input[type="text"],[contenteditable="true"]')) return;
+      // 含其它可交互控件（按钮/输入/链接）的容器只置灰视觉、不锁事件，
+      // 免得误伤同容器内的发送/附件按钮或输入框。
+      var hasInteractive = !!n.querySelector('button,input,select,a,[contenteditable="true"],textarea');
+      if (locked) {
+        if (!n.hasAttribute('data-ku-lock')) { n.setAttribute('data-ku-lock', '1'); hit++; }
+        if (hasInteractive) n.classList.add('ku-host-model-locked-v');
+        else n.classList.add('ku-host-model-locked');
+        if (n.tagName === 'BUTTON' || n.tagName === 'SELECT') n.disabled = true;
+        n.setAttribute('title', '已锁定到档位主模型，发送框不能切换（在用量卡片解锁）');
+      } else if (n.hasAttribute('data-ku-lock')) {
+        n.removeAttribute('data-ku-lock');
+        n.classList.remove('ku-host-model-locked');
+        n.classList.remove('ku-host-model-locked-v');
+        if (n.tagName === 'BUTTON' || n.tagName === 'SELECT') n.disabled = false;
+        n.removeAttribute('title');
+      }
+    });
+    return hit;
+  }
+
+  function kmdHostLockWatch() {
+    if (kmdHostObs) { kmdHostObs.disconnect(); kmdHostObs = null; }
+    if (!kmdIsLocked()) return;
+    // SPA 会重挂 DOM，观察整棵 body，命中后重设禁用
+    kmdHostObs = new MutationObserver(function() { kmdHostLockApply(); });
+    kmdHostObs.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function kmdRenderLock(card) {
+    card = card || document.getElementById(CARD_ID);
+    if (!card) return;
+    var btn = card.querySelector('#ku-mode-lock');
+    if (!btn) return;
+    var locked = kmdIsLocked();
+    var li = kmdLockedIndex();
+    btn.classList.toggle('on', locked);
+    btn.disabled = kmdLockBusy;
+    btn.innerHTML = locked ? '🔒' : '🔓';
+    btn.title = locked
+      ? ('已锁定第 ' + (li + 1) + ' 档「' + ((kmdData.modes || [])[li] || {}).name + '」：发送框模型固定，点击解锁')
+      : '锁定当前档：发送框模型被固定为本档主模型，后端守护自动改回';
+    var nameEl = card.querySelector('#ku-mode-name');
+    if (nameEl && locked) {
+      // 名字后挂锁标，但不重复加
+      if (!nameEl.querySelector('.ku-mode-lock-badge')) {
+        var b = document.createElement('span');
+        b.className = 'ku-mode-lock-badge';
+        b.textContent = '锁';
+        nameEl.appendChild(b);
+      }
+    } else if (nameEl) {
+      var old = nameEl.querySelector('.ku-mode-lock-badge');
+      if (old) old.remove();
+    }
+    var desc = card.querySelector('#ku-mode-desc');
+    if (desc && locked && !desc.querySelector('.ku-lock-note')) {
+      var n = document.createElement('div');
+      n.className = 'ku-lock-note';
+      n.style.cssText = 'color:var(--color-warning,#d29922);font-size:10px;margin-top:2px;';
+      n.textContent = '已锁定：发送框请用档位主模型（后端会自动改回偏离的切换）';
+      desc.appendChild(n);
+    } else if (desc && !locked) {
+      var on = desc.querySelector('.ku-lock-note');
+      if (on) on.remove();
+    }
+  }
+
+  function kmdToggleLock() {
+    if (kmdLockBusy || !kmdData) return;
+    var locked = kmdIsLocked();
+    var idx = locked ? null : (kmdData.active != null ? kmdData.active
+                             : (kmdData.last_applied && kmdData.last_applied.index));
+    if (!locked && (idx == null || idx < 0)) { kmmToast('先选一档再锁定', true); return; }
+    kmdLockBusy = true;
+    kmdRenderLock();
+    var call = locked ? kmdPost('/api/modes/unlock', {}) : kmdPost('/api/modes/lock', { index: idx });
+    call.then(function(d) {
+      if (d.success) {
+        if (d.data) kmdData = d.data;
+        kmmToast(d.message || (locked ? '已解锁' : '已锁定'));
+      } else {
+        kmmToast(d.message || '操作失败', true);
+      }
+    }).catch(function() { kmmToast('操作失败：后台服务未响应', true); })
+      .then(function() {
+        kmdLockBusy = false;
+        kmdRender();
+        kmdRenderLock();
+        kmdHostLockApply();
+        kmdHostLockWatch();
+      });
+  }
+
+
   function kmdBindCard(el) {
     var range = el.querySelector('#ku-mode-range');
     if (!range) return;
@@ -2814,8 +2978,9 @@
       kmdSnapTo(range, i, function() { kmdApply(i); });
     };
     el.querySelector('#ku-mode-edit').onclick = function(e) { e.stopPropagation(); kmdOpenEditor(); };
-    if (kmdData) kmdRender(el);
-    kmdFetch(true);
+    el.querySelector('#ku-mode-lock').onclick = function(e) { e.stopPropagation(); kmdToggleLock(); };
+    if (kmdData) { kmdRender(el); kmdRenderLock(el); kmdHostLockApply(); kmdHostLockWatch(); }
+    kmdFetch(true).then(function() { kmdRenderLock(); kmdHostLockApply(); kmdHostLockWatch(); });
   }
 
   function kmdEnsureOverlay() {

@@ -302,14 +302,14 @@ _PCT_RE = re.compile(r'%[0-9A-Fa-f]{2}')
 _ENCODED_SEP_RE = re.compile(r'%2f|%5c', re.IGNORECASE)
 
 
-# 手机用量入口：注入到原生 SPA index 的同源固定链接（相对路径，无外部/
-# loopback 地址，低干扰角落按钮）。href 用相对路径 'usage'——经 /t/<id>
-# 前缀的 relay 入口打开时，相对寻址自动落在该前缀下，不丢隧道归属。
+# 手机用量入口：注入到原生 SPA index 的同源「弹层」组件（按钮 + 遮罩/底部
+# sheet + 共享用量渲染脚本）。点击不跳页——在当前聊天页上就地展开/收起；
+# 标记/样式/查询全部限定在 #kuOv/#kuBox 容器内，不污染宿主 SPA。
+# 取数与跳转经 JS 端 root 前缀拼同源路径（relay 下 root=/t/<id>），不丢隧道
+# 归属。mobile_usage 缺失时降级为空（连入口按钮都没有，好过留死按钮）。
 _USAGE_ENTRY_HTML = (
-    '<a href="usage" style="position:fixed;right:12px;bottom:12px;'
-    'z-index:9999;padding:7px 14px;border-radius:999px;background:#17171d;'
-    'color:#a8a8b3;border:1px solid #33333d;font:13px system-ui,sans-serif;'
-    'text-decoration:none;opacity:.85">用量</a>').encode('utf-8')
+    _mobile_usage.USAGE_OVERLAY_HTML.encode('utf-8')
+    if _mobile_usage is not None else b'')
 
 # 局域网是明文 HTTP＝非安全上下文，浏览器不提供 crypto.randomUUID，原生前端
 # 渲染输入区时会抛错。仅在缺失时补一个基于 getRandomValues 的实现。
@@ -672,20 +672,40 @@ def _json_no_dup_object(pairs):
     return obj
 
 
+def _token_variants(token):
+    """server.token 的所有外发形态（原文 / percent / base64 / urlsafe-b64，
+    含去 '=' 变体），返回 bytes 列表供体检与脱敏共用。"""
+    if not token:
+        return []
+    tb = token.encode('utf-8')
+    return [tb,
+            quote(token).encode('ascii'),
+            quote(token, safe='').encode('ascii'),
+            base64.b64encode(tb),
+            base64.b64encode(tb).rstrip(b'='),
+            base64.urlsafe_b64encode(tb),
+            base64.urlsafe_b64encode(tb).rstrip(b'=')]
+
+
 def _contains_token(haystack, token):
     """出向泄露体检：haystack(bytes) 中是否出现 server.token 的原文、
     percent 编码或 base64 形态。"""
-    if not token:
-        return False
-    tb = token.encode('utf-8')
-    variants = [tb,
-                quote(token).encode('ascii'),
-                quote(token, safe='').encode('ascii'),
-                base64.b64encode(tb),
-                base64.b64encode(tb).rstrip(b'='),
-                base64.urlsafe_b64encode(tb),
-                base64.urlsafe_b64encode(tb).rstrip(b'=')]
-    return any(v and v in haystack for v in variants)
+    return any(v and v in haystack for v in _token_variants(token))
+
+
+# 命中 token 时的脱敏占位符：替换而非整包 502。transcript / messages 等
+# 读面会把用户自己的会话历史透给手机端，历史里可能合法含 token 原文
+# （例如 panel_url.txt 写入的 ?token= 串），那属于数据内容而非凭据外泄，
+# 整包 502 会让正常读面瘫痪；改为擦除成占位符既保不泄露又放行内容。
+_TOKEN_REDACTION = b'[redacted-token]'
+
+
+def _redact_token(haystack, token):
+    """把 haystack(bytes) 中出现的所有 token 形态替换为占位符后返回。"""
+    for v in _token_variants(token):
+        if v:
+            haystack = haystack.replace(v, _TOKEN_REDACTION)
+    return haystack
 
 
 # ---------------- connector diagnostics 白名单投影 ----------------
@@ -1937,7 +1957,9 @@ class _LanHandler(BaseHTTPRequestHandler):
             if self.command not in ('GET', 'HEAD'):
                 return self._err(404, '接口不存在')
             if not self._session_ok():
-                return self._redirect('/mobile/pair')
+                # 相对 Location：同目录换页。relay 下浏览器按 /t/<tid>/mobile/usage
+                # 解析到 /t/<tid>/mobile/pair，隧道前缀自动保留（桥看不到 tid）。
+                return self._redirect('pair')
             return self._usage_page()
         if path == '/mobile/usage/data':
             if self.command not in ('GET', 'HEAD'):
@@ -1951,7 +1973,12 @@ class _LanHandler(BaseHTTPRequestHandler):
             if path.startswith('/api/'):
                 return self._err(403, '未配对或会话已过期，请重新扫码配对')
             if self.command == 'GET' and ('.' not in path.rsplit('/', 1)[-1]):
-                return self._redirect('/mobile/pair')
+                # 相对 Location：浏览器按自身完整 URL 解析，relay 下自动保住
+                # /t/<tid> 前缀（本桥看不到 tid，用 ../ 上探到隧道根再进
+                # mobile/pair）；LAN 或前缀已丢时上探到站点根，等效原根绝对
+                # 跳转，且 cookie/Referer 兜底路由仍在。
+                ups = max(0, path.count('/') - 1)
+                return self._redirect('../' * ups + 'mobile/pair')
             return self._err(403, '未配对或会话已过期，请重新扫码配对')
         # 会话有效 + 路径合法（allowlist）才算真实活动并滑动 idle；
         # 匿名/伪造/被拒路径一律不续期。config POST 例外：touch 在
@@ -2083,12 +2110,12 @@ class _LanHandler(BaseHTTPRequestHandler):
         # 否则会看到落地页的「配对码缺失」误报。带 kimi_onboarded=1 跳过
         # 桌面登录引导（手机无需该引导；native 侧仅写 localStorage）
         # 已配对重入属真实已认证活动，滑动 idle。
-        # redirect 回站点内绝对 '/'：relay 下经 VPS 公网口单隧道兜底路由
-        # 回到本桥 SPA 根（手机地址栏本就带 /t/<id>/ 前缀，'/' 路径由 VPS
-        # 兜底转给唯一隧道）。
+        # Location 用相对路径 '../?kimi_onboarded=1'：本页浏览器路径是
+        # <root>/mobile/pair，上探一级即站点根（relay 下 root=/t/<tid>——
+        # 桥看不到 tid，相对寻址自动保留前缀；LAN 下等效原 '/' 跳转）。
         if self._session_ok():
             self.mgr.session_touch(self._session_sid(), self._generation)
-            return self._redirect('/?kimi_onboarded=1')
+            return self._redirect('../?kimi_onboarded=1')
         ip = self._client_ip
         if not self.mgr._exchange_rate_ok(ip):
             return self._err(429, '尝试过于频繁，请稍后再试')
@@ -2157,8 +2184,7 @@ class _LanHandler(BaseHTTPRequestHandler):
         self.mgr.session_touch(self._session_sid(), self._generation)
         body = _mobile_usage.USAGE_PAGE_HTML.encode('utf-8')
         token = self.mgr.inject_token(self._generation)
-        if _contains_token(body, token):
-            return self._err(500, '代理内部错误')
+        body = _redact_token(body, token)
         self._send_raw(200, body, 'text/html; charset=utf-8', extra_headers=[
             ('Content-Security-Policy', self._USAGE_CSP),
             ('Referrer-Policy', 'no-referrer')])
@@ -2174,8 +2200,7 @@ class _LanHandler(BaseHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False,
                           allow_nan=False).encode('utf-8')
         token = self.mgr.inject_token(self._generation)
-        if _contains_token(body, token):
-            return self._err(502, '上游响应不被允许')
+        body = _redact_token(body, token)
         # 数据接口成功响应才计真实已认证活动（失败/被拒不滑动静默 idle）
         self.mgr.session_touch(self._session_sid(), self._generation)
         self._send_raw(200, body, 'application/json; charset=utf-8')
@@ -2497,12 +2522,13 @@ class _LanHandler(BaseHTTPRequestHandler):
                             data += _USAGE_ENTRY_HTML
                 except Exception:
                     pass
-            # 出向体检：响应体/响应头中不得出现真实 server.token 的原文、
-            # percent 编码或 base64 形态——命中即通用 502，不回显 token
-            if _contains_token(data, token) or any(
-                    _contains_token(v.encode('latin-1', 'replace'), token)
-                    for _, v in rh):
-                return self._err(502, '上游响应不被允许')
+            # 出向体检：响应体/响应头中若出现真实 server.token 的原文、
+            # percent 编码或 base64 形态，做脱敏替换而非整包 502——transcript
+            # 等读面会把含 token 的会话历史透给手机端，属数据内容非凭据外泄。
+            data = _redact_token(data, token)
+            rh = [(k, _redact_token(v.encode('latin-1', 'replace'),
+                                   token).decode('latin-1'))
+                  for k, v in rh]
             try:
                 response_json = json.loads(data)
             except (ValueError, TypeError):
@@ -2511,8 +2537,8 @@ class _LanHandler(BaseHTTPRequestHandler):
                 normalized = json.dumps(response_json, ensure_ascii=False).encode('utf-8')
                 if len(normalized) > PROXY_MAX_RESPONSE_BODY:
                     return self._err(502, '响应过大')
-            if _contains_token(normalized, token):
-                return self._err(502, '上游响应不被允许')
+            # 规范化重编码可能把 token 变成新的转义形态，再擦一遍兜底
+            normalized = _redact_token(normalized, token)
             if not self.mgr.authorization_valid(self._generation, snapshot, sid):
                 return
             self._send_status(resp.status)

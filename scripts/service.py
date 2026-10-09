@@ -1464,7 +1464,10 @@ def load_modes(data=None):
         if not isinstance(d, dict):
             d = {}
     except Exception:
-        d = {}
+        # 文件整体坏（如尾部某字段双重转义写花）时，尽量从文本里抠出 modes
+        # 数组保住用户档位，而不是整档回退默认——之前就是 previous_snapshot
+        # 损坏让 load_modes 静默换回 DEFAULT_MODES，用户配的挂件「丢了一个」。
+        d = _salvage_modes_file()
     modes = d.get('modes')
     if not isinstance(modes, list) or not (MODES_MIN <= len(modes) <= MODES_MAX):
         d['modes'] = json.loads(json.dumps(DEFAULT_MODES))
@@ -1475,6 +1478,58 @@ def load_modes(data=None):
     if not isinstance(d.get('pool_hints'), dict):
         d['pool_hints'] = {}
     return d
+
+
+def _salvage_modes_file():
+    """modes.json 解析失败时的兜底：从原始文本里抠出 "modes" 数组段单独
+    json.loads，保住档位/mode 配置；抠不出才返回 {}（外层回退默认）。
+    顺带把坏文件备份成 modes.json.corrupt-<ts> 便于排查。"""
+    try:
+        with open(MODES_PATH, encoding='utf-8', errors='replace') as f:
+            raw = f.read()
+    except Exception:
+        return {}
+    try:
+        import shutil
+        shutil.copyfile(MODES_PATH,
+                        MODES_PATH + '.corrupt-' +
+                        datetime.now().strftime('%Y%m%d%H%M%S'))
+    except Exception:
+        pass
+    i = raw.find('"modes"')
+    if i < 0:
+        return {}
+    j = raw.find('[', i)
+    if j < 0:
+        return {}
+    # 从 '[' 起配平找数组终点（modes 元素是对象，字符串里不会有裸括号）
+    depth, k, in_str, esc = 0, j, False, False
+    while k < len(raw):
+        c = raw[k]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == '\\':
+                esc = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == '[':
+                depth += 1
+            elif c == ']':
+                depth -= 1
+                if depth == 0:
+                    break
+        k += 1
+    try:
+        modes = json.loads(raw[j:k + 1])
+    except Exception:
+        return {}
+    if not isinstance(modes, list):
+        return {}
+    return {'modes': modes}
 
 
 def save_modes(d):
@@ -1648,6 +1703,7 @@ def get_modes_data():
     disabled = ((data.get('tools') or {}).get('disabled')) or []
     return {'modes': d['modes'], 'active': detect_active_mode(d['modes'], data),
             'last_applied': d.get('last_applied'),
+            'locked': d.get('locked') or {'locked': False},
             'has_snapshot': bool(d.get('previous_snapshot')),
             'current': {'default_model': data.get('default_model', ''),
                         'secondary_default': sec.get('default_model', ''),
@@ -1828,26 +1884,140 @@ def _apply_session_live(mode, old_data):
     if not items:
         notes.append('无活动会话，发送框将在新会话自动应用')
     else:
-        active = items[0]
-        sid = active.get('id')
-        models = _api_data(_api_json('GET', base + '/api/v1/models', token) or {}).get('items') or []
-        mid = mode['main']
-        # 发送框要 daemon 的 provider/model id，config 里可能存的是 alias
-        mi = next((m for m in models if m.get('model') == mid or m.get('id') == mid), None)
-        if mi is None:
-            mi = next((m for m in models if (m.get('model') or '').endswith('/' + mid.split('/')[-1])), None)
-        if mi is None:
-            notes.append('发送框模型 %s 不在 daemon 模型表（未切换）' % mid)
-        else:
-            send_id = mi.get('id') or mi.get('model')
-            thinking = _thinking_for_model(mi, mode.get('effort') or '')
-            body = {'agent_config': {'model': send_id, 'thinking': thinking}}
-            r = _api_json('POST', base + '/api/v1/sessions/%s/profile' % sid, token, body)
-            if r is None:
-                notes.append('会话模型未即时切换（/reload 或手动选档）')
-            else:
-                notes.append('发送框模型已同步为 %s' % (mi.get('display_name') or send_id))
+        sid = items[0].get('id')
+        ok, note = _session_set_model(base, token, sid, mode)
+        notes.append(note)
     return '；'.join(notes)
+
+
+def _session_set_model(base, token, sid, mode):
+    """把活动会话的 agent_config.model 改成 mode['main'] 对应的 daemon 模型 id。
+    返回 (是否成功, 提示文本)。供 apply 和锁定守护共用。"""
+    models = _api_data(_api_json('GET', base + '/api/v1/models', token) or {}).get('items') or []
+    mid = mode['main']
+    # 发送框要 daemon 的 provider/model id，config 里可能存的是 alias
+    mi = next((m for m in models if m.get('model') == mid or m.get('id') == mid), None)
+    if mi is None:
+        mi = next((m for m in models if (m.get('model') or '').endswith('/' + mid.split('/')[-1])), None)
+    if mi is None:
+        return False, '发送框模型 %s 不在 daemon 模型表（未切换）' % mid
+    send_id = mi.get('id') or mi.get('model')
+    thinking = _thinking_for_model(mi, mode.get('effort') or '')
+    body = {'agent_config': {'model': send_id, 'thinking': thinking}}
+    r = _api_json('POST', base + '/api/v1/sessions/%s/profile' % sid, token, body)
+    if r is None:
+        return False, '会话模型未即时切换（/reload 或手动选档）'
+    return True, '发送框模型已同步为 %s' % (mi.get('display_name') or send_id)
+
+
+# ---------------- 模式锁定 ----------------
+# 锁定 = 切到指定档位 + 守护线程盯活动会话，凡是把会话模型改成档位主模型
+# 之外的操作都被改回。挂件仍按档位下发（secondary_model 已在 apply 时写入）。
+_LOCK_STATE = threading.Lock()
+_LOCK_THREAD = [None]          # 正在跑的守护线程
+_LOCK_STOP = threading.Event() # 守护退出信号
+_LOCK_GEN = [0]                # 守护代数，防止旧线程写新档
+
+
+def _lock_daemon_target():
+    """取当前活动会话 id + 该会话现在的 model；供守护比对。"""
+    base = _server_endpoint()
+    token = _server_token()
+    if not base or not token:
+        return None, None, None
+    sess = _api_data(_api_json('GET', base + '/api/v1/sessions?page_size=1&sort=updated_desc', token) or {})
+    items = sess.get('items') or []
+    if not items:
+        return base, token, None
+    return base, token, items[0]
+
+
+def _locked_main_id(base, token, main_alias):
+    """把档位 main 别名解析成 daemon 认识的 model id；解析不到返回 None。"""
+    models = _api_data(_api_json('GET', base + '/api/v1/models', token) or {}).get('items') or []
+    mi = next((m for m in models if m.get('model') == main_alias or m.get('id') == main_alias), None)
+    if mi is None:
+        mi = next((m for m in models if (m.get('model') or '').endswith('/' + main_alias.split('/')[-1])), None)
+    return (mi.get('id') or mi.get('model')) if mi else None
+
+
+def _lock_guard(gen):
+    """每 ~1.5s 检查活动会话模型；偏离锁定档位主模型就改回。
+    daemon 失联/无活动会话就静默重试；收到 _LOCK_STOP 或代数变了就退出。"""
+    while not _LOCK_STOP.is_set() and _LOCK_GEN[0] == gen:
+        time.sleep(1.5)
+        if _LOCK_STOP.is_set() or _LOCK_GEN[0] != gen:
+            break
+        try:
+            d = load_modes()
+            locked = d.get('locked')
+            if not (isinstance(locked, dict) and locked.get('locked')):
+                break                       # 已被解锁
+            modes = d.get('modes') or []
+            li = locked.get('index', -1)
+            if not (0 <= li < len(modes)):
+                continue                    # 锁定档位已被编辑删掉，继续守到用户解锁
+            mode = modes[li]
+            base, token, active = _lock_daemon_target()
+            if not base or not active:
+                continue                    # daemon 没起 / 无会话，下轮再看
+            sid = active.get('id')
+            cur = ((active.get('agent_config') or {}).get('model') or '')
+            want_id = _locked_main_id(base, token, mode['main'])
+            if not want_id or cur == want_id:
+                continue
+            # 活动会话被改成了别的模型 → 改回档位主模型
+            ok, _ = _session_set_model(base, token, sid, mode)
+            if ok:
+                log('mode-lock: session %s model %s -> %s' % (sid, cur, mode['main']))
+        except Exception:
+            pass                            # 静默重试，守护不能崩
+
+
+def _start_lock_guard():
+    """启动（或重启）守护线程；幂等。"""
+    with _LOCK_STATE:
+        _LOCK_GEN[0] += 1
+        _LOCK_STOP.set()                     # 先让旧线程退出
+        _LOCK_STOP.clear()                   # 再为新线程清信号（旧线程读的是自己那代 gen，不受影响）
+        t = threading.Thread(target=_lock_guard, args=(_LOCK_GEN[0],), daemon=True)
+        _LOCK_THREAD[0] = t
+        t.start()
+
+
+def _stop_lock_guard():
+    with _LOCK_STATE:
+        _LOCK_GEN[0] += 1
+        _LOCK_STOP.set()
+        _LOCK_THREAD[0] = None
+
+
+def lock_mode(index):
+    """锁到第 index 档：apply + 记 locked + 起守护。"""
+    ok, msg = apply_mode(index)
+    if not ok:
+        return False, msg
+    d = load_modes()
+    d['locked'] = {'locked': True, 'index': index,
+                   'name': (d['modes'][index] or {}).get('name', ''),
+                   'main': (d['modes'][index] or {}).get('main', ''),
+                   'subagents': list((d['modes'][index] or {}).get('subagents') or []),
+                   'effort': (d['modes'][index] or {}).get('effort', ''),
+                   'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    save_modes(d)
+    _start_lock_guard()
+    return True, '%s；已锁定' % msg
+
+
+def unlock_mode():
+    """解锁：停守护 + 清 locked；不改当前模型。"""
+    d = load_modes()
+    was = d.get('locked')
+    d.pop('locked', None)
+    save_modes(d)
+    _stop_lock_guard()
+    name = (was or {}).get('name', '') if isinstance(was, dict) else ''
+    return True, '已解锁%s' % (('（原档：%s）' % name) if name else '')
 
 
 def restore_mode_snapshot():
@@ -1877,6 +2047,9 @@ def restore_mode_snapshot():
     d.pop('previous_snapshot', None)
     d['tools_owned'] = False
     d['last_applied'] = None
+    # 恢复快照时清锁：锁定已失去参照档位，守护若继续跑会把会话又改回锁档主模型
+    if d.pop('locked', None):
+        _stop_lock_guard()
     save_modes(d)
     return True, '已恢复到使用滑杆之前的配置（%s 的快照），会话内 /reload 生效' % snap.get('time', '')
 
@@ -2731,7 +2904,26 @@ class Handler(BaseHTTPRequestHandler):
                 idx = req.get('index')
                 if isinstance(idx, bool) or not isinstance(idx, int):
                     return self._json({'success': False, 'message': 'index 必须是整数'}, 400)
-                ok, msg = apply_mode(idx)
+                # 锁定时滑到别的档 = 解锁旧档 + 锁新档（locked 状态保持，档位换）
+                d0 = load_modes()
+                locked = d0.get('locked')
+                if isinstance(locked, dict) and locked.get('locked'):
+                    ok, msg = lock_mode(idx)
+                else:
+                    ok, msg = apply_mode(idx)
+                return self._json({'success': ok, 'message': msg, 'data': get_modes_data()},
+                                  200 if ok else 400)
+
+            if path == '/api/modes/lock':
+                idx = req.get('index')
+                if isinstance(idx, bool) or not isinstance(idx, int):
+                    return self._json({'success': False, 'message': 'index 必须是整数'}, 400)
+                ok, msg = lock_mode(idx)
+                return self._json({'success': ok, 'message': msg, 'data': get_modes_data()},
+                                  200 if ok else 400)
+
+            if path == '/api/modes/unlock':
+                ok, msg = unlock_mode()
                 return self._json({'success': ok, 'message': msg, 'data': get_modes_data()},
                                   200 if ok else 400)
 
@@ -3067,6 +3259,14 @@ def run_server():
     load_state()
     # 扫描由主循环 collect_once 驱动，不再另起后台线程（双线程曾并发扫文件导致重复计数）
     threading.Thread(target=_poll_official_loop, daemon=True).start()
+    # 服务重启自愈：modes.json 里还挂着锁就把守护线程拉回来
+    try:
+        _d = load_modes()
+        if isinstance(_d.get('locked'), dict) and _d['locked'].get('locked'):
+            _start_lock_guard()
+            log('mode-lock guard restored (index=%s)' % _d['locked'].get('index'))
+    except Exception:
+        pass
 
     httpd = None
     try:

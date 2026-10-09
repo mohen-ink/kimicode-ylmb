@@ -297,65 +297,71 @@ def _stale_copy(data):
     return out
 
 
-USAGE_PAGE_HTML = """<!doctype html>
-<html lang="zh"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="referrer" content="no-referrer">
-<title>Kimi Code · 手机用量</title>
-<style>
-*{box-sizing:border-box}
-body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#101014;color:#e8e8ec;margin:0;padding:12px;font-size:14px}
-h1{font-size:1.05em;font-weight:600;margin:4px 0 12px;flex:1}
-h2{font-size:.82em;color:#a8a8b3;font-weight:600;margin:0 0 6px}
-.top{display:flex;align-items:center;gap:8px}
-.back{padding:5px 12px;border-radius:999px;background:#17171d;color:#a8a8b3;border:1px solid #33333d;font-size:13px;cursor:pointer;text-decoration:none}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
-@media(min-width:560px){.grid{grid-template-columns:repeat(4,1fr)}}
-.card{background:#17171d;border:1px solid #26262e;border-radius:10px;padding:10px}
-.big{font-size:1.25em;font-weight:600;margin-top:2px}
-.sub{color:#8b8b96;font-size:.78em;margin-top:2px}
-.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #22222a;font-size:.86em}
-.row:last-child{border-bottom:none}
-.k{color:#a8a8b3}
-.bar{height:6px;background:#22222a;border-radius:3px;overflow:hidden;margin-top:6px}
-.bar>i{display:block;height:100%;background:#5b8cff;border-radius:3px}
-.st{color:#8b8b96;font-size:.76em;margin:12px 0 4px;text-align:center}
-.err{color:#ff7d6b;text-align:center;padding:12px}
-.stale{color:#e8b56b}
-.mrow{display:flex;justify-content:space-between;gap:8px;padding:5px 0;border-bottom:1px solid #22222a;font-size:.84em}
-.mrow:last-child{border-bottom:none}
-.mn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%}
-</style></head><body>
-<div class="top"><h1>Kimi Code 用量</h1><button class="back" id="backBtn">返回聊天</button></div>
-<div class="grid" id="cards"></div>
-<div class="card" style="margin-top:8px" id="quotaBox"><h2>官方配额</h2><div id="quota"></div></div>
-<div class="card" style="margin-top:8px"><h2>速率 / 缓存 / 速度</h2><div id="misc"></div></div>
-<div class="card" style="margin-top:8px"><h2>模型分布（今日）</h2><div id="models"></div></div>
-<div class="st" id="status">加载中…</div>
-<script>
-(function(){
-'use strict';
-var POLL=5000,FETCH_TIMEOUT=5500,timer=null,inflight=null;
+# ---------------- 用量 UI（整页与 SPA 弹层共用一份 CSS/标记/脚本） ----------------
+# 样式选择器与 DOM 查询都限定在容器内：同一片段既能作 /mobile/usage 整页内容，
+# 也能注入 SPA 弹层而不与宿主页面互相污染（宿主可能撞名 id/class，故统一用
+# data-ku 属性 + ku- 前缀类名做容器内查询）。
+# 取数与跳转一律经传入的 root 前缀拼同源路径：relay 下 root='/t/<tid>'
+# （保住隧道前缀，不依赖 relay 的 cookie/Referer 兜底）；LAN 下 root=''，
+# 退化为原先的根绝对路径，行为不变。
+_USAGE_CSS = """\
+#kuBox{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#e8e8ec;font-size:14px}
+#kuBox *{box-sizing:border-box}
+#kuBox h1{font-size:1.05em;font-weight:600;margin:4px 0 12px;flex:1;color:#e8e8ec}
+#kuBox h2{font-size:.82em;color:#a8a8b3;font-weight:600;margin:0 0 6px}
+#kuBox .ku-top{display:flex;align-items:center;gap:8px}
+#kuBox .ku-back{padding:5px 12px;border-radius:999px;background:#17171d;color:#a8a8b3;border:1px solid #33333d;font-size:13px;cursor:pointer;text-decoration:none}
+#kuBox .ku-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+@media(min-width:560px){#kuBox .ku-grid{grid-template-columns:repeat(4,1fr)}}
+#kuBox .ku-card{background:#17171d;border:1px solid #26262e;border-radius:10px;padding:10px;margin-top:8px}
+#kuBox .ku-grid .ku-card{margin-top:0}
+#kuBox .ku-big{font-size:1.25em;font-weight:600;margin-top:2px}
+#kuBox .ku-sub{color:#8b8b96;font-size:.78em;margin-top:2px}
+#kuBox .ku-row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #22222a;font-size:.86em}
+#kuBox .ku-row:last-child{border-bottom:none}
+#kuBox .ku-k{color:#a8a8b3}
+#kuBox .ku-bar{height:6px;background:#22222a;border-radius:3px;overflow:hidden;margin-top:6px}
+#kuBox .ku-bar>i{display:block;height:100%;background:#5b8cff;border-radius:3px}
+#kuBox .ku-st{color:#8b8b96;font-size:.76em;margin:12px 0 4px;text-align:center}
+#kuBox .ku-err{color:#ff7d6b;text-align:center;padding:12px}
+#kuBox .ku-stale{color:#e8b56b}
+#kuBox .ku-mrow{display:flex;justify-content:space-between;gap:8px;padding:5px 0;border-bottom:1px solid #22222a;font-size:.84em}
+#kuBox .ku-mrow:last-child{border-bottom:none}
+#kuBox .ku-mn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%}
+"""
+
+_USAGE_BODY = """\
+<div class="ku-grid" data-ku="cards"></div>
+<div class="ku-card" data-ku="quotaBox"><h2>官方配额</h2><div data-ku="quota"></div></div>
+<div class="ku-card"><h2>速率 / 缓存 / 速度</h2><div data-ku="misc"></div></div>
+<div class="ku-card"><h2>模型分布（今日）</h2><div data-ku="models"></div></div>
+<div class="ku-st" data-ku="status">加载中…</div>
+"""
+
+# 挂载函数：host=容器元素（内含 _USAGE_BODY 标记），root=站点根前缀（''或/t/<id>）。
+# 返回 {start,stop} 供弹层收起时暂停轮询、展开时续跑；整页场景忽略返回值。
+_USAGE_JS = """\
 function el(t,c){var e=document.createElement(t);if(c)e.className=c;return e;}
-function put(id,node){var b=document.getElementById(id);while(b.firstChild)b.removeChild(b.firstChild);if(node)b.appendChild(node);}
 function txt(s){return (typeof s==='string')?s:'';}
 function card(label,value,sub){
-  var c=el('div','card'),h=el('h2'),v=el('div','big');
+  var c=el('div','ku-card'),h=el('h2'),v=el('div','ku-big');
   h.textContent=label;v.textContent=value;c.appendChild(h);c.appendChild(v);
-  if(sub){var s=el('div','sub');s.textContent=sub;c.appendChild(s);}
+  if(sub){var s=el('div','ku-sub');s.textContent=sub;c.appendChild(s);}
   return c;}
-function row(k,v){var r=el('div','row'),a=el('span','k'),b=el('span');
+function row(k,v){var r=el('div','ku-row'),a=el('span','ku-k'),b=el('span');
   a.textContent=k;b.textContent=v;r.appendChild(a);r.appendChild(b);return r;}
 function quotaRow(name,q){
   var wrap=el('div');
   var pct=(typeof q.pct==='number'&&isFinite(q.pct))?Math.max(0,Math.min(100,q.pct)):null;
   wrap.appendChild(row(name,(q.used!=null?q.used:'?')+' / '+(q.limit!=null?q.limit:'?')+(pct!=null?'（'+pct.toFixed(1)+'%）':'')));
-  if(pct!=null){var bar=el('div','bar'),i=el('i');i.style.width=pct+'%';bar.appendChild(i);wrap.appendChild(bar);}
+  if(pct!=null){var bar=el('div','ku-bar'),i=el('i');i.style.width=pct+'%';bar.appendChild(i);wrap.appendChild(bar);}
   if(typeof q.reset==='string'&&q.reset)wrap.appendChild(row('重置',txt(q.reset)));
   if(typeof q.eta==='string'&&q.eta)wrap.appendChild(row('预计耗尽',txt(q.eta)));
   return wrap;}
-function render(d){
-  var cards=el('div');cards.className='grid';
+function render(host,d){
+  function q(k){return host.querySelector('[data-ku="'+k+'"]');}
+  function put(k,node){var b=q(k);if(!b)return;while(b.firstChild)b.removeChild(b.firstChild);if(node)b.appendChild(node);}
+  var cards=el('div');cards.className='ku-grid';
   [['今日',d.today],['本周',d.week],['本月',d.month],['累计',d.cumul]].forEach(function(p){
     var s=p[1]||{},t=s.tokens_fmt||'—',sub=[];
     if(s.cost_fmt)sub.push(s.cost_fmt);
@@ -367,7 +373,7 @@ function render(d){
   if(d.quota&&d.quota.week)qb.appendChild(quotaRow('每周',d.quota.week));
   if(d.quota&&d.quota.h5)qb.appendChild(quotaRow('5 小时',d.quota.h5));
   put('quota',qb);
-  document.getElementById('quotaBox').style.display=qb.firstChild?'':'none';
+  var quotaBox=q('quotaBox');if(quotaBox)quotaBox.style.display=qb.firstChild?'':'none';
   var misc=el('div');
   if(d.cache){if(d.cache.pct_fmt)misc.appendChild(row('缓存命中率',txt(d.cache.pct_fmt)));
     else if(typeof d.cache.pct==='number')misc.appendChild(row('缓存命中率',d.cache.pct.toFixed(1)+'%'));}
@@ -379,7 +385,7 @@ function render(d){
   put('misc',misc);
   var ms=el('div');
   (Array.isArray(d.today_models)?d.today_models:[]).slice(0,8).forEach(function(m){
-    var r=el('div','mrow'),n=el('span','mn'),v=el('span');
+    var r=el('div','ku-mrow'),n=el('span','ku-mn'),v=el('span');
     n.textContent=txt(m.model)||'(未知)';
     var bits=[];
     if(m.tokens_fmt)bits.push(m.tokens_fmt);
@@ -388,40 +394,114 @@ function render(d){
     v.textContent=bits.join(' · ');
     r.appendChild(n);r.appendChild(v);ms.appendChild(r);});
   put('models',ms);
-  var st=document.getElementById('status');
+  var st=q('status');if(!st)return;
   if(d._stale){
     st.textContent='数据为缓存，采集于 '+(d._collected_at||d.updated_at||'未知')+'（用量服务暂不可用）';
-    st.className='st stale';
+    st.className='ku-st ku-stale';
   }else{
     st.textContent='采集于 '+(d.updated_at||'未知');
-    st.className='st';}}
-function fail(t){var st=document.getElementById('status');st.textContent=t;st.className='st err';}
-function poll(){
-  if(document.hidden||inflight)return;
-  var ctrl=new AbortController();
-  inflight=ctrl;
-  var to=setTimeout(function(){ctrl.abort();},FETCH_TIMEOUT);
-  fetch('/mobile/usage/data',{headers:{'Accept':'application/json'},signal:ctrl.signal})
-    .then(function(r){
-      if(r.status===403){location.replace('/mobile/pair');return null;}
-      if(!r.ok)throw new Error('bad');
-      return r.json();})
-    .then(function(d){if(d)render(d);})
-    .catch(function(e){if(e&&e.name!=='AbortError')fail('用量数据暂时不可用');else if(e)fail('用量数据请求超时');})
-    .finally(function(){clearTimeout(to);inflight=null;});}
-function loop(){poll();timer=setTimeout(loop,POLL);}
-document.addEventListener('visibilitychange',function(){
-  if(document.hidden){
-    if(timer){clearTimeout(timer);timer=null;}
-    if(inflight){inflight.abort();inflight=null;}}
-  else if(!timer){loop();}});
-document.getElementById('backBtn').addEventListener('click',function(){
-  if(window.history.length>1)history.back();else location.replace('/');});
-loop();
+    st.className='ku-st';}}
+function kimiUsageMount(host,root){
+  var POLL=5000,FETCH_TIMEOUT=5500,timer=null,inflight=null,alive=true;
+  function q(k){return host.querySelector('[data-ku="'+k+'"]');}
+  function fail(t){var st=q('status');if(st){st.textContent=t;st.className='ku-st ku-err';}}
+  function poll(){
+    if(!alive||document.hidden||inflight)return;
+    var ctrl=new AbortController();
+    inflight=ctrl;
+    var to=setTimeout(function(){ctrl.abort();},FETCH_TIMEOUT);
+    fetch(root+'/mobile/usage/data',{headers:{'Accept':'application/json'},signal:ctrl.signal})
+      .then(function(r){
+        if(r.status===403){location.replace(root+'/mobile/pair');return null;}
+        if(!r.ok)throw new Error('bad');
+        return r.json();})
+      .then(function(d){if(d)render(host,d);})
+      .catch(function(e){if(e&&e.name!=='AbortError')fail('用量数据暂时不可用');else if(e)fail('用量数据请求超时');})
+      .finally(function(){clearTimeout(to);inflight=null;});}
+  function loop(){poll();if(alive)timer=setTimeout(loop,POLL);}
+  function onVis(){
+    if(document.hidden){
+      if(timer){clearTimeout(timer);timer=null;}
+      if(inflight){inflight.abort();inflight=null;}}
+    else if(!timer&&alive){loop();}}
+  document.addEventListener('visibilitychange',onVis);
+  loop();
+  return {
+    stop:function(){alive=false;
+      if(timer){clearTimeout(timer);timer=null;}
+      if(inflight){inflight.abort();inflight=null;}
+      document.removeEventListener('visibilitychange',onVis);},
+    start:function(){if(!alive){alive=true;document.addEventListener('visibilitychange',onVis);}
+      if(!timer&&!document.hidden)loop();}};
+}
+"""
+
+USAGE_PAGE_HTML = """<!doctype html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Kimi Code · 手机用量</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#101014;color:#e8e8ec;margin:0;padding:12px;font-size:14px}
+""" + _USAGE_CSS + """
+</style></head><body>
+<div id="kuBox"><div class="ku-top"><h1>Kimi Code 用量</h1><button class="ku-back" data-ku-back type="button">返回聊天</button></div>
+""" + _USAGE_BODY + """
+</div>
+<script>
+(function(){
+'use strict';
+""" + _USAGE_JS + """
+// 本页路径是 <root>/mobile/usage（relay 下 root=/t/<id>，否则 root=''）；
+// 剥掉末段得到 root，取数/回配对/回聊天全部按 root 前缀拼，不丢隧道归属。
+var root=location.pathname.replace(/\\/mobile\\/usage\\/?$/,'');
+kimiUsageMount(document.getElementById('kuBox'),root);
+document.querySelector('[data-ku-back]').addEventListener('click',function(){
+  if(window.history.length>1)history.back();else location.replace(root+'/');});
 })();
 </script></body></html>"""
 
 
+# SPA 弹层注入片段：入口 <button>（不再跳页）+ 遮罩/底部 sheet + 共享 UI。
+# root 从 SPA 当前 URL 的 /t/<tid> 段取（SPA 可能已丢前缀走 cookie 兜底——
+# 取不到就退回 ''，与整页同一路径规则）；sheet 内滚动，遮罩/关闭/再点按钮收起。
+USAGE_OVERLAY_HTML = """\
+<style>
+#kuOv{position:fixed;inset:0;z-index:10000}
+#kuOv[hidden]{display:none}
+#kuOv .ku-mask{position:absolute;inset:0;background:rgba(8,8,12,.6)}
+#kuOv .ku-sheet{position:absolute;left:0;right:0;bottom:0;top:6%;background:#101014;border-top:1px solid #33333d;border-radius:14px 14px 0 0;overflow-y:auto;padding:12px}
+</style>
+<style>
+""" + _USAGE_CSS + """
+</style>
+<div id="kuOv" hidden>
+<div class="ku-mask"></div>
+<div class="ku-sheet"><div id="kuBox">
+<div class="ku-top"><h1>Kimi Code 用量</h1><button class="ku-back" data-ku-back type="button">关闭</button></div>
+""" + _USAGE_BODY + """
+</div></div></div>
+<button id="kuUsageBtn" type="button" style="position:fixed;right:12px;bottom:12px;z-index:10001;padding:7px 14px;border-radius:999px;background:#17171d;color:#a8a8b3;border:1px solid #33333d;font:13px system-ui,sans-serif;opacity:.85;cursor:pointer">用量</button>
+<script>
+(function(){
+'use strict';
+""" + _USAGE_JS + """
+var m=location.pathname.match(/^(\\/t\\/[A-Za-z0-9_-]{4,32})(?=\\/|$)/);
+var root=m?m[1]:'';
+var ov=document.getElementById('kuOv'),inst=null;
+function open(){ov.hidden=false;
+  if(!inst){inst=kimiUsageMount(document.getElementById('kuBox'),root);}else{inst.start();}}
+function close(){ov.hidden=true;if(inst)inst.stop();}
+document.getElementById('kuUsageBtn').addEventListener('click',function(){
+  if(ov.hidden)open();else close();});
+ov.querySelector('.ku-mask').addEventListener('click',close);
+ov.querySelector('[data-ku-back]').addEventListener('click',close);
+})();
+</script>"""
+
+
 __all__ = ['fetch_usage', 'reset_cache', 'UsageFetchError', 'USAGE_PAGE_HTML',
+           'USAGE_OVERLAY_HTML',
            'USAGE_API_URL', 'USAGE_TIMEOUT_SECONDS', 'USAGE_TOTAL_DEADLINE',
            'USAGE_MAX_BODY', 'USAGE_CACHE_SECONDS', 'USAGE_STALE_TTL_SECONDS']
