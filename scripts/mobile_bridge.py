@@ -199,10 +199,12 @@ _API_READ_ONLY = (
     '/api/v1/auth',        # models_ready 探测，非 secret
     '/api/v1/config',      # 原生已脱敏；POST 见 _route 的 _config_post 白名单分支
 )
-# v2 只放行主侧边栏 boot 的那一条读，且必须精确匹配：
-# /api/v2/sessions/…（子资源）与 /api/v2/sessions:<action> 是 v2 重启后的
-# 归档/恢复写面，前缀放行会被顺带打开。
+# v2 只放行主侧边栏 boot 的那一条读，且必须精确匹配：前缀放行会把
+# /api/v2/sessions/…（子资源）与其它 /api/v2/sessions:<action> 一起打开。
 _V2_READ_EXACT = ('/api/v2/sessions',)
+# v2 仅放行这两条精确写动作（批量归档/恢复，桌面侧栏多选归档走这套路由）；
+# 不做前缀匹配，v2 其它写面（含 :delete 等）与子资源一律拒绝。
+_V2_WRITE_EXACT = frozenset(('/api/v2/sessions:archive', '/api/v2/sessions:restore'))
 # 非 /api/ 静态面白名单（收紧）：SPA index 与 native 客户端路由 + /assets/
 # 下的构建产物。任何其它非 API 路径都不再转发给 owner——否则等于给攻击者
 # 一个「任意路径打到本机 owner」的转发器。
@@ -259,8 +261,10 @@ _SESSION_FS_READ_ACTIONS = frozenset((
     'list', 'read', 'list_many', 'stat', 'stat_many',
     'search', 'grep', 'git_status', 'diff',
 ))
-# session 级 :action（POST /sessions/{id}:<action>）；archive/delete 本版不放行
-_SESSION_POST_ACTIONS = frozenset(('fork', 'compact', 'undo', 'abort', 'btw', 'restore'))
+# session 级 :action（POST /sessions/{id}:<action>）；archive/delete 放行
+# （delete 不可逆、archive 可 restore；均仅 POST，GET 仍走只读表）
+_SESSION_POST_ACTIONS = frozenset(('fork', 'compact', 'undo', 'abort', 'btw',
+                                   'restore', 'archive', 'delete'))
 _SESSION_PROMPT_ACTIONS = frozenset(('abort', 'steer'))
 _SESSION_QUESTION_ACTIONS = frozenset(('resolve', 'dismiss'))
 _SESSION_TASK_ACTIONS = frozenset(('cancel', 'detach'))
@@ -2266,6 +2270,8 @@ class _LanHandler(BaseHTTPRequestHandler):
             return _LanHandler._files_api_allowed(method, path)
         if path in _V2_READ_EXACT:
             return method in ('GET', 'HEAD')
+        if path in _V2_WRITE_EXACT:
+            return method == 'POST'
         for p in _API_READ_ONLY:
             if path == p or path.startswith(p + '/') or path.startswith(p + ':'):
                 return method in ('GET', 'HEAD')
@@ -2331,7 +2337,9 @@ class _LanHandler(BaseHTTPRequestHandler):
         if method != 'POST':
             return False
         if len(segs) == 2:
-            return seg1 in ('prompts', 'profile', 'children')
+            # export 仅 POST（导出是写触发动作，返回 ZIP）；GET 走上方只读表，
+            # 不在 _SESSION_GET_SEGMENTS 内故仍拒。
+            return seg1 in ('prompts', 'profile', 'children', 'export')
         if len(segs) != 3:
             return False
         tail = segs[2]

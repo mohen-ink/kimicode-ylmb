@@ -35,7 +35,7 @@ start 在 worker 未就绪时把该阶段的固定码（WORKER_*，白名单内�
 错误码透出；无阶段诊断的失败仍回退 TUNNEL_START_FAILED，未知阶段一律回退，
 绝不外泄 stderr/路径/secret。
 
-协议 protocol=1，版本 version=3.3.7-frp.1。本模块只依赖 Python>=3.8 标准库。
+协议 protocol=1，版本 version=3.3.8。本模块只依赖 Python>=3.8 标准库。
 """
 import ctypes
 import http.client
@@ -61,7 +61,7 @@ from mobile_bridge import (
     _json_no_dup_object, RELAY_CONTROL_MAX_BODY)
 
 WORKER_PROTOCOL = 1
-WORKER_VERSION = '3.3.7-frp.1'
+WORKER_VERSION = '3.3.8'
 WORKER_HEADER = 'X-Kimi-Mobile-Worker'
 WORKER_MAX_BODY = 8192
 SECRET_BYTES = 32

@@ -361,6 +361,28 @@ class RelayBridgeTests(unittest.TestCase):
         self.assertIn('subscribe', bridge._WS_ALLOWED_TYPES)
         self.assertNotIn('terminal_input', bridge._WS_ALLOWED_TYPES)
 
+    def test_session_archive_delete_export_are_allowed_but_stay_narrow(self):
+        # 放行：单会话 :action 的 archive/delete，导出的 POST 子路径，
+        # 以及 v2 精确批量归档/恢复。
+        handler = self.make_handler('POST', '/api/v1/sessions/x')
+        for path in ('/api/v1/sessions/s1:delete', '/api/v1/sessions/s1:archive',
+                     '/api/v1/sessions/s1/export',
+                     '/api/v2/sessions:archive', '/api/v2/sessions:restore'):
+            self.assertTrue(handler._api_allowed('POST', path), path)
+        # 只放 POST：归档/删除/导出都不接受其它方法。
+        for method in ('GET', 'PUT', 'DELETE', 'PATCH'):
+            for path in ('/api/v1/sessions/s1:delete', '/api/v1/sessions/s1:archive',
+                         '/api/v1/sessions/s1/export',
+                         '/api/v2/sessions:archive', '/api/v2/sessions:restore'):
+                self.assertFalse(handler._api_allowed(method, path), (method, path))
+        # 未放行的近邻路径必须仍然拒绝（含 v2 其它写面与子资源）。
+        for path in ('/api/v2/sessions', '/api/v2/sessions:delete',
+                     '/api/v2/sessions/s1:archive', '/api/v2/sessions:s1/archive',
+                     '/api/v1/sessions/s1:purge', '/api/v1/sessions/s1/export/extra',
+                     '/api/v1/providers:refresh', '/api/v1/shutdown',
+                     '/api/v1/authority', '/api/v1/fs:read'):
+            self.assertFalse(handler._api_allowed('POST', path), path)
+
 
 class RelayControlTests(unittest.TestCase):
     def setUp(self):
@@ -493,7 +515,7 @@ class RelayControlTests(unittest.TestCase):
             self.assertEqual(client.stop(), {'state': 'off'})
             self.assertEqual([item.args[3] for item in call.call_args_list],
                              ['/api/mobile/stop', '/api/mobile/internal/stop-worker'])
-        self.assertEqual(worker.WORKER_VERSION, '3.3.7-frp.1')
+        self.assertEqual(worker.WORKER_VERSION, '3.3.8')
 
     def test_local_off_status_includes_relay_install_state_without_spawn(self):
         frp, cf = mock.Mock(), mock.Mock()

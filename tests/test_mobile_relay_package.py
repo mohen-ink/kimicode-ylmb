@@ -41,7 +41,7 @@ class RelayPackageTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256((self.target / name).read_bytes()).digest(),
                              expected, name)
         manifest = json.loads((self.target / 'kimi.plugin.json').read_text(encoding='utf-8'))
-        self.assertEqual(manifest['version'], '3.3.7')
+        self.assertEqual(manifest['version'], '3.3.8')
 
     def test_missing_relay_module_rejects_before_writing(self):
         sentinel = self.target / 'sentinel'
