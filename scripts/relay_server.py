@@ -49,10 +49,16 @@ PUBLIC_PORT = 47961         # 手机公网口（http://<vps>:<PUBLIC_PORT>/t/<id
 PUBLIC_HOST_HEADER = '127.0.0.1:%d' % PUBLIC_PORT
 
 MAX_HTTP_BODY = 32 * 1024 * 1024     # 与桥 PROXY_MAX_REQUEST_BODY 对齐
-MAX_WS_MESSAGE = 4 * 1024 * 1024     # 与桥 _WS_MAX_MESSAGE 对齐
+MAX_WS_MESSAGE = 4 * 1024 * 1024     # 与桥 _WS_MAX_MESSAGE 对齐（手机侧 WS 帧上限）
+# 隧道（worker<->VPS）单帧上限。帧里是 base64 JSON，体积约为原始的 1.34 倍：
+# 桥 PROXY_MAX_RESPONSE_BODY=128MB → 约 172MB。旧版误用 MAX_WS_MESSAGE(4MB)，
+# SPA 主包 3.5MB → 隧道帧 4.7MB 超限 → 整条隧道被判违例拆掉 → 手机一连就断。
+TUNNEL_MAX_FRAME = 192 * 1024 * 1024
 HTTP_TIMEOUT = 60.0          # HTTP 请求在隧道内的等待上限
 TUNNEL_IDLE_CLOSE = 90.0     # 隧道 WS 读空闲上限（worker 有心跳）
 HEADER_MAX = 32 * 1024
+RECONNECT_WAIT = 10.0        # 隧道重连空档内，公网请求最多等它回来的秒数
+RELAY_COOKIE = 'kimi_relay_tid'   # 根路径请求的隧道归属（访问 /t/<tid>/ 时下发）
 WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 _TOK_ID_RE = frozenset('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-')
 
@@ -64,6 +70,15 @@ def _tok_ok(s, lo=1, hi=64):
 
 
 # ---------------- WebSocket 帧（RFC6455，纯标准库） ----------------
+def _xor_mask(data, mask):
+    """RFC6455 掩码：大整数一次异或，MB 级帧比逐字节生成器快两个数量级。"""
+    n = len(data)
+    if not n:
+        return b''
+    m = (bytes(mask) * (n // 4 + 1))[:n]
+    return (int.from_bytes(data, 'big') ^ int.from_bytes(m, 'big')).to_bytes(n, 'big')
+
+
 def ws_frame(opcode, payload, mask_key=None):
     """opcode: 0/1/2/8/9/10；mask_key=None 表示不掩码（服务端侧）。"""
     b0 = 0x80 | opcode
@@ -76,8 +91,7 @@ def ws_frame(opcode, payload, mask_key=None):
         head = bytes([b0, 127]) + struct.pack('>Q', ln)
     if mask_key is None:
         return head + payload
-    masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-    return head + mask_key + masked
+    return head + mask_key + _xor_mask(payload, mask_key)
 
 
 async def ws_read_frame(reader, masked_expected, max_len=MAX_WS_MESSAGE):
@@ -118,7 +132,7 @@ async def ws_read_frame(reader, masked_expected, max_len=MAX_WS_MESSAGE):
     if payload is None:
         return None
     if mask is not None:
-        payload = bytes(v ^ mask[i % 4] for i, v in enumerate(payload))
+        payload = _xor_mask(payload, mask)
     return fin, opcode, payload
 
 
@@ -294,7 +308,8 @@ async def relay_register(reader, writer, token):
         log.info('tunnel registered: %s', tid)
         # 主读循环：worker 的帧 = 响应 / ws 数据 / pong
         while True:
-            frame = await ws_read_frame(reader, masked_expected=True)
+            frame = await ws_read_frame(reader, masked_expected=True,
+                                        max_len=TUNNEL_MAX_FRAME)
             if frame is None:
                 break
             fin, opcode, payload = frame
@@ -329,7 +344,8 @@ async def relay_register(reader, writer, token):
                 continue
     finally:
         tun.alive = False
-        TUNNELS.pop(tid, None)
+        if TUNNELS.get(tid) is tun:
+            TUNNELS.pop(tid, None)
         _recent_remember(tid)   # 入墓碑：重连可 X-Relay-Resume 复用
         for fut in tun.pending.values():
             if not fut.done():
@@ -341,6 +357,46 @@ async def relay_register(reader, writer, token):
         except Exception:
             pass
         log.info('tunnel unregistered: %s', tid)
+
+
+def _root_tid(hmap):
+    """根路径请求的隧道归属：Cookie → Referer；都没有返回 ''。"""
+    for part in (hmap.get('cookie') or '').split(';'):
+        k, sep, v = part.strip().partition('=')
+        if sep and k == RELAY_COOKIE and _tok_ok(v.strip(), 4, 32):
+            return v.strip()
+    ref = hmap.get('referer') or ''
+    i = ref.find('/t/')
+    if i >= 0:
+        cand = ref[i + 3:].split('/', 1)[0].split('?', 1)[0].split('#', 1)[0]
+        if _tok_ok(cand, 4, 32):
+            return cand
+    return ''
+
+
+async def _await_tunnel(tid):
+    """取活隧道；tid 在墓碑表（worker 正在重连）时最多等 RECONNECT_WAIT 秒。"""
+    tun = TUNNELS.get(tid)
+    if tun is not None and tun.alive:
+        return tun
+    if not _recent_valid(tid):
+        return None
+    deadline = time.monotonic() + RECONNECT_WAIT
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.25)
+        tun = TUNNELS.get(tid)
+        if tun is not None and tun.alive:
+            return tun
+        if not _recent_valid(tid):
+            return None
+    return None
+
+
+async def _tunnel_missing(writer, tid):
+    if _recent_valid(tid):
+        await _http_resp(writer, 503, 'tunnel reconnecting')
+    else:
+        await _http_resp(writer, 404, 'tunnel not found')
 
 
 async def _http_resp(writer, code, text):
@@ -471,28 +527,37 @@ async def _public_conn(reader, writer):
     # /t/<tunnel_id>/<rest>
     segs = raw_path.split('/')
     tun = None
-    if len(segs) >= 3 and segs[1] == 't' and _tok_ok(segs[2], 4, 32):
-        tid = segs[2]
-        tun = TUNNELS.get(tid)
-        if tun is None or not tun.alive:
-            await _http_resp(writer, 404, 'tunnel not found')
+    set_cookie = None
+    if len(segs) >= 3 and segs[1] == 't' and _tok_ok(segs[2].split('?', 1)[0], 4, 32):
+        tid = segs[2].split('?', 1)[0]
+        tun = await _await_tunnel(tid)
+        if tun is None:
+            await _tunnel_missing(writer, tid)
             return
+        set_cookie = tid
         inner = '/' + '/'.join(segs[3:])
         inner = inner.split('?', 1)[0]
         if not inner or inner == '/':
             inner = '/'
     else:
-        # 配对页内的绝对路径（/mobile/pair、/mobile/usage、SPA 根 /、/api/...）
-        # 不带 /t/<id> 前缀：手机经中继打开后 location.pathname 从根起算，
-        # 桥/SPA 内部一律以同源绝对路径互跳。单隧道时把根路径兜底转给它；
-        # 多隧道时根路径无归属，一律 404（不猜、不泄露隧道清单）。
-        if len(TUNNELS) != 1:
-            await _http_resp(writer, 404, 'unknown tunnel')
-            return
-        tun = next(iter(TUNNELS.values()))
-        if not tun.alive:
-            await _http_resp(writer, 404, 'tunnel not found')
-            return
+        # SPA 资源 / API / WS 用的是不带 /t/<id> 前缀的根绝对路径
+        # （/assets/*、/api/v1/*、/api/v1/ws）。归属判定优先级：
+        #   Cookie kimi_relay_tid（访问 /t/<tid>/ 时下发）→ Referer 里的
+        #   /t/<tid>/ → 仅一条隧道时兜底；多隧道又无归属则 404（不猜）。
+        tid = _root_tid(hmap)
+        if tid:
+            tun = await _await_tunnel(tid)
+            if tun is None:
+                await _tunnel_missing(writer, tid)
+                return
+        else:
+            if len(TUNNELS) != 1:
+                await _http_resp(writer, 404, 'unknown tunnel')
+                return
+            tun = next(iter(TUNNELS.values()))
+            if not tun.alive:
+                await _http_resp(writer, 404, 'tunnel not found')
+                return
         inner = raw_path.split('?', 1)[0] or '/'
     # 保留 query（inner 此时是剥了前缀/未剥前缀的纯路径，query 不在其中）
     qidx = raw_path.find('?')
@@ -507,10 +572,24 @@ async def _public_conn(reader, writer):
             return
         cid = secrets.token_urlsafe(8)
         accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode('ascii')).digest())
-        writer.write((b'HTTP/1.1 101 Switching Protocols\r\n'
-                      b'Upgrade: websocket\r\n'
-                      b'Connection: Upgrade\r\n'
-                      b'Sec-WebSocket-Accept: ' + accept + b'\r\n\r\n'))
+        # 回显浏览器请求的 WS 子协议：SPA 用 'kimi-code.bearer.<凭据>' 子协议承载
+        # 登录态，而浏览器规定服务端必须在 101 响应里回显所选子协议，否则直接
+        # 判握手失败（页面报 WebSocket error，实时更新失效）。桥对该子协议只校验
+        # 'kimi-code.bearer.' 前缀，故原样回显第一个即可；没有则不发这个头。
+        proto = ''
+        for p in (hmap.get('sec-websocket-protocol') or '').split(','):
+            p = p.strip()
+            if p.startswith('kimi-code.bearer.'):
+                proto = p
+                break
+        resp = (b'HTTP/1.1 101 Switching Protocols\r\n'
+                b'Upgrade: websocket\r\n'
+                b'Connection: Upgrade\r\n'
+                b'Sec-WebSocket-Accept: ' + accept + b'\r\n')
+        if proto:
+            resp += ('Sec-WebSocket-Protocol: %s\r\n' % proto).encode('latin-1')
+        resp += b'\r\n'
+        writer.write(resp)
         try:
             await writer.drain()
         except Exception:
@@ -551,6 +630,7 @@ async def _public_conn(reader, writer):
             rest += more
         body = rest[:n]
     req_id = secrets.token_urlsafe(10)
+    t_start = time.monotonic()
     fut = asyncio.get_event_loop().create_future()
     tun.pending[req_id] = fut
     try:
@@ -564,6 +644,7 @@ async def _public_conn(reader, writer):
         try:
             resp = await asyncio.wait_for(fut, timeout=HTTP_TIMEOUT)
         except asyncio.TimeoutError:
+            log.warning('%s %s -> 504 timeout', method, inner)
             await _http_resp(writer, 504, 'upstream timeout')
             return
         status = int(resp.get('status', 502))
@@ -582,10 +663,15 @@ async def _public_conn(reader, writer):
             except Exception as e:
                 log.warning('hdr encode fail %r: %r', k, e)
                 continue
+        if set_cookie:
+            out += ('Set-Cookie: %s=%s; Path=/; HttpOnly; SameSite=Lax\r\n'
+                    % (RELAY_COOKIE, set_cookie)).encode('latin-1')
         out += b'Server: kimi-relay\r\n'
         out += b'Content-Length: %d\r\nConnection: close\r\n\r\n' % len(rbody)
         out += rbody
         writer.write(bytes(out))
+        log.info('%s %s -> %d %dB %.2fs', method, inner, status, len(rbody),
+                 time.monotonic() - t_start)
         await writer.drain()
     finally:
         tun.pending.pop(req_id, None)
