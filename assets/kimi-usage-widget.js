@@ -1184,6 +1184,93 @@
     #kud-modal { width: 440px; }
     #kud-cancel { background: var(--color-surface-sunken, #eef0f2); color: var(--color-text-secondary, #64748b); }
     #kud-ok { background: var(--color-accent, #1a88ff); color: #fff; }
+    .ku-mode-row {
+      margin: 0 0 9px; padding: 9px 10px 8px; border-radius: 10px;
+      background: color-mix(in srgb, var(--color-accent, #1a88ff) 4.5%, transparent);
+      border: 1px solid color-mix(in srgb, var(--color-accent, #1a88ff) 14%, transparent);
+      transition: border-color .15s ease, box-shadow .15s ease;
+    }
+    .ku-mode-row:hover { border-color: color-mix(in srgb, var(--color-accent, #1a88ff) 30%, transparent); }
+    .ku-mode-top { display: flex; align-items: center; gap: 7px; }
+    .ku-mode-top .ku-row-label { font-size: 10px; font-weight: 700; color: var(--color-text-faint, #94a3b8); text-transform: uppercase; letter-spacing: .4px; width: auto; }
+    .ku-mode-name { flex: 1; min-width: 0; font-size: 12.5px; font-weight: 700; color: var(--color-text, #0f172a); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ku-mode-edit {
+      border: 1px solid color-mix(in srgb, var(--color-accent, #1a88ff) 28%, transparent);
+      background: color-mix(in srgb, var(--color-accent, #1a88ff) 7%, transparent);
+      cursor: pointer; font-size: 10.5px; font-weight: 600; padding: 2px 8px; border-radius: 6px;
+      color: var(--color-accent, #1a88ff); font-family: inherit; line-height: 1.5;
+      transition: all .15s ease;
+    }
+    .ku-mode-edit:hover { background: var(--color-accent, #1a88ff); color: #fff; border-color: var(--color-accent, #1a88ff); }
+    .ku-mode-range { width: 100%; margin: 8px 0 0; accent-color: var(--color-accent, #1a88ff); cursor: pointer; -webkit-appearance: none; appearance: none; height: 20px; background: transparent; }
+    .ku-mode-range::-webkit-slider-runnable-track { height: 5px; border-radius: 3px; background: color-mix(in srgb, var(--color-accent, #1a88ff) 18%, color-mix(in srgb, var(--color-text,#000) 7%, transparent)); }
+    .ku-mode-range::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 17px; height: 17px; margin-top: -6px; border-radius: 50%; background: var(--color-accent, #1a88ff); border: 2.5px solid var(--color-surface, #fff); box-shadow: 0 1px 6px rgba(0,0,0,.28), 0 0 0 0 color-mix(in srgb, var(--color-accent, #1a88ff) 0%, transparent); transition: transform .15s ease, box-shadow .2s ease; }
+    .ku-mode-range.ku-snapping::-webkit-slider-thumb { transition: transform .16s cubic-bezier(.2,.9,.25,1.4), box-shadow .2s ease; }
+    .ku-mode-range:not(:disabled):hover::-webkit-slider-thumb { transform: scale(1.12); box-shadow: 0 1px 6px rgba(0,0,0,.28), 0 0 0 5px color-mix(in srgb, var(--color-accent, #1a88ff) 14%, transparent); }
+    .ku-mode-range:not(:disabled):active::-webkit-slider-thumb { transform: scale(1.2); box-shadow: 0 1px 6px rgba(0,0,0,.3), 0 0 0 8px color-mix(in srgb, var(--color-accent, #1a88ff) 18%, transparent); }
+    .ku-mode-range::-moz-range-track { height: 5px; border-radius: 3px; background: color-mix(in srgb, var(--color-accent, #1a88ff) 18%, color-mix(in srgb, var(--color-text,#000) 7%, transparent)); }
+    .ku-mode-range::-moz-range-thumb { width: 17px; height: 17px; border-radius: 50%; background: var(--color-accent, #1a88ff); border: 2.5px solid var(--color-surface, #fff); box-shadow: 0 1px 6px rgba(0,0,0,.28); transition: transform .15s ease, box-shadow .2s ease; }
+    .ku-mode-range:not(:disabled):hover::-moz-range-thumb { transform: scale(1.12); box-shadow: 0 1px 6px rgba(0,0,0,.28), 0 0 0 5px color-mix(in srgb, var(--color-accent, #1a88ff) 14%, transparent); }
+    .ku-mode-range:disabled { cursor: wait; }
+    .ku-mode-range:disabled::-webkit-slider-thumb { opacity: .55; }
+    .ku-mode-range:disabled::-moz-range-thumb { opacity: .55; }
+    .ku-mode-ticks { display: flex; justify-content: space-between; gap: 2px; font-size: 10.5px; color: var(--color-text-faint, #94a3b8); margin-top: 4px; padding: 0 1px; }
+    .ku-mode-ticks span { flex: 1; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; padding: 2px 3px; border-radius: 5px; transition: background .12s ease, color .12s ease, font-weight .12s; }
+    .ku-mode-ticks span:hover { background: color-mix(in srgb, var(--color-text, #000) 5%, transparent); color: var(--color-text-secondary, #64748b); }
+    .ku-mode-ticks span.on { background: color-mix(in srgb, var(--color-accent, #1a88ff) 13%, transparent); color: var(--color-accent, #1a88ff); font-weight: 700; }
+    .ku-mode-desc { font-size: 10.5px; line-height: 1.5; color: var(--color-text-secondary, #64748b); margin-top: 6px; padding-left: 7px; border-left: 2px solid color-mix(in srgb, var(--color-accent, #1a88ff) 30%, transparent); word-break: break-all; }
+    .ku-mode-desc b { color: var(--color-text, #0f172a); font-weight: 600; }
+    .ku-mode-desc .warn { color: var(--color-warning, #d29922); }
+    #kmd-overlay {
+      position: fixed; inset: 0; z-index: 100002;
+      background: rgba(0,0,0,.45); backdrop-filter: blur(3px);
+      display: none; align-items: center; justify-content: center;
+      font-family: system-ui, -apple-system, sans-serif;
+      opacity: 0; transition: opacity 0.17s ease;
+    }
+    #kmd-overlay.visible { display: flex; opacity: 1; }
+    #kmd-overlay.ku-anim-in { opacity: 1; }
+    #kmd-modal {
+      width: 620px; max-width: 92vw; max-height: 86vh; display: flex; flex-direction: column;
+      background: var(--color-surface, #1f1f1f); color: var(--color-text, #e2e8f0);
+      border: 1px solid color-mix(in srgb, var(--color-text, #fff) 10%, transparent);
+      border-radius: 14px; box-shadow: 0 24px 64px rgba(0,0,0,.35); overflow: hidden;
+    }
+    .kmd-head { padding: 16px 20px 10px; display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+    .kmd-head h3 { margin: 0; font-size: 16px; font-weight: 700; }
+    .kmd-head .kmd-sub { font-size: 11.5px; color: var(--color-text-faint, #94a3b8); }
+    .kmd-body { padding: 14px 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;
+      border-top: 1px solid color-mix(in srgb, var(--color-text, #fff) 7%, transparent); }
+    .kmd-card { border: 1px solid color-mix(in srgb, var(--color-text, #fff) 9%, transparent); border-radius: 11px;
+      padding: 11px 13px; background: var(--color-surface-raised, #292929);
+      transition: border-color .15s ease, box-shadow .15s ease, background .15s ease; }
+    .kmd-card.on { border-color: color-mix(in srgb, var(--color-accent, #1a88ff) 55%, transparent);
+      background: color-mix(in srgb, var(--color-accent, #1a88ff) 5%, var(--color-surface-raised, #292929));
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent, #1a88ff) 10%, transparent); }
+    .kmd-line { display: flex; gap: 8px; align-items: center; margin-top: 7px; flex-wrap: wrap; }
+    .kmd-line:first-child { margin-top: 0; }
+    .kmd-line label { font-size: 11px; width: 40px; flex-shrink: 0; color: var(--color-text-faint, #94a3b8); font-weight: 600; }
+    .kmd-card input[type=text], .kmd-card select {
+      flex: 1; min-width: 120px; box-sizing: border-box; padding: 6px 9px; font-size: 12px; font-family: inherit;
+      border-radius: 7px; border: 1px solid color-mix(in srgb, var(--color-text, #fff) 14%, transparent);
+      background: var(--color-surface-sunken, #121212); color: var(--color-text, #e2e8f0); outline: none;
+      transition: border-color .12s ease, box-shadow .12s ease;
+    }
+    .kmd-card input[type=text]:focus, .kmd-card select:focus {
+      border-color: color-mix(in srgb, var(--color-accent, #1a88ff) 55%, transparent);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent, #1a88ff) 15%, transparent); }
+    .kmd-card select.kmd-sub-sel { flex: 1; min-width: 0; }
+    .kmd-idx { font-size: 10px; font-weight: 700; color: var(--color-accent, #1a88ff); flex-shrink: 0;
+      width: 40px; text-align: center; box-sizing: border-box;
+      padding: 3px 0; border-radius: 5px; background: color-mix(in srgb, var(--color-accent, #1a88ff) 12%, transparent);
+      letter-spacing: .3px; }
+    .kmd-acts { display: flex; gap: 2px; margin-left: auto; flex-shrink: 0; }
+    .kmd-acts .kmm-link { padding: 3px 6px; font-size: 11px; }
+    .kmd-acts .kmm-link[data-act=del] { color: var(--color-warning, #d29922); margin-left: 6px; }
+    .kmd-acts .kmm-link[data-act=del]:hover { background: color-mix(in srgb, var(--color-warning, #d29922) 12%, transparent); color: var(--color-warning, #d29922); }
+    .kmd-foot { padding: 12px 20px; display: flex; gap: 8px; align-items: center;
+      border-top: 1px solid color-mix(in srgb, var(--color-text, #fff) 7%, transparent); }
+    .kmd-foot .kmd-tip { flex: 1; font-size: 11px; color: var(--color-text-faint, #94a3b8); }
     #kmm-toast {
       position: fixed;
       bottom: 24px;
@@ -1195,7 +1282,7 @@
       box-shadow: 0 4px 14px rgba(0,0,0,0.3);
       font-size: 12px;
       font-weight: 500;
-      z-index: 100001;
+      z-index: 100010;
       display: none;
       font-family: system-ui, -apple-system, sans-serif;
     }
@@ -1465,6 +1552,16 @@
       </div>
 
       <div class="ku-expanded-body">
+        <div class="ku-mode-row" id="ku-mode-row">
+          <div class="ku-mode-top">
+            <span class="ku-row-label">模式</span>
+            <span class="ku-mode-name" id="ku-mode-name">--</span>
+            <button class="ku-mode-edit" id="ku-mode-edit" title="自定义各档主模型与挂件">编辑</button>
+          </div>
+          <input type="range" class="ku-mode-range" id="ku-mode-range" min="0" max="3" step="0.02" value="0" title="拖动切换干活模式，松手生效">
+          <div class="ku-mode-ticks" id="ku-mode-ticks"></div>
+          <div class="ku-mode-desc" id="ku-mode-desc">加载中…</div>
+        </div>
         <div class="ku-row">
           <span class="ku-row-label">今日</span>
           <span class="ku-row-val" id="ku-today-val">--</span>
@@ -1590,6 +1687,7 @@
       if (RW && typeof RW.open === 'function') { RW.open(); return; }
       kmmToast('远程连接模块未加载（缺少 kimi-remote-widget.js）', true);
     }
+    kmdBindCard(el);
     el.querySelector('#ku-remote-btn').onclick = (e) => { e.stopPropagation(); openRemoteOverlay(); };
     el.querySelector('#ku-min-remote-btn').onclick = (e) => { e.stopPropagation(); openRemoteOverlay(); };
 
@@ -2535,6 +2633,353 @@
     toast.style.display = 'block';
     setTimeout(function() { toast.style.display = 'none'; }, 3000);
   }
+
+  /* ================================================================
+   * 模式滑杆（kmd- 前缀）：从单模型省钱档到「主模型 + 1~3 个挂件子代理」
+   * ================================================================ */
+  var kmdData = null;
+  var kmdBusy = false;
+  var kmdOverlayEl = null;
+  var kmdDraft = null;
+  var kmdLastFetch = 0;
+
+  function kmdModelName(alias) {
+    var m = kmdData && (kmdData.models || []).find(function(x) { return x.alias === alias; });
+    return (m && m.display_name && m.display_name !== alias) ? m.display_name : shortName(alias);
+  }
+  function kmdPriceTxt(alias) {
+    var m = kmdData && (kmdData.models || []).find(function(x) { return x.alias === alias; });
+    var p = m && m.pricing;
+    if (!p) return '';
+    if (p.mode === 'per_call') return '¥' + p.price + '/次';
+    if (p.input != null) return p.input + '/' + p.output;
+    return '';
+  }
+  function kmdModeDesc(m) {
+    if (!m) return '';
+    var s = '主 <b>' + esc(kmdModelName(m.main)) + '</b>';
+    var pt = kmdPriceTxt(m.main);
+    if (pt) s += ' <span title="输入/输出 每百万 Token">(' + esc(pt) + ')</span>';
+    var subs = m.subagents || [];
+    if (!subs.length) s += ' · 单干，不派子代理';
+    else s += ' · 挂件 ' + subs.length + '：' + subs.map(function(a) { return esc(kmdModelName(a)); }).join('、');
+    if (m.scene) s += '<br>' + esc(m.scene);
+    return s;
+  }
+
+  function kmdRender(card) {
+    card = card || document.getElementById(CARD_ID);
+    if (!card || !kmdData) return;
+    var modes = kmdData.modes || [];
+    var range = card.querySelector('#ku-mode-range');
+    var nameEl = card.querySelector('#ku-mode-name');
+    var desc = card.querySelector('#ku-mode-desc');
+    var ticks = card.querySelector('#ku-mode-ticks');
+    if (!range || !modes.length) return;
+    range.max = String(modes.length - 1);
+    var act = kmdData.active;
+    // act==null（编辑后当前 config 不再匹配任何档）时，滑块别停在失效
+    // 位置：优先回到「最近一次应用」的档（last_applied.index），那才是
+    // 用户最后明确选过的档位；都没有再退回 range.value。
+    var fallback = (kmdData.last_applied && typeof kmdData.last_applied.index === 'number'
+                    && kmdData.last_applied.index < modes.length)
+                   ? kmdData.last_applied.index : Math.round(Number(range.value || 0));
+    var shown = (act == null) ? fallback : act;
+    if (!kmdBusy && !kmdDragging && document.activeElement !== range) range.value = String(shown);
+    ticks.innerHTML = modes.map(function(m, i) {
+      // 高亮跟滑块实际位置（shown）走：act==null 时 shown 是 last_applied，
+      // 那档也该高亮，避免「滑到某档却没选中态」的割裂。
+      return '<span data-i="' + i + '" class="' + (i === shown ? 'on' : '') + '" title="' + esc(m.name) + '">' + esc(m.name) + '</span>';
+    }).join('');
+    ticks.querySelectorAll('span').forEach(function(sp) {
+      sp.onclick = function(e) { e.stopPropagation(); kmdApply(Number(sp.getAttribute('data-i'))); };
+    });
+    if (act == null) {
+      var fb = modes[shown];
+      nameEl.textContent = (fb ? ((shown + 1) + '/' + modes.length + ' · ' + fb.name) : '自定义')
+        + '（配置已改动·未匹配）';
+      var c = kmdData.current || {};
+      desc.innerHTML = '当前主 <b>' + esc(kmdModelName(c.default_model)) + '</b> · 子代理池 '
+        + (c.agents_disabled ? '已禁用' : ((c.pool || []).length + ' 个'))
+        + (kmdData.has_snapshot ? ' · <span class="warn">可在「编辑」里恢复切换前配置</span>' : '');
+    } else {
+      nameEl.textContent = (act + 1) + '/' + modes.length + ' · ' + modes[act].name;
+      desc.innerHTML = kmdModeDesc(modes[act]);
+    }
+  }
+
+  var kmdDragging = false;
+  var kmdSnapRaf = 0;
+
+  function kmdPreview(card, i) {
+    if (!kmdData) return;
+    var modes = kmdData.modes || [];
+    var m = modes[Math.round(i)];
+    if (!m) return;
+    var dragging = kmdDragging ? '（松手切换）' : '';
+    card.querySelector('#ku-mode-name').textContent = (Math.round(i) + 1) + '/' + modes.length + ' · ' + m.name + dragging;
+    card.querySelector('#ku-mode-desc').innerHTML = kmdModeDesc(m);
+    var ticks = card.querySelector('#ku-mode-ticks');
+    if (ticks) ticks.querySelectorAll('span').forEach(function(sp) {
+      sp.classList.toggle('on', Number(sp.getAttribute('data-i')) === Math.round(i));
+    });
+  }
+
+  function kmdSnapTo(range, target, done) {
+    if (kmdSnapRaf) cancelAnimationFrame(kmdSnapRaf);
+    var from = Number(range.value), to = Number(target);
+    if (from === to) { if (done) done(); return; }
+    range.classList.add('ku-snapping');
+    var t0 = performance.now(), dur = 170;
+    function tick(t) {
+      var p = Math.min(1, (t - t0) / dur);
+      var e = 1 - Math.pow(1 - p, 3);
+      range.value = String(from + (to - from) * e);
+      if (p < 1) { kmdSnapRaf = requestAnimationFrame(tick); return; }
+      kmdSnapRaf = 0; range.classList.remove('ku-snapping');
+      range.value = String(to);
+      if (done) done();
+    }
+    kmdSnapRaf = requestAnimationFrame(tick);
+  }
+
+  function kmdFetch(force) {
+    if (!force && Date.now() - kmdLastFetch < 15000) { kmdRender(); return Promise.resolve(kmdData); }
+    kmdLastFetch = Date.now();
+    return kapiFetch(API_BASE + '/api/modes')
+      .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function(d) { kmdData = d; kmdRender(); if (kmdOverlayEl && kmdOverlayEl.classList.contains('visible') && !kmdDraft) kmdRenderEditor(); return d; })
+      .catch(function() {
+        var desc = document.querySelector('#' + CARD_ID + ' #ku-mode-desc');
+        if (desc && !kmdData) desc.textContent = '后台服务离线，模式滑杆不可用';
+      });
+  }
+
+  function kmdPost(path, body) {
+    return kapiFetch(API_BASE + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {})
+    }).then(function(r) { return r.json(); });
+  }
+
+  function kmdApply(i) {
+    if (kmdBusy || !kmdData) return;
+    i = Math.round(i);
+    if (i === kmdData.active) { kmdRender(); return; }
+    var card = document.getElementById(CARD_ID);
+    var range = card && card.querySelector('#ku-mode-range');
+    var prevActive = kmdData.active;
+    // 乐观更新：先把 UI 落到目标档，后端失败再回滚
+    kmdBusy = true;
+    kmdData.active = i;
+    if (range) { range.disabled = true; }
+    if (range && kmdDragging) { kmdDragging = false; kmdSnapTo(range, i, null); }
+    else if (range) range.value = String(i);
+    kmdRender();
+    kmdPost('/api/modes/apply', { index: i })
+      .then(function(d) {
+        if (d.success) {
+          if (d.data) { kmdData = d.data; }
+          kmmToast(d.message || '已切换');
+        } else {
+          kmdData.active = prevActive;
+          kmmToast(d.message || '切换失败', true);
+        }
+      })
+      .catch(function() { kmdData.active = prevActive; kmmToast('切换失败：后台服务未响应', true); })
+      .then(function() {
+        kmdBusy = false;
+        if (range) { range.disabled = false; kmdSnapTo(range, kmdData.active == null ? i : kmdData.active, null); }
+        kmdRender();
+        if (typeof fetchModels === 'function') fetchModels();
+      });
+  }
+
+  function kmdBindCard(el) {
+    var range = el.querySelector('#ku-mode-range');
+    if (!range) return;
+    ['click', 'mousedown', 'pointerdown'].forEach(function(t) {
+      el.querySelector('#ku-mode-row').addEventListener(t, function(e) { e.stopPropagation(); });
+    });
+    var kmdStartDrag = function() { kmdDragging = true; };
+    var kmdEndDrag = function() { kmdDragging = false; };
+    range.addEventListener('pointerdown', kmdStartDrag);
+    range.addEventListener('pointerup', kmdEndDrag);
+    range.addEventListener('pointercancel', kmdEndDrag);
+    range.addEventListener('blur', kmdEndDrag);
+    range.oninput = function() { kmdPreview(el, Number(range.value)); };
+    range.onchange = function() {
+      var i = Math.round(Number(range.value));
+      kmdDragging = false;
+      if (kmdData && i === kmdData.active) { kmdSnapTo(range, i, function() { kmdRender(); }); return; }
+      kmdSnapTo(range, i, function() { kmdApply(i); });
+    };
+    el.querySelector('#ku-mode-edit').onclick = function(e) { e.stopPropagation(); kmdOpenEditor(); };
+    if (kmdData) kmdRender(el);
+    kmdFetch(true);
+  }
+
+  function kmdEnsureOverlay() {
+    if (kmdOverlayEl) return kmdOverlayEl;
+    var o = document.createElement('div');
+    o.id = 'kmd-overlay';
+    o.innerHTML = '<div id="kmd-modal">'
+      + '<div class="kmd-head"><div><h3>模式档位</h3><div class="kmd-sub">滑杆从左到右：单模型省钱 → 主模型 + 挂件（子代理）。每档可自定义主模型与 0~3 个挂件。</div></div>'
+      + '<button class="kmm-x" id="kmd-x" title="关闭">✕</button></div>'
+      + '<div class="kmd-body" id="kmd-body"></div>'
+      + '<div class="kmd-foot"><span class="kmd-tip" id="kmd-tip"></span>'
+      + '<button class="kmm-tbtn" id="kmd-restore" title="把 default_model / [secondary_model] / [tools] 恢复成第一次用滑杆之前的样子">恢复切换前</button>'
+      + '<button class="kmm-tbtn" id="kmd-reset">恢复预设</button>'
+      + '<button class="kmm-tbtn" id="kmd-add">+ 加一档</button>'
+      + '<button class="kmm-tbtn primary" id="kmd-save">保存</button></div>'
+      + '</div>';
+    document.body.appendChild(o);
+    kmdOverlayEl = o;
+    var close = function() { kmdDraft = null; kuLayerHide(o, 'visible'); };
+    o.onclick = function(e) { if (e.target === o) close(); };
+    o.querySelector('#kmd-x').onclick = close;
+    o.querySelector('#kmd-add').onclick = function() {
+      kmdCollect();
+      if (kmdDraft.length >= (kmdData.max || 6)) { kmmToast('最多 ' + (kmdData.max || 6) + ' 档', true); return; }
+      var last = kmdDraft[kmdDraft.length - 1] || {};
+      kmdDraft.push({ name: '档位 ' + (kmdDraft.length + 1), scene: '', main: last.main || '', subagents: (last.subagents || []).slice(), effort: '' });
+      kmdRenderEditor();
+    };
+    o.querySelector('#kmd-save').onclick = function() {
+      kmdCollect();
+      var btn = o.querySelector('#kmd-save');
+      btn.disabled = true;
+      kmdPost('/api/modes/save', { modes: kmdDraft }).then(function(d) {
+        if (d.success) {
+          kmdData = d.data; kmdDraft = null;
+          kmmToast(d.message || '已保存');
+          // 保存后立即刷新滑块：不等关弹窗延迟，先清拖拽/焦点态再把
+          // 滑块吸附到 active 档——否则 range 仍停在编辑前位置，与
+          // detect_active_mode 反推出的高亮档不一致，看起来像「没选中」。
+          setTimeout(function() {
+            kuLayerHide(o, 'visible');
+            var card = document.getElementById(CARD_ID);
+            var range = card && card.querySelector('#ku-mode-range');
+            kmdBusy = false; kmdDragging = false;
+            if (range) { range.blur(); }
+            kmdRender();
+            if (range && kmdData && kmdData.active != null) {
+              kmdSnapTo(range, kmdData.active, null);
+            }
+          }, 350);
+        } else {
+          kmmToast(d.message || '保存失败', true);
+        }
+      }).catch(function() { kmmToast('保存失败：后台服务未响应', true); })
+        .then(function() { btn.disabled = false; });
+    };
+    o.querySelector('#kmd-reset').onclick = function() {
+      if (!confirm('把档位列表恢复为内置 4 档预设？（不会改动 config.toml）')) return;
+      kmdPost('/api/modes/reset', {}).then(function(d) {
+        kmmToast(d.message, !d.success);
+        if (d.success) { kmdData = d.data; kmdDraft = null; kmdRender(); kmdRenderEditor(); }
+      });
+    };
+    o.querySelector('#kmd-restore').onclick = function() {
+      if (!confirm('把 config.toml 的主模型 / 子代理池 / [tools] 恢复成第一次用滑杆之前的样子？')) return;
+      kmdPost('/api/modes/restore', {}).then(function(d) {
+        kmmToast(d.message, !d.success);
+        if (d.data) { kmdData = d.data; kmdDraft = null; kmdRender(); kmdRenderEditor(); }
+      }).catch(function() { kmmToast('恢复失败：后台服务未响应', true); });
+    };
+    return o;
+  }
+
+  function kmdOptions(sel, allowEmpty) {
+    var h = allowEmpty ? '<option value="">（无）</option>' : '';
+    var found = !sel;
+    (kmdData.models || []).forEach(function(m) {
+      if (m.alias === sel) found = true;
+      var pt = kmdPriceTxt(m.alias);
+      var label = m.alias + (m.display_name && m.display_name !== m.alias ? ' · ' + m.display_name : '') + (pt ? '  [' + pt + ']' : '') + (m.has_tools ? '' : '  (无工具调用)');
+      h += '<option value="' + esc(m.alias) + '"' + (m.alias === sel ? ' selected' : '') + '>' + esc(label) + '</option>';
+    });
+    if (!found) h += '<option value="' + esc(sel) + '" selected>' + esc(sel) + '（config 中不存在）</option>';
+    return h;
+  }
+
+  function kmdRenderEditor() {
+    if (!kmdOverlayEl || !kmdData) return;
+    if (!kmdDraft) kmdDraft = JSON.parse(JSON.stringify(kmdData.modes || []));
+    var body = kmdOverlayEl.querySelector('#kmd-body');
+    var max = kmdData.subs_max || 3;
+    body.innerHTML = kmdDraft.map(function(m, i) {
+      var subs = '';
+      for (var k = 0; k < max; k++) {
+        subs += '<select class="kmd-sub-sel" data-f="sub" data-k="' + k + '">' + kmdOptions((m.subagents || [])[k] || '', true) + '</select>';
+      }
+      return '<div class="kmd-card' + (i === kmdData.active ? ' on' : '') + '" data-i="' + i + '">'
+        + '<div class="kmd-line"><span class="kmd-idx">第 ' + (i + 1) + ' 档</span>'
+        + '<input type="text" data-f="name" maxlength="20" placeholder="档名" value="' + esc(m.name) + '">'
+        + '<span class="kmd-acts">'
+        + '<button class="kmm-link" data-act="up" title="上移">↑</button><button class="kmm-link" data-act="down" title="下移">↓</button>'
+        + '<button class="kmm-link" data-act="del" title="删除这一档">删除</button></span></div>'
+        + '<div class="kmd-line"><label>场景</label><input type="text" data-f="scene" maxlength="120" placeholder="适合什么活" value="' + esc(m.scene || '') + '"></div>'
+        + '<div class="kmd-line"><label>主模型</label><select data-f="main">' + kmdOptions(m.main, false) + '</select></div>'
+        + '<div class="kmd-line"><label>挂件</label>' + subs + '</div>'
+        + '<div class="kmd-line"><label>思考</label><select data-f="effort">'
+        + ['', 'on', 'off', 'low', 'medium', 'high', 'xhigh', 'max'].map(function(e) {
+            return '<option value="' + e + '"' + ((m.effort || '') === e ? ' selected' : '') + '>' + (e ? '子代理 ' + e : '子代理沿用现有') + '</option>';
+          }).join('')
+        + '</select></div></div>';
+    }).join('');
+    body.querySelectorAll('[data-act]').forEach(function(b) {
+      b.onclick = function() {
+        kmdCollect();
+        var i = Number(b.closest('.kmd-card').getAttribute('data-i'));
+        var act = b.getAttribute('data-act');
+        if (act === 'del') {
+          if (kmdDraft.length <= (kmdData.min || 2)) { kmmToast('至少保留 ' + (kmdData.min || 2) + ' 档', true); return; }
+          kmdDraft.splice(i, 1);
+        } else {
+          var j = act === 'up' ? i - 1 : i + 1;
+          if (j < 0 || j >= kmdDraft.length) return;
+          var t = kmdDraft[i]; kmdDraft[i] = kmdDraft[j]; kmdDraft[j] = t;
+        }
+        kmdRenderEditor();
+      };
+    });
+    var tip = [];
+    if (kmdData.last_applied) tip.push('上次切换：' + kmdData.last_applied.name + ' @ ' + kmdData.last_applied.time);
+    if ((kmdData.undefined_pool || []).length) tip.push('⚠ 现有子代理池含未定义模型：' + kmdData.undefined_pool.join('、'));
+    tip.push('第 1 个挂件即子代理默认模型；0 个挂件 = 禁用 Agent/AgentSwarm。切换后会话内 /reload 生效');
+    kmdOverlayEl.querySelector('#kmd-tip').textContent = tip.join(' · ');
+    kmdOverlayEl.querySelector('#kmd-restore').disabled = !kmdData.has_snapshot;
+    kmdOverlayEl.querySelector('#kmd-restore').style.opacity = kmdData.has_snapshot ? '' : '.45';
+  }
+
+  function kmdCollect() {
+    if (!kmdOverlayEl || !kmdDraft) return;
+    kmdOverlayEl.querySelectorAll('.kmd-card').forEach(function(c) {
+      var i = Number(c.getAttribute('data-i'));
+      var m = kmdDraft[i];
+      if (!m) return;
+      m.name = c.querySelector('[data-f=name]').value.trim();
+      m.scene = c.querySelector('[data-f=scene]').value.trim();
+      m.main = c.querySelector('[data-f=main]').value;
+      m.effort = c.querySelector('[data-f=effort]').value;
+      var subs = [];
+      c.querySelectorAll('[data-f=sub]').forEach(function(s) { if (s.value && subs.indexOf(s.value) < 0) subs.push(s.value); });
+      m.subagents = subs;
+    });
+  }
+
+  function kmdOpenEditor() {
+    var o = kmdEnsureOverlay();
+    kmdDraft = null;
+    kuLayerShow(o, 'visible');
+    if (kmdData) kmdRenderEditor();
+    kmdFetch(true).then(function() { if (!kmdDraft) kmdRenderEditor(); });
+  }
+
+  setInterval(function() {
+    if (document.hidden || kmdBusy || !document.getElementById(CARD_ID)) return;
+    kmdFetch(false);
+  }, 20000);
 
   function openModelModal() {
     var overlay = ensureModelOverlay();

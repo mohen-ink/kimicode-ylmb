@@ -1,7 +1,7 @@
 /**
  * 手机连接控制面适配层（window.KimiMobileAPI）。
  * 控制面与 owner 仅信任本机回环；公网源绝不成为控制源。
- * LAN 配对严格绑定地址/端口；CF 与 frp 配对分别校验并绑定当前 ready tunnel 的公网源。
+ * LAN 配对严格绑定地址/端口，Internet 配对严格绑定当前 ready tunnel 的公网源。
  * 所有 POST 均不重试，响应仅下发已校验字段与有限安全错误文案。
  */
 (function() {
@@ -11,6 +11,7 @@
   var STATUS_PATH = '/api/mobile/status';
   var START_PATH = '/api/mobile/start';
   var STOP_PATH = '/api/mobile/stop';
+  var RELAY_CONFIG_PATH = '/api/mobile/relay/config';
   var CONTROL_HEADER = 'X-Kimi-Mobile-Control';
   var ORIGIN_PARAM = 'kimi_origin';
   var ORIGIN_STORAGE_KEY = 'kimi-desktop-server-origin';
@@ -28,29 +29,27 @@
   var PAIR_STATES = ['missing', 'available', 'used', 'expired'];
   var CONNECTOR_VERSION = '2026.9.3';
   var CONSENT_VERSION = 'cloudflare-quick-2026-09-v1';
-  var FRP_CONSENT_VERSION = 'frp-tcp-http-v1';
   var INSTALL_PATH = '/api/mobile/connector/install';
   var PAIR_ROTATE_PATH = '/api/mobile/pair/rotate';
   var IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
   var PAIR_PATH = '/mobile/pair';
   var PAIR_TOKEN_RE = /^[A-Za-z0-9_-]{8,256}$/;
   var PUBLIC_ORIGIN_RE = /^https:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.trycloudflare\.com$/;
+  // relay 公网 origin：固定 VPS IP + 端口（不带 /t/<id> 路径，tid 只在配对 URL 里）
+  var RELAY_ORIGIN_RE = /^http:\/\/114\.66\.24\.119:\d+$/;
   var ERROR_MESSAGES = {
     CONNECTOR_MISSING: '请先安装外网连接组件。',
     CONNECTOR_INSTALL_FAILED: '连接组件安装失败，请重新确认后再试。',
     CONNECTOR_HASH_MISMATCH: '连接组件完整性校验失败，无法使用。',
     CONNECTOR_UNSUPPORTED: '当前系统不支持此外网连接组件。',
     CONNECTOR_BUSY: '连接组件正在处理其他操作，请稍候。',
-    CONSENT_REQUIRED: '请分别明确同意组件下载和本次中转风险。',
-    RELAY_CONFIG_INVALID: '中继配置无效：请检查公网 IPv4、不同的端口、32–512 位无空白 ASCII token 和 PEM CA 证书。',
+    CONSENT_REQUIRED: '请分别明确同意组件下载和本次 Cloudflare 中转。',
     TUNNEL_START_FAILED: '外网通道启动失败，请停止后再试。',
     TUNNEL_TIMEOUT: '外网通道启动超时，请检查网络后重试。',
     TUNNEL_EXITED: '外网通道已断开，请停止后重新开启。',
     OWNER_LOST: '桌面端服务已断开，连接已撤销。',
-    SERVER_TOKEN_UNAVAILABLE: '手机连接凭据创建或读取失败，请检查目录权限。',
-    OWNER_AUTH_FAILED: '桌面端拒绝手机连接凭据，请停止后重试或升级桌面端。',
-    OWNER_AUTH_CHECK_FAILED: '无法验证桌面端认证，请稍后重试。',
     START_CANCELLED: '连接启动已取消。',
+    SERVER_TOKEN_UNAVAILABLE: '手机连接凭据创建或读取失败，请检查目录权限。',
     WORKER_STATE_DIR_UNAVAILABLE: '手机连接助手工作目录不可用，请检查插件安装。',
     WORKER_STARTUP_BUSY: '有其他启动操作正在进行，请稍候再试。',
     WORKER_LOCK_HELD: '已有手机连接实例在运行但身份无法核实，请稍候再试。',
@@ -115,73 +114,10 @@
     throw apiErr('服务返回的手机连接状态格式异常', 'MOBILE_BAD_RESPONSE');
   }
 
-  function validPublicOrigin(origin) {
-    return typeof origin === 'string' && PUBLIC_ORIGIN_RE.test(origin) && !/\s/.test(origin);
-  }
-
-  function isPublicIPv4(host) {
-    if (typeof host !== 'string') return false;
-    var p = parseIPv4(host);
-    if (!p || p.join('.') !== host || p[0] === 0 || p[0] === 10 || p[0] === 127
-        || p[0] >= 224 || isRFC1918(host)) return false;
-    if (p[0] === 100 && p[1] >= 64 && p[1] <= 127) return false;
-    if (p[0] === 169 && p[1] === 254) return false;
-    if (p[0] === 192 && ((p[1] === 0 && (p[2] === 0 || p[2] === 2))
-        || (p[1] === 88 && p[2] === 99))) return false;
-    if (p[0] === 198 && (p[1] === 18 || p[1] === 19
-        || (p[1] === 51 && p[2] === 100))) return false;
-    if (p[0] === 203 && p[1] === 0 && p[2] === 113) return false;
-    return true;
-  }
-
-  function validRelayOrigin(origin) {
-    if (typeof origin !== 'string') return false;
-    var m = /^http:\/\/([0-9.]+):([1-9][0-9]{0,4})$/.exec(origin);
-    return !!m && m[0] === origin && String(+m[2]) === m[2]
-      && isPublicIPv4(m[1]) && isPort(+m[2]);
-  }
-
-  function validateRelayConfig(config) {
-    var reject = function() { throw apiErr(errorMessage('RELAY_CONFIG_INVALID'), 'RELAY_CONFIG_INVALID'); };
-    var keys = ['server_ip', 'server_port', 'remote_port', 'token', 'ca_cert'];
-    if (!isObj(config)) return reject();
-    var ownKeys = Object.keys(config);
-    for (var keyIndex = 0; keyIndex < ownKeys.length; keyIndex++) {
-      if (keys.indexOf(ownKeys[keyIndex]) < 0) return reject();
-    }
-    for (var requiredIndex = 0; requiredIndex < keys.length; requiredIndex++) {
-      if (!Object.prototype.hasOwnProperty.call(config, keys[requiredIndex])) return reject();
-    }
-    if (!isPublicIPv4(config.server_ip)
-        || !isPort(config.server_port) || !isPort(config.remote_port)
-        || config.server_port === config.remote_port
-        || typeof config.token !== 'string' || config.token.length < 32 || config.token.length > 512
-        || /[^\x21-\x7e]/.test(config.token)
-        || typeof config.ca_cert !== 'string' || /[^\x20-\x7e\t\r\n]/.test(config.ca_cert)) return reject();
-    var normalized = config.ca_cert.replace(/\r\n/g, '\n');
-    if (/\r/.test(normalized) || normalized.length > 65536) return reject();
-    var pemRe = /-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/g;
-    var certs = [];
-    var bodies = [];
-    var cursor = 0;
-    var match;
-    while ((match = pemRe.exec(normalized)) !== null) {
-      if (!/^[ \t\n]*$/.test(normalized.slice(cursor, match.index))) return reject();
-      var body = match[1];
-      if (!/^[A-Za-z0-9+/= \t\n]*$/.test(body)) return reject();
-      var data = body.replace(/[ \t\n]/g, '');
-      if (!data || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)
-          || (data.indexOf('=') >= 0 && data.indexOf('=') < data.length - 2
-            && data.indexOf('=') !== data.length - 2)) return reject();
-      if (bodies.indexOf(data) >= 0) return reject();
-      bodies.push(data);
-      certs.push('-----BEGIN CERTIFICATE-----\n' + body.trim() + '\n-----END CERTIFICATE-----');
-      if (certs.length > 4) return reject();
-      cursor = pemRe.lastIndex;
-    }
-    if (!certs.length || !/^[ \t\n]*$/.test(normalized.slice(cursor))) return reject();
-    return { server_ip: config.server_ip, server_port: config.server_port,
-      remote_port: config.remote_port, token: config.token, ca_cert: certs.join('\n') + '\n' };
+  function validPublicOrigin(origin, mode) {
+    if (typeof origin !== 'string' || /\s/.test(origin)) return false;
+    if (mode === 'relay') return RELAY_ORIGIN_RE.test(origin);
+    return PUBLIC_ORIGIN_RE.test(origin);
   }
 
   // owner_origin：http + 回环 host，无 userinfo/路径/查询/锚点
@@ -338,18 +274,26 @@
     if (typeof text !== 'string' || text === '' || text !== text.trim()) return reject();
     var u;
     try { u = new URL(text); } catch (e) { return reject(); }
-    if (u.username || u.password || u.pathname !== PAIR_PATH || u.search
+    if (u.username || u.password || u.search
         || u.hash.slice(0, 6) !== '#pair=' || !PAIR_TOKEN_RE.test(u.hash.slice(6))) return reject();
     if (isObj(status) && status.mode === 'internet') {
+      if (u.pathname !== PAIR_PATH) return reject();
       if (status.enabled !== true || status.state !== 'on' || !isObj(status.tunnel)
-          || status.tunnel.state !== 'ready' || !validPublicOrigin(status.public_origin)
+          || status.tunnel.state !== 'ready' || !validPublicOrigin(status.public_origin, 'internet')
           || u.protocol !== 'https:' || u.port || u.origin !== status.public_origin
           || text !== status.public_origin + PAIR_PATH + u.hash) return reject();
     } else if (isObj(status) && status.mode === 'relay') {
+      // relay：url 形如 http://<vps>:<port>/t/<tid>/mobile/pair#pair=...
+      // public_origin 只含 http://<vps>:<port>，tid 前缀需在路径里。
+      var m = /^\/t\/([A-Za-z0-9_-]{4,32})\/mobile\/pair$/.exec(u.pathname);
+      if (!m) return reject();
       if (status.enabled !== true || status.state !== 'on' || !isObj(status.tunnel)
-          || status.tunnel.state !== 'ready' || !validRelayOrigin(status.public_origin)
-          || u.protocol !== 'http:' || text !== status.public_origin + PAIR_PATH + u.hash) return reject();
+          || status.tunnel.state !== 'ready' || !validPublicOrigin(status.public_origin, 'relay')
+          || u.protocol !== 'http:' || u.hostname !== '114.66.24.119' || !u.port
+          || u.origin !== status.public_origin
+          || text !== status.public_origin + u.pathname + u.hash) return reject();
     } else {
+      if (u.pathname !== PAIR_PATH) return reject();
       if (u.protocol !== 'http:' || !isRFC1918(u.hostname) || !u.port
           || text !== u.origin + PAIR_PATH + u.hash) return reject();
       if (status !== undefined && status !== null) {
@@ -441,23 +385,11 @@
     };
     var sources = [d, d.connector, d.tunnel];
     var targets = [status, status.connector, status.tunnel];
-    if (d.relay_connector !== undefined) {
-      if (!isObj(d.relay_connector) || CONNECTOR_STATES.indexOf(d.relay_connector.state) < 0
-          || typeof d.relay_connector.version !== 'string'
-          || !/^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$/.test(d.relay_connector.version)
-          || /[^A-Za-z0-9.+_-]/.test(d.relay_connector.version)) badStatus();
-      status.relay_connector = { state: d.relay_connector.state, version: d.relay_connector.version };
-      sources.push(d.relay_connector);
-      targets.push(status.relay_connector);
-    }
     for (var k = 0; k < sources.length; k++) {
       if (sources[k].error_code !== undefined) {
         if (!errorMessage(sources[k].error_code)) badStatus();
         targets[k].error_code = sources[k].error_code;
-        if (k === 0 || (k === 1 && d.mode === 'internet')
-            || (k === 2 && d.mode !== 'lan') || (k === 3 && d.mode === 'relay')) {
-          status.error = errorMessage(sources[k].error_code);
-        }
+        status.error = errorMessage(sources[k].error_code);
       }
     }
     if (d.owner_origin !== undefined && d.owner_origin !== '') {
@@ -485,12 +417,10 @@
       status.pair_state = d.pair_state;
     }
     if (d.public_origin !== undefined) {
-      if (!d.enabled || d.state !== 'on' || d.tunnel.state !== 'ready'
-          || (d.mode === 'internet' ? !validPublicOrigin(d.public_origin)
-            : (d.mode !== 'relay' || !validRelayOrigin(d.public_origin)))) badStatus();
+      if ((d.mode !== 'internet' && d.mode !== 'relay') || !d.enabled || d.state !== 'on'
+          || d.tunnel.state !== 'ready' || !validPublicOrigin(d.public_origin, d.mode)) badStatus();
       status.public_origin = d.public_origin;
     }
-    if (d.mode === 'relay' && d.state === 'on' && d.tunnel.state === 'ready' && !status.public_origin) badStatus();
     if (d.expires_at !== undefined) {
       if (typeof d.expires_at !== 'number' || !isFinite(d.expires_at) || d.expires_at <= 0) badStatus();
     }
@@ -521,7 +451,7 @@
           || /^[A-Za-z0-9_-]{8,256}$/.test(d.worker_notice)) badStatus();
       status.worker_notice = d.worker_notice;
     }
-    if (d.mode === 'internet' && d.connector_diagnostics !== undefined && d.connector_diagnostics !== null) {
+    if (d.connector_diagnostics !== undefined && d.connector_diagnostics !== null) {
       var projected = toDiagnostics(d.connector_diagnostics);
       if (projected !== null) status.connector_diagnostics = projected;
     }
@@ -597,17 +527,12 @@
       status: function() {
         return call(fetchImpl, getTimeoutMs, 'GET', STATUS_PATH, undefined, '查询手机连接状态');
       },
-      installConnector: function(consent, mode) {
+      installConnector: function(consent) {
         if (consent !== true) return Promise.reject(apiErr(errorMessage('CONSENT_REQUIRED'), 'CONSENT_REQUIRED'));
-        if (mode !== undefined && mode !== 'internet' && mode !== 'relay') {
-          return Promise.reject(apiErr('组件安装模式不受支持', 'MOBILE_BAD_ARG'));
-        }
-        var body = mode === 'relay'
-          ? { mode: 'relay', consent: true, consent_version: FRP_CONSENT_VERSION }
-          : { consent: true, consent_version: CONSENT_VERSION };
-        return call(fetchImpl, installTimeoutMs, 'POST', INSTALL_PATH, body, '安装连接组件');
+        return call(fetchImpl, installTimeoutMs, 'POST', INSTALL_PATH,
+          { consent: true, consent_version: CONSENT_VERSION }, '安装连接组件');
       },
-      setEnabled: function(enabled, address, mode, relayConsent, relayConfig) {
+      setEnabled: function(enabled, address, mode, relayConsent) {
         if (typeof enabled !== 'boolean') {
           return Promise.reject(apiErr('setEnabled 参数必须是布尔值', 'MOBILE_BAD_ARG'));
         }
@@ -619,17 +544,18 @@
         }
         var body = { owner_origin: ownerOrigin };
         if (mode !== undefined) body.mode = mode;
-        if (mode === 'internet' || mode === 'relay') {
+        if (mode === 'internet') {
           if (address !== undefined && address !== null && address !== '') {
             return Promise.reject(apiErr('外网模式不允许指定绑定地址', 'MOBILE_BAD_ARG'));
           }
           if (relayConsent !== true) return Promise.reject(apiErr(errorMessage('CONSENT_REQUIRED'), 'CONSENT_REQUIRED'));
           body.relay_consent = true;
-          body.consent_version = mode === 'relay' ? FRP_CONSENT_VERSION : CONSENT_VERSION;
-          if (mode === 'relay') {
-            try { body.relay_config = validateRelayConfig(relayConfig); }
-            catch (e) { return Promise.reject(apiErr(errorMessage('RELAY_CONFIG_INVALID'), 'RELAY_CONFIG_INVALID')); }
+          body.consent_version = CONSENT_VERSION;
+        } else if (mode === 'relay') {
+          if (address !== undefined && address !== null && address !== '') {
+            return Promise.reject(apiErr('中继模式不允许指定绑定地址', 'MOBILE_BAD_ARG'));
           }
+          // relay：body 只带 owner_origin+mode（私人 VPS，无 consent）
         } else if (address !== undefined && address !== null && address !== '') {
           if (typeof address !== 'string' || !isRFC1918(address)) {
             return Promise.reject(apiErr('网卡地址必须是本机局域网 IPv4 地址', 'MOBILE_BAD_ARG'));
@@ -640,14 +566,50 @@
       },
       rotatePair: function() {
         return call(fetchImpl, postTimeoutMs, 'POST', PAIR_ROTATE_PATH, {}, '更换配对码');
+      },
+      // relay 配置（daemon 本地文件，不经 worker）：读取返回 {host,tunnel_port,public_port,token_set}，
+      // 永不回显 token 明文；写入接受明文（可仅传部分字段，缺省继承现值）。
+      getRelayConfig: function() {
+        var url = CONTROL_BASE + RELAY_CONFIG_PATH;
+        var init = { method: 'GET', headers: { 'Accept': 'application/json' }, cache: 'no-store' };
+        init.headers[CONTROL_HEADER] = '1';
+        return doFetch(fetchImpl, url, init, getTimeoutMs, '读取中继配置').then(function(out) {
+          if (out.http >= 200 && out.http < 300) {
+            try { var d = JSON.parse(out.body); return (d && d.relay) || {}; } catch (e) { return {}; }
+          }
+          throw apiErr('中继配置读取失败', 'MOBILE_HTTP');
+        });
+      },
+      setRelayConfig: function(cfg) {
+        var body = {};
+        if (cfg && typeof cfg === 'object') {
+          if (cfg.host !== undefined) body.host = String(cfg.host || '');
+          if (cfg.tunnel_port !== undefined) body.tunnel_port = cfg.tunnel_port;
+          if (cfg.public_port !== undefined) body.public_port = cfg.public_port;
+          if (cfg.token !== undefined) body.token = String(cfg.token || '');
+        }
+        var url = CONTROL_BASE + RELAY_CONFIG_PATH;
+        var init = {
+          method: 'POST',
+          headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+          cache: 'no-store', body: JSON.stringify(body)
+        };
+        init.headers[CONTROL_HEADER] = '1';
+        return doFetch(fetchImpl, url, init, postTimeoutMs, '保存中继配置').then(function(out) {
+          if (out.http >= 200 && out.http < 300) {
+            try { var d = JSON.parse(out.body); return (d && d.relay) || {}; } catch (e) { return {}; }
+          }
+          var msg = '中继配置保存失败';
+          try { var eb = JSON.parse(out.body); if (eb && eb.error) msg = String(eb.error); } catch (e) {}
+          throw apiErr(msg, 'MOBILE_HTTP');
+        });
       }
     };
   }
 
   var api = {
     create: create,
-    validateRemoteURL: validateRemoteURL,
-    validateRelayConfig: validateRelayConfig
+    validateRemoteURL: validateRemoteURL
   };
 
   var root = typeof globalThis !== 'undefined' ? globalThis : this;
