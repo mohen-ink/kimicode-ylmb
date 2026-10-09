@@ -2,13 +2,12 @@
  * Kimi Remote Widget · 手机远程连接浮层 v3（自包含模块，kur- 前缀）
  * ---------------------------------------------------------------
  * 顶部三段切换块：内网（LAN，明文 HTTP，绑定所选内网网卡）/ CF 隧道（Cloudflare
- * Quick Tunnel）/ 中继服务器（frp，手机段明文 HTTP）。连接开启或在途期间模式锁定为当前
- * 运行模式，需先停止才能切换；关闭状态下切换只保存模式偏好，不持久化中继配置。
+ * Quick Tunnel）/ 中继服务器（占位，尚未开放）。连接开启或在途期间模式锁定为当前
+ * 运行模式，需先停止才能切换；关闭状态下切换只保存前端偏好，不发任何请求。
  * 外部契约（由先加载的脚本提供，缺失时给出明确提示，不拖垮宿主）：
  *   window.KimiMobileAPI.create({window?, fetch?, timeoutMs?})
- *     -> { status(), installConnector(consent, mode?), setEnabled(boolean, address?, mode?, relayConsent?, relayConfig?), rotatePair?() }
- *   window.KimiMobileAPI.validateRemoteURL(text, status) -> 可信 LAN / Internet / Relay pair url 或 throw
- *   window.KimiMobileAPI.validateRelayConfig(config) -> 已校验的中继配置或 throw
+ *     -> { status(), installConnector(consent), setEnabled(boolean, address?, mode?, relayConsent?), rotatePair?() }
+ *   window.KimiMobileAPI.validateRemoteURL(text, status) -> 可信 LAN / Internet pair url 或 throw
  *   window.KimiRemoteAPI.create(...)（可选）-> { status(): Promise<{enabled,state}> } 仅用于探测旧版官方中继
  *   window.KimiRemoteQR.toSVG(text) -> SVG 字符串
  * 本模块导出：window.KimiRemoteWidget.open()
@@ -38,8 +37,8 @@
   var api = null;
   var mobileApi = null;
   var MODE_KEY = 'kur-mode';
-  var lanStatus = null;   // 三种模式共用的移动桥状态
-  var selMode = loadMode();   // 关闭状态下的所选模式：'lan' | 'internet' | 'relay'
+  var lanStatus = null;   // 移动桥状态（内网 / 外网共用同一个桥）
+  var selMode = loadMode();   // 关闭状态下的所选模式：'lan' | 'internet' | 'relay'（relay 仅占位，不持久化）
   var selAddr = '';           // 内网模式所选网卡地址
   var lanAddrKey = null;      // 上次渲染到下拉框的网卡列表指纹，变化才重建 DOM，避免轮询时收起下拉
   var offStatus = null;   // 官方中继状态（仅探测用，不影响桥可用性）
@@ -51,6 +50,8 @@
   var msgSrc = '';        // 当前消息来源：'req'=请求/状态错误 'post'=POST 落地错误（对账 GET 不得清除）'local'=复制反馈
   var postError = '';     // 最近一次 POST 的安全错误文案：显式成功/对应状态达成前保留，新失败保持供诊断
   var postKind = '';      // 产生 postError 的动作：start/stop/install/rotate/official（决定谁能清除它）
+  var relayCfg = null;    // 最近一次读到的 {host,tunnel_port,public_port,token_set}；null=未加载
+  var relayCfgLoading = false;
   var lastFocus = null;
   var docKeyHandler = null;
   var overlayKeyHandler = null;
@@ -134,20 +135,19 @@
     '.kur-select { width: 100%; height: 36px; padding: 0 10px; border-radius: 10px; border: 1px solid color-mix(in srgb, var(--color-text, #000) 14%, transparent); background: var(--color-surface-sunken, transparent); color: var(--color-text, #1e293b); font-size: 13px; font-family: inherit; outline: none; }' +
     '.kur-select:focus { border-color: var(--color-accent, #1a88ff); }' +
     '.kur-select:disabled { opacity: 0.6; cursor: not-allowed; }' +
+    '.kur-relay-field { display: flex; flex-direction: column; gap: 5px; font-size: 12px; font-weight: 600; color: var(--color-text-muted, #64748b); }' +
+    '.kur-relay-field .kur-input { width: 100%; height: 36px; padding: 0 10px; border-radius: 10px; border: 1px solid color-mix(in srgb, var(--color-text, #000) 14%, transparent); background: var(--color-surface-sunken, transparent); color: var(--color-text, #1e293b); font-size: 13px; font-family: inherit; outline: none; }' +
+    '.kur-relay-field .kur-input:focus { border-color: var(--color-accent, #1a88ff); }' +
+    '.kur-relay-field .kur-input:disabled { opacity: 0.6; cursor: not-allowed; }' +
+    '.kur-relay-tokenset { font-size: 11.5px; font-weight: 400; color: var(--color-text-faint, var(--color-text-muted, #64748b)); margin-top: 2px; }' +
+    '.kur-relay-save { align-self: flex-start; }' +
     '.kur-lan-empty { padding: 10px 12px; border-radius: 10px; font-size: 12px; line-height: 1.6; background: color-mix(in srgb, var(--color-warning, #d97706) 12%, transparent); color: var(--color-warning, #b45309); }' +
+    '.kur-soon { padding: 18px 14px; border-radius: 12px; text-align: center; font-size: 13px; line-height: 1.7; color: var(--color-text-muted, #64748b); background: var(--color-surface-sunken, color-mix(in srgb, var(--color-text, #000) 4%, transparent)); }' +
     '@media (max-width: 380px) { .kur-head { padding: 16px 16px 12px; } .kur-body { padding: 0 16px 16px; } .kur-modes { margin: 0 16px 12px; } .kur-modehint { margin: -6px 16px 10px; } .kur-qrbox { width: 180px; height: 180px; } }';
 
   var DOWNLOAD_NOTICE = '我同意从 Cloudflare 官方 GitHub 下载固定版本 cloudflared 2026.9.3（约 55 MB，55,366,080 字节），并校验 SHA-256；安装组件不会开启连接。';
   var RELAY_NOTICE = '我同意本次通过 Cloudflare Quick Tunnel 中转。Cloudflare 可处理传输内容，此方式不是端到端加密（E2E），也不是 P2P；临时通道没有可靠性保证，电脑须保持开机，不依赖个人 VPS。';
   var LAN_NOTICE = '我了解内网模式使用明文 HTTP，同一网络内的其他设备可能窃听或篡改流量；仅在自己控制的可信 Wi-Fi 下使用。';
-  var FRP_DOWNLOAD_NOTICE = '我同意从 frp 官方 GitHub 下载插件固定版本的 frpc，并校验 SHA-256；这是独立于 cloudflared 的组件，安装不会开启连接。';
-  var FRP_HTTP_NOTICE = '我明确同意本次以明文 HTTP 连接中继服务器：手机到服务器的流量（包括配对授权）可能被窃听或篡改，仅用于联调，不用于敏感操作。电脑到服务器的 frp 通道仍使用 TLS 并校验服务器身份，但无法保护手机 HTTP 段。';
-  var NOTE_RELAY = '中继服务器第一阶段仅支持 HTTP，仅用于联调。手机到服务器的流量及配对授权可能被窃听、篡改，请勿用于敏感操作。' +
-    '服务器无需域名：填写规范公网 IPv4、frps 控制端口与不同的手机访问端口，并在服务器防火墙放行相应端口。' +
-    '电脑到服务器的 frp 通道使用 TLS；CA 必须为签发服务器证书的可信公开证书，服务器证书应包含该 IP 的 SAN，以便校验身份。不要粘贴私钥。' +
-    'frp 认证 token 须与服务器一致，它不是手机配对码，不会出现在手机链接或二维码里。配置不保存在浏览器存储中，停止或关闭浮层后清空 token 和 CA。' +
-    '运行中配置锁定；恢复运行状态只显示公开 IP 和访问端口。链接/二维码含一次性控制授权，请勿分享；手机端可执行命令、操作电脑文件。' +
-    '配对码约 10 分钟有效、仅可使用一次；生成新二维码不会断开已连接设备。电脑须保持开机，关闭此窗口不会停止连接。';
   var NOTE_LAN = '内网模式：不经过 Cloudflare，也无需下载任何组件。手机与电脑必须连接同一个可信 Wi-Fi，用系统浏览器扫描二维码或打开链接。' +
     '桥只绑定你选择的那块内网网卡（RFC1918 私有地址），不会监听其他网卡；端口从 39282 起自动选取空闲端口。' +
     '流量是明文 HTTP，不是加密连接；链接/二维码含一次性会话控制授权，请勿分享；手机端可通过 Agent 执行命令、操作电脑文件。' +
@@ -324,45 +324,48 @@
     var relayPanel = doc.createElement('div');
     relayPanel.id = 'kur-relay';
     relayPanel.className = 'kur-relay';
-    var relayConnector = doc.createElement('div');
-    relayConnector.id = 'kur-frp-connector';
-    relayConnector.className = 'kur-connector';
-    relayConnector.setAttribute('aria-live', 'polite');
-    relayPanel.appendChild(relayConnector);
-    consentRow(relayPanel, 'kur-frp-download-consent', FRP_DOWNLOAD_NOTICE);
-    var frpInstall = doc.createElement('button');
-    frpInstall.id = 'kur-frp-install';
-    frpInstall.type = 'button';
-    frpInstall.className = 'kur-btn-mini';
-    frpInstall.textContent = '仅安装 frp 组件';
-    frpInstall.disabled = true;
-    relayPanel.appendChild(frpInstall);
-    [['server-ip', '服务器公网 IPv4', 'text', '', '例如 8.8.8.8'],
-      ['server-port', '控制端口', 'number', '7000', '7000'],
-      ['remote-port', '手机访问端口', 'number', '6000', '6000'],
-      ['token', 'frp 认证 token（不是手机配对码）', 'password', '', '32–512 位无空白 ASCII'],
-      ['ca-cert', '服务器 CA 证书（PEM，仅粘贴公开证书）', 'textarea', '', '-----BEGIN CERTIFICATE-----']
-    ].forEach(function(f) {
-      var row = doc.createElement('label');
-      row.className = 'kur-lan-row';
-      row.appendChild(doc.createTextNode(f[1]));
-      var input = doc.createElement(f[2] === 'textarea' ? 'textarea' : 'input');
-      input.id = 'kur-frp-' + f[0];
-      input.className = f[2] === 'textarea' ? 'kur-link' : 'kur-select';
-      if (f[2] === 'textarea') { input.rows = 5; input.maxLength = 65536; }
-      else input.type = f[2];
-      if (f[2] === 'number') { input.min = '1'; input.max = '65535'; input.step = '1'; }
-      if (f[0] === 'token') input.maxLength = 512;
-      if (f[0] === 'server-ip') input.maxLength = 15;
-      input.value = f[3];
-      input.placeholder = f[4];
-      input.setAttribute('autocomplete', 'off');
-      input.setAttribute('spellcheck', 'false');
-      input.setAttribute('aria-label', f[1]);
-      row.appendChild(input);
-      relayPanel.appendChild(row);
-    });
-    consentRow(relayPanel, 'kur-frp-consent', FRP_HTTP_NOTICE);
+    var relayNote = doc.createElement('div');
+    relayNote.className = 'kur-soon';
+    relayNote.textContent = '经私人中继服务器（VPS）中转，由 worker 主动建立隧道。' +
+      '仅用于可信私人测试：明文 HTTP，不共享给不受信设备。';
+    relayPanel.appendChild(relayNote);
+    // 中继服务器配置：host/隧道端口/公网端口/密钥，保存后写
+    // usage-dashboard/relay.json，下次 start 生效；token 只写不回显。
+    var mkField = function(labelText, id, type, ph) {
+      var lab = doc.createElement('label');
+      lab.className = 'kur-relay-field';
+      lab.appendChild(doc.createTextNode(labelText));
+      var inp = doc.createElement('input');
+      inp.id = id;
+      inp.className = 'kur-input';
+      inp.type = type;
+      if (ph) inp.placeholder = ph;
+      lab.appendChild(inp);
+      return lab;
+    };
+    relayPanel.appendChild(mkField('服务器地址', 'kur-relay-host', 'text', '例如 your-relay-host 或 relay.example.com'));
+    var portRow = doc.createElement('div');
+    portRow.style.cssText = 'display:flex;gap:10px;';
+    var pf1 = mkField('隧道端口', 'kur-relay-tport', 'number', '48213');
+    pf1.style.flex = '1';
+    var pf2 = mkField('公网端口', 'kur-relay-pport', 'number', '47961');
+    pf2.style.flex = '1';
+    portRow.appendChild(pf1);
+    portRow.appendChild(pf2);
+    relayPanel.appendChild(portRow);
+    var tokenLab = mkField('连接密钥（token）', 'kur-relay-token', 'password', '留空 = 用内置默认');
+    var tokSet = doc.createElement('div');
+    tokSet.id = 'kur-relay-tokenset';
+    tokSet.className = 'kur-relay-tokenset';
+    tokSet.textContent = '';
+    tokenLab.appendChild(tokSet);
+    relayPanel.appendChild(tokenLab);
+    var relaySave = doc.createElement('button');
+    relaySave.id = 'kur-relay-save';
+    relaySave.className = 'kur-btn-mini kur-relay-save';
+    relaySave.type = 'button';
+    relaySave.textContent = '保存中继配置';
+    relayPanel.appendChild(relaySave);
     b.appendChild(relayPanel);
 
     var internet = doc.createElement('div');
@@ -519,9 +522,8 @@
 
   function focusables() {
     var ids = ['#kur-x', '#kur-mode-lan', '#kur-mode-internet', '#kur-mode-relay', '#kur-legacy-stop',
-               '#kur-lan-addr', '#kur-lan-consent', '#kur-frp-download-consent', '#kur-frp-install',
-               '#kur-frp-server-ip', '#kur-frp-server-port', '#kur-frp-remote-port', '#kur-frp-token',
-               '#kur-frp-ca-cert', '#kur-frp-consent', '#kur-download-consent', '#kur-install', '#kur-relay-consent',
+               '#kur-lan-addr', '#kur-lan-consent', '#kur-download-consent', '#kur-install', '#kur-relay-consent',
+               '#kur-relay-host', '#kur-relay-tport', '#kur-relay-pport', '#kur-relay-token', '#kur-relay-save',
                '#kur-link', '#kur-rotate', '#kur-copy', '#kur-enable', '#kur-disable', '#kur-note-toggle'];
     var out = [];
     for (var i = 0; i < ids.length; i++) {
@@ -564,17 +566,19 @@
   function loadMode() {
     try {
       var v = window.localStorage && window.localStorage.getItem(MODE_KEY);
-      if (v === 'lan' || v === 'internet' || v === 'relay') return v;
+      if (v === 'lan' || v === 'internet') return v;
     } catch (e) { /* 存储不可用：用默认 */ }
     return 'internet';
   }
   function saveMode(m) {
     try { if (window.localStorage) window.localStorage.setItem(MODE_KEY, m); } catch (e) { /* 忽略 */ }
   }
+  // 桥开启/启动中/停止中时，界面跟随桥的实际模式；关闭时用所选模式
   function curMode() {
-    if (bridgeBusy() && MODE_NAMES[lanStatus.mode]) return lanStatus.mode;
+    if (bridgeBusy() && (lanStatus.mode === 'lan' || lanStatus.mode === 'internet' || lanStatus.mode === 'relay')) return lanStatus.mode;
     return selMode;
   }
+  // 桥未确认（尚无状态）、桥非关闭、或有 POST 在途时锁定模式切换
   function modeLocked() {
     return !lanStatus || bridgeBusy() || (!!inflight && inflight.kind === 'POST');
   }
@@ -595,42 +599,19 @@
     }
     return false;
   }
-  function clearRelaySecrets() {
-    ['#kur-frp-token', '#kur-frp-ca-cert'].forEach(function(id) {
-      var el = $(id);
-      if (el) el.value = '';
-    });
-  }
-  function readRelayConfig() {
-    var validate = window.KimiMobileAPI && window.KimiMobileAPI.validateRelayConfig;
-    if (typeof validate !== 'function') return null;
-    var value = function(id) { var el = $('#kur-frp-' + id); return el ? el.value : ''; };
-    var port = function(id) { var raw = value(id); return /^[1-9][0-9]{0,4}$/.test(raw) ? +raw : NaN; };
-    try {
-      return validate({ server_ip: value('server-ip'), server_port: port('server-port'),
-        remote_port: port('remote-port'), token: value('token'), ca_cert: value('ca-cert') });
-    } catch (e) { return null; }
-  }
-  function currentConnector() {
-    if (!lanStatus) return null;
-    return curMode() === 'relay' ? (lanStatus.relay_connector || { state: 'missing' }) : lanStatus.connector;
-  }
   function canStart(allowRefresh) {
     if (requestLocked(allowRefresh) || !lanConfirmedOff() || startBlockedByLegacy()) return false;
     var mode = curMode();
     if (mode === 'lan') return lanAddrValid() && checked('#kur-lan-consent');
-    var connector = currentConnector();
-    if (!connector || connector.state !== 'installed') return false;
-    if (mode === 'relay') return checked('#kur-frp-consent') && !!readRelayConfig();
-    return mode === 'internet' && checked('#kur-relay-consent');
+    if (mode === 'relay') return true;   // 私人 VPS：无 consent、无 connector 前置
+    if (mode !== 'internet') return false;
+    return !!lanStatus.connector && lanStatus.connector.state === 'installed' && checked('#kur-relay-consent');
   }
   function canInstall(allowRefresh) {
-    var mode = curMode();
-    var connector = currentConnector();
-    return !requestLocked(allowRefresh) && !!mobileApi && (mode === 'internet' || mode === 'relay')
+    return !requestLocked(allowRefresh) && !!mobileApi && curMode() === 'internet'
       && typeof mobileApi.installConnector === 'function' && lanConfirmedOff() && !startBlockedByLegacy()
-      && !!connector && (connector.state === 'missing' || connector.state === 'failed')
-      && checked(mode === 'relay' ? '#kur-frp-download-consent' : '#kur-download-consent');
+      && !!lanStatus.connector && (lanStatus.connector.state === 'missing' || lanStatus.connector.state === 'failed')
+      && checked('#kur-download-consent');
   }
   function canRotate(allowRefresh) {
     if (requestLocked(allowRefresh) || !mobileApi || typeof mobileApi.rotatePair !== 'function') return false;
@@ -664,7 +645,8 @@
     var showStop = (!!lanStatus && lanStatus.state !== 'off') || (!lanStatus && !!lanErr);
     if (on) {
       on.classList.toggle('kur-hidden', showStop);
-      on.textContent = curMode() === 'lan' ? '开启内网连接' : (curMode() === 'relay' ? '开启中继连接（HTTP）' : '开启外网连接');
+      on.textContent = curMode() === 'lan' ? '开启内网连接'
+        : (curMode() === 'relay' ? '开启中继连接' : '开启外网连接');
     }
     if (off) off.classList.toggle('kur-hidden', !showStop);
     var rotate = $('#kur-rotate');
@@ -698,27 +680,8 @@
     if (lanConsent) lanConsent.disabled = locked || !lanConfirmedOff() || startBlockedByLegacy();
     var lanSel = $('#kur-lan-addr');
     if (lanSel) lanSel.disabled = locked || !lanConfirmedOff() || startBlockedByLegacy() || !lanAddresses().length;
-    var frp = lanStatus && (lanStatus.relay_connector || { state: 'missing' });
-    var frpInstalled = !!frp && frp.state === 'installed';
-    var frpEl = $('#kur-frp-connector');
-    var frpNames = { missing: '未安装', installing: '正在安装…', installed: '已安装', failed: '安装失败' };
-    if (frpEl) frpEl.textContent = 'frp 组件：' + (frp ? (frpNames[frp.state] || '状态未知')
-      + (frp.version ? '（' + frp.version + '）' : '') : '状态待确认');
-    var frpInstall = $('#kur-frp-install');
-    if (frpInstall) {
-      frpInstall.disabled = curMode() !== 'relay' || !canInstall(true);
-      frpInstall.setAttribute('aria-disabled', frpInstall.disabled || !!inflight ? 'true' : 'false');
-      frpInstall.classList.toggle('kur-hidden', frpInstalled);
-    }
-    var frpRow = $('#kur-frp-download-consent-row');
-    if (frpRow) frpRow.classList.toggle('kur-hidden', frpInstalled);
-    var frpDownload = $('#kur-frp-download-consent');
-    if (frpDownload) frpDownload.disabled = frpInstalled || locked || !frp || frp.state === 'installing';
-    var frpLocked = locked || !lanConfirmedOff() || startBlockedByLegacy();
-    ['server-ip', 'server-port', 'remote-port', 'token', 'ca-cert', 'consent'].forEach(function(id) {
-      var el = $('#kur-frp-' + id);
-      if (el) el.disabled = frpLocked;
-    });
+    // relay 配置区与模式锁定同生命周期：桥在跑时不允许改配置
+    relayCfgFieldsDisabled(locked || !lanConfirmedOff() || startBlockedByLegacy() || relayCfgLoading);
     renderLegacyBanner();
     if (hadDialogFocus && document.activeElement === document.body) {
       var targets = focusables();
@@ -732,6 +695,59 @@
 
   // 重建网卡下拉：仅在网卡列表变化时重建，避免轮询把用户正在展开的下拉收起；
   // 保留用户已选地址，未选时仅有一块网卡才自动选中（多网卡不预选，防止选到虚拟网卡）
+  /* ---------------- relay 配置 ---------------- */
+  function relayCfgFieldsDisabled(disabled) {
+    ['#kur-relay-host', '#kur-relay-tport', '#kur-relay-pport', '#kur-relay-token', '#kur-relay-save']
+      .forEach(function(id) {
+        var el = $(id);
+        if (el) el.disabled = disabled;
+      });
+  }
+  function relayCfgApply(c) {
+    relayCfg = c || null;
+    var h = $('#kur-relay-host'), tp = $('#kur-relay-tport'), pp = $('#kur-relay-pport'), ts = $('#kur-relay-tokenset');
+    if (h && relayCfg) h.value = relayCfg.host || '';
+    if (tp && relayCfg) tp.value = (relayCfg.tunnel_port !== undefined && relayCfg.tunnel_port !== null) ? String(relayCfg.tunnel_port) : '';
+    if (pp && relayCfg) pp.value = (relayCfg.public_port !== undefined && relayCfg.public_port !== null) ? String(relayCfg.public_port) : '';
+    if (ts) ts.textContent = relayCfg && relayCfg.token_set ? '已设置（不回显）' : '未设置（用内置默认）';
+  }
+  function loadRelayConfig() {
+    if (!mobileApi || typeof mobileApi.getRelayConfig !== 'function') return;
+    if (relayCfgLoading) return;
+    relayCfgLoading = true;
+    mobileApi.getRelayConfig().then(function(c) {
+      relayCfgApply(c);
+    }).catch(function() { /* 读取失败保持输入框原样 */ }).then(function() {
+      relayCfgLoading = false;
+    });
+  }
+  function saveRelayConfig() {
+    if (!mobileApi || typeof mobileApi.setRelayConfig !== 'function') return;
+    var host = ($('#kur-relay-host') || {}).value || '';
+    var tport = ($('#kur-relay-tport') || {}).value || '';
+    var pport = ($('#kur-relay-pport') || {}).value || '';
+    var token = ($('#kur-relay-token') || {}).value || '';
+    var body = {};
+    if (host !== '') body.host = host;
+    var tp = parseInt(tport, 10), pp = parseInt(pport, 10);
+    if (tport !== '' && !isNaN(tp)) body.tunnel_port = tp;
+    if (pport !== '' && !isNaN(pp)) body.public_port = pp;
+    if (token !== '') body.token = token;
+    var saveBtn = $('#kur-relay-save');
+    if (saveBtn) saveBtn.disabled = true;
+    mobileApi.setRelayConfig(body).then(function(c) {
+      relayCfgApply(c);
+      var t = $('#kur-relay-token');
+      if (t) t.value = '';   // 不回显
+      showMsg('中继配置已保存，下次开启生效。', false, 'local');
+    }).catch(function(e) {
+      showMsg((e && e.message) || '中继配置保存失败', true, 'req');
+    }).then(function() {
+      if (saveBtn) saveBtn.disabled = false;
+      setButtons();
+    });
+  }
+
   function renderLanAddrs() {
     var sel = $('#kur-lan-addr');
     var empty = $('#kur-lan-empty');
@@ -787,7 +803,9 @@
     }
     var note = $('#kur-note');
     if (note) {
-      var noteText = mode === 'lan' ? NOTE_LAN : (mode === 'internet' ? NOTE_INTERNET : NOTE_RELAY);
+      var noteText = mode === 'lan' ? NOTE_LAN
+        : (mode === 'internet' ? NOTE_INTERNET
+           : '经私人中继服务器（VPS）中转，worker 主动建立加密隧道出口；明文 HTTP，仅用于可信私人测试。');
       if (note.textContent !== noteText) note.textContent = noteText;
     }
     renderLanAddrs();
@@ -796,10 +814,7 @@
   function selectMode(m) {
     if (!isOpen || modeLocked() || m === selMode) return;
     selMode = m;
-    saveMode(m);
-    clearRelaySecrets();
-    var consent = $('#kur-frp-consent');
-    if (consent) consent.checked = false;
+    if (m !== 'relay') saveMode(m);
     hideLink();
     showMsg('', false);
     postError = '';
@@ -900,16 +915,13 @@
       CONNECTOR_HASH_MISMATCH: '组件完整性校验失败，无法使用。',
       CONNECTOR_UNSUPPORTED: '当前系统不支持此外网组件。',
       CONNECTOR_BUSY: '组件正在处理其他操作，请稍候。',
-      CONSENT_REQUIRED: '请分别明确同意组件下载和本次中转风险。',
-      RELAY_CONFIG_INVALID: '中继配置无效：请检查公网 IPv4、不同的端口、32–512 位无空白 ASCII token 和 PEM CA 证书。',
+      CONSENT_REQUIRED: '请分别明确同意组件下载和本次中转。',
       TUNNEL_START_FAILED: '外网通道启动失败，请停止后再试。',
       TUNNEL_TIMEOUT: '外网通道启动超时，请检查网络。',
       TUNNEL_EXITED: '外网通道已断开，请停止后重新开启。',
       OWNER_LOST: '桌面端服务已断开，连接已撤销。',
-      SERVER_TOKEN_UNAVAILABLE: '手机连接凭据创建或读取失败，请检查目录权限。',
-      OWNER_AUTH_FAILED: '桌面端拒绝手机连接凭据，请停止后重试或升级桌面端。',
-      OWNER_AUTH_CHECK_FAILED: '无法验证桌面端认证，请稍后重试。',
       START_CANCELLED: '连接启动已取消。',
+      SERVER_TOKEN_UNAVAILABLE: '手机连接凭据创建或读取失败，请检查目录权限。',
       // worker 启动阶段码（与 mobile_worker stage 表一致，固定中文文案）
       WORKER_STATE_DIR_UNAVAILABLE: '手机连接助手工作目录不可用，请检查插件安装。',
       WORKER_STARTUP_BUSY: '有其他启动操作正在进行，请稍候再试。',
@@ -979,8 +991,7 @@
     s = s || {};
     var st = STATES[s.state] ? s.state : '';
     var ok = (postKind === 'start' && st === 'on')
-      || (postKind === 'install' && !!s.connector && s.connector.state === 'installed')
-      || (postKind === 'install-relay' && !!s.relay_connector && s.relay_connector.state === 'installed');
+      || (postKind === 'install' && !!s.connector && s.connector.state === 'installed');
     if (!ok) return;
     postError = '';
     postKind = '';
@@ -990,23 +1001,13 @@
   function renderStatus(s) {
     s = s || {};
     var st = STATES[s.state] ? s.state : '';
-    if (st === 'off' && curState && curState !== 'off') clearRelaySecrets();
     curState = st;
-    if (st && st !== 'off' && MODE_NAMES[s.mode]) selMode = s.mode;
-    if (s.mode === 'relay' && st === 'on' && s.public_origin) {
-      var endpoint = /^http:\/\/([0-9.]+):([1-9][0-9]{0,4})$/.exec(s.public_origin);
-      if (endpoint) {
-        var ip = $('#kur-frp-server-ip');
-        var port = $('#kur-frp-remote-port');
-        if (ip) ip.value = endpoint[1];
-        if (port) port.value = endpoint[2];
-      }
-    }
+    if (st && st !== 'off' && (s.mode === 'lan' || s.mode === 'internet' || s.mode === 'relay')) selMode = s.mode;
     var url = validUrlFrom(s);
     var onNoUrl = st === 'on' && !url;
     var pairUsed = onNoUrl && s.pair_state === 'used';
     var pairExpired = onNoUrl && s.pair_state === 'expired';
-    var tunnelFailed = s.mode === curMode() && s.mode !== 'lan' && s.tunnel && s.tunnel.state === 'failed';
+    var tunnelFailed = s.mode !== 'lan' && s.tunnel && s.tunnel.state === 'failed';
     var stateEl = $('#kur-state');
     var dot = $('#kur-dot');
     var stateText = STATES[st] || '状态待确认';
@@ -1049,16 +1050,15 @@
       worker.classList.toggle('kur-show', !!notice);
       worker.setAttribute('aria-hidden', notice ? 'false' : 'true');
     }
-    renderTunnelDiag(s.mode === 'internet' && curMode() === 'internet' ? s : null);
+    renderTunnelDiag(s.mode === 'lan' ? null : s);
     clearPostIfConfirmed(s);
-    var mode = curMode();
-    var sameMode = s.mode === mode;
-    var connector = mode === 'relay' ? s.relay_connector : (mode === 'internet' ? s.connector : null);
-    var topError = sameMode || !/^(CONNECTOR_|TUNNEL_|RELAY_)/.test(s.error_code || '') ? s.error_code : '';
-    var errorCode = topError || (sameMode && mode !== 'lan' && s.tunnel && s.tunnel.error_code)
-      || (connector && connector.error_code);
+    // LAN 桥与连接器/隧道无关：这些字段的错误码只对 CF 隧道模式有意义
+    var inet = s.mode !== 'lan' && curMode() !== 'lan';
+    var errorCode = inet
+      ? (s.error_code || (s.tunnel && s.tunnel.error_code) || (s.connector && s.connector.error_code))
+      : s.error_code;
     var priority = msgSrc === 'post';   // POST 落地错误优先于轮询级提示，不被对账 GET 覆盖
-    if (errorCode) showMsg(priority ? postError : safeError({ code: errorCode }), true, priority ? 'post' : 'req');
+    if (errorCode || (inet && s.error)) showMsg(priority ? postError : safeError({ code: errorCode }), true, priority ? 'post' : 'req');
     else if (tunnelFailed) {
       showMsg(priority ? postError : '外网通道进程已退出，旧链接已不可用。请停止后重新开启，以生成新的链接和二维码。', true, priority ? 'post' : 'req');
     } else if (pairUsed) {
@@ -1257,7 +1257,6 @@
     // 仅在已确认 off 时拦截
     if (!mobileApi || (on && !canStart()) || (!on && !!lanStatus && lanStatus.state === 'off')) return;
     if (!on) {
-      clearRelaySecrets();
       runPost(function() { return mobileApi.setEnabled(false); }, true, false, 'stop');
       return;
     }
@@ -1269,20 +1268,9 @@
       return;
     }
     if (curMode() === 'relay') {
-      var config = readRelayConfig();
-      if (!config) { showMsg(safeError({ code: 'RELAY_CONFIG_INVALID' }), true, 'req'); return; }
-      var frpConsent = checked('#kur-frp-consent');
       runPost(function() {
-        try { return mobileApi.setEnabled(true, undefined, 'relay', frpConsent, config); }
-        finally {
-          config.token = '';
-          config.ca_cert = '';
-          config = null;
-          clearRelaySecrets();
-        }
+        return mobileApi.setEnabled(true, undefined, 'relay');
       }, false, false, 'start');
-      var frp = $('#kur-frp-consent');
-      if (frp) frp.checked = false;
       return;
     }
     var relayConsent = checked('#kur-relay-consent');
@@ -1295,11 +1283,7 @@
 
   function installConnector() {
     if (!isOpen || !canInstall()) return;
-    var mode = curMode();
-    runPost(function() { return mode === 'relay' ? mobileApi.installConnector(true, 'relay')
-      : mobileApi.installConnector(true); }, false, false, mode === 'relay' ? 'install-relay' : 'install');
-    var consent = $(mode === 'relay' ? '#kur-frp-download-consent' : '#kur-download-consent');
-    if (consent) consent.checked = false;
+    runPost(function() { return mobileApi.installConnector(true); }, false, false, 'install');
   }
 
   // 更换配对码：仅重发一次性配对码，不重建通道、不断开已连设备；POST 锁内只允许一次
@@ -1392,21 +1376,17 @@
       };
       bind('#kur-x', close);
       bind('#kur-install', installConnector);
-      bind('#kur-frp-install', installConnector);
-      ['server-ip', 'server-port', 'remote-port', 'token', 'ca-cert'].forEach(function(id) {
-        var el = $('#kur-frp-' + id);
-        if (el) el.addEventListener('input', setButtons);
-      });
       bind('#kur-enable', function() { setEnabled(true); });
       bind('#kur-disable', function() { setEnabled(false); });
       bind('#kur-copy', copyLink);
       bind('#kur-rotate', rotatePair);
       bind('#kur-legacy-stop', stopOfficial);
+      bind('#kur-relay-save', saveRelayConfig);
       bind('#kur-note-toggle', toggleNote);
       ['lan', 'internet', 'relay'].forEach(function(m) {
         bind('#kur-mode-' + m, function() { selectMode(m); });
       });
-      ['#kur-download-consent', '#kur-relay-consent', '#kur-lan-consent', '#kur-frp-download-consent', '#kur-frp-consent'].forEach(function(id) {
+      ['#kur-download-consent', '#kur-relay-consent', '#kur-lan-consent'].forEach(function(id) {
         var el = $(id);
         if (el) el.addEventListener('change', setButtons);
       });
@@ -1419,7 +1399,7 @@
     isOpen = true;
     toggleNote(false);
     overlayEl.classList.add('kur-open');
-    ['#kur-download-consent', '#kur-relay-consent', '#kur-lan-consent', '#kur-frp-download-consent', '#kur-frp-consent'].forEach(function(id) {
+    ['#kur-download-consent', '#kur-relay-consent', '#kur-lan-consent'].forEach(function(id) {
       var el = $(id);
       if (el) el.checked = false;
     });
@@ -1453,6 +1433,7 @@
       if (d) { d.classList.remove('kur-on'); d.classList.remove('kur-mid'); }
       hideLink();
       setButtons();
+      loadRelayConfig();
       if (inflight) wantRefresh = true;   // 在途请求属旧 gen：落地后立即补当前 gen 的 GET
       else pollOnce();
       startPolling();
@@ -1465,7 +1446,6 @@
     gen++;                    // 丢弃所有在途响应
     wantRefresh = false;
     stopPolling();
-    clearRelaySecrets();
     if (overlayEl) overlayEl.classList.remove('kur-open');
     if (docKeyHandler) {
       document.removeEventListener('keydown', docKeyHandler);

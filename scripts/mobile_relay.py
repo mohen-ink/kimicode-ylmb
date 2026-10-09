@@ -1,724 +1,695 @@
 # -*- coding: utf-8 -*-
+"""
+Kimi Code 用量面板 · 私人测试用公网中继（worker 侧，纯标准库，Python>=3.8）
+
+拓扑（与 VPS 端 scripts/relay_server.py 配对）：
+  手机浏览器 --HTTP/WS--> VPS 公网口 :<public_port> --WS 帧--> 本模块（worker 隧道）
+  本模块 --HTTP/WS--> 127.0.0.1:<bridge_port>（本机桥，仍绑回环）
+
+本模块在 worker 进程内运行：向 ws://<vps>:48213/relay/register 建立一条持久
+WebSocket（X-Relay-Token 共享密钥，客户端帧必须掩码），注册后：
+
+  - 收 {type:'http', id, method, path, headers, body(b64)}：
+      向本机桥发一次普通 HTTP 请求（Host 重写为 VPS 公网口地址，
+      Content-Length 按转发的 body 实算），把响应帧化回
+      {type:'http_resp', id, status, headers, body(b64)}。
+  - 收 {type:'ws_open', id, path, headers}：
+      对本机桥发起一次 WebSocket 升级（同 Host 重写），之后把隧道侧
+      {type:'ws_data', id, opcode, fin, payload(b64)} 与本机 socket 上的
+      RFC6455 帧双向互转，{type:'ws_close'} 双向同步。
+  - 周期性发 RFC6455 ping 保活；隧道断开会以指数退避重连（须先告知桥
+    on_failure——桥语义是 fail-closed，重连只会用于下一次 start）。
+
+与 ConnectorRuntime 的调用契约一致：start(bound_port, on_ready, on_fail)
+立即返回、后台线程跑隧道；on_ready(origin) 在注册成功拿到
+{registered, tunnel_id, origin} 后回调（origin 形如
+'http://<vps>:<public_port>'，不带 /t/<id>——tid 经 self.tunnel_id 另取）；
+on_failure(code) 在隧道不可用/断线时回调一次。stop() 同步停当前隧道，
+shutdown() 永久关闭。code 只用桥白名单里的码（TUNNEL_* / START_CANCELLED）。
+
+纯标准库：socket + ssl（预留 TLS，当前 ws:// 明文）+ base64 + hashlib +
+json + secrets + struct + threading。不装任何第三方。
+"""
 import base64
 import hashlib
-import ipaddress
 import json
-import os
-from pathlib import Path
-import re
 import secrets
-import ssl
-import stat
-import tempfile
+import socket
+import struct
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-import zipfile
 
-from mobile_security import _set_protected_dacl
-from mobile_tunnel import (_WindowsJobProcess, _file_change_time, _hash_file,
-                           _private_environment, _supported_windows)
+# ---------------- 配置 ----------------
+# 默认值即「未配置」的兼容回退；持久化在 usage-dashboard/relay.json，由
+# relay_config.py 统一读写校验。运行时经 RelayClient(...) 构造参数注入——
+# 本模块不再用模块级常量写死目标 VPS（host/port/header 全部实例化）。
+RELAY_HOST = 'your-relay-host'
+RELAY_PORT = 48213           # VPS 隧道注册口（ws://<vps>:<RELAY_PORT>/relay/register）
+RELAY_PUBLIC_PORT = 47961    # VPS 公网口（http://<vps>:<RELAY_PUBLIC_PORT>/t/<id>/...）
+# 共享密钥：运行期经 KIMI_RELAY_TOKEN 环境变量，或本机 usage-dashboard/relay.json
+# 的 token 字段提供。**仓库不内置任何 token 默认值**——真实值只存在于部署环境与
+# 本机配置，不进代码、不进提交。空串 = 不发 X-Relay-Token（仅服务器未启用
+# --token 校验时可用）。
+DEFAULT_RELAY_TOKEN = ''
 
-CONSENT_VERSION = 'frp-tcp-http-v1'
-RELAY_VERSION = '0.67.0'
-ARCHIVE_URL = ('https://github.com/fatedier/frp/releases/download/v0.67.0/'
-               'frp_0.67.0_windows_amd64.zip')
-ARCHIVE_SIZE = 13729508
-ARCHIVE_SHA256 = '8baf23e3fbd486f6ba0913501372c5ff0053efa88a8b8d391f3605ced43d2af5'
-CONNECTOR_SIZE = 16326144
-CONNECTOR_SHA256 = '4606ce1567074e102a703db6a662d23d6a13f2cbffbc054faa4e110ff7a75582'
-LICENSE_SIZE = 11358
-LICENSE_SHA256 = 'c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08'
-EXE_MEMBER = 'frp_0.67.0_windows_amd64/frpc.exe'
-LICENSE_MEMBER = 'frp_0.67.0_windows_amd64/LICENSE'
-INSTALL_TIMEOUT = 180.0
-DOWNLOAD_TIMEOUT = 30.0
-STARTUP_TIMEOUT = 45.0
-HEARTBEAT_INTERVAL = 5
-HEARTBEAT_TIMEOUT = 15
-LOG_LINE_MAX_BYTES = 4096
-LOG_CHUNK_MAX_BYTES = 4096
-LOG_BLOCKS_PER_POLL = 16
-CA_MAX_BYTES = 65536
-CA_MAX_CERTIFICATES = 4
-_PACKAGED_ROOT = Path(os.path.realpath(os.path.abspath(__file__))).parent.parent
-_PACKAGED_LICENSE = _PACKAGED_ROOT / 'assets' / 'vendor' / 'frp-0.67.0-LICENSE'
-_CDN_HOSTS = frozenset(('release-assets.githubusercontent.com',
-                        'objects.githubusercontent.com',
-                        'github-releases.githubusercontent.com'))
-_CONFIG_FIELDS = frozenset(('server_ip', 'server_port', 'remote_port', 'token', 'ca_cert'))
-_CERTIFICATE_RE = re.compile(
-    r'-----BEGIN CERTIFICATE-----\n([A-Za-z0-9+/=\n]+)\n-----END CERTIFICATE-----')
-_NONPUBLIC_NETWORKS = tuple(ipaddress.IPv4Network(value) for value in (
-    '0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8',
-    '169.254.0.0/16', '172.16.0.0/12', '192.0.0.0/24', '192.0.2.0/24',
-    '192.88.99.0/24', '192.168.0.0/16', '198.18.0.0/15',
-    '198.51.100.0/24', '203.0.113.0/24', '224.0.0.0/4', '240.0.0.0/4'))
+WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+CONNECT_TIMEOUT = 15.0
+REGISTER_TIMEOUT = 20.0
+HTTP_TIMEOUT = 60.0          # 隧道内一次 HTTP 往返的上限（与桥 PROXY 超时对齐）
+PING_INTERVAL = 20.0         # 隧道保活 ping 周期
+RECONNECT_BASE = 1.0         # 掉线重连起始退避（秒）
+RECONNECT_MAX = 30.0         # 掉线重连退避上限（秒）
+RECONNECT_GIVEUP = 300.0     # 连续重连多久仍失败才认 TUNNEL_EXITED（秒）
+MAX_HTTP_BODY = 32 * 1024 * 1024
+MAX_WS_MESSAGE = 4 * 1024 * 1024
+HEADER_MAX = 32 * 1024
+RECV_POLL = 0.5              # socket 轮询步长（让 stop 能及时生效）
+
+_TOK_ID_RE = frozenset('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-')
 
 
-def validate_config(config):
-    try:
-        if type(config) is not dict or set(config) != _CONFIG_FIELDS:
-            raise ValueError()
-        server_ip = config['server_ip']
-        if type(server_ip) is not str:
-            raise ValueError()
-        address = ipaddress.IPv4Address(server_ip)
-        if (str(address) != server_ip or not address.is_global
-                or address.is_multicast or address.is_reserved
-                or any(address in network for network in _NONPUBLIC_NETWORKS)):
-            raise ValueError()
-        for name in ('server_port', 'remote_port'):
-            if type(config[name]) is not int or not 1 <= config[name] <= 65535:
-                raise ValueError()
-        if config['server_port'] == config['remote_port']:
-            raise ValueError()
-        token = config['token']
-        if (type(token) is not str or not 32 <= len(token) <= 512
-                or any(not 33 <= ord(char) <= 126 for char in token)):
-            raise ValueError()
-        ca = config['ca_cert']
-        if type(ca) is not str or len(ca) > CA_MAX_BYTES:
-            raise ValueError()
-        ca.encode('ascii')
-        ca = ca.replace('\r\n', '\n').strip(' \t\n')
-        certificates = []
-        position = 0
-        for match in _CERTIFICATE_RE.finditer(ca):
-            if ca[position:match.start()].strip(' \t\n'):
-                raise ValueError()
-            base64.b64decode(match.group(1).replace('\n', ''), validate=True)
-            certificates.append(match.group(0))
-            position = match.end()
-        if (ca[position:].strip(' \t\n')
-                or not 1 <= len(certificates) <= CA_MAX_CERTIFICATES
-                or len(set(certificates)) != len(certificates)):
-            raise ValueError()
-        ca = '\n'.join(certificates) + '\n'
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        context.load_verify_locations(cadata=ca)
-        counts = context.cert_store_stats()
-        if counts['x509'] != len(certificates) or counts['x509_ca'] != len(certificates):
-            raise ValueError()
-        return {'server_ip': server_ip, 'server_port': config['server_port'],
-                'remote_port': config['remote_port'], 'token': token, 'ca_cert': ca}
-    except (ValueError, TypeError, KeyError, UnicodeError, ssl.SSLError):
-        raise ValueError('RELAY_CONFIG_INVALID') from None
+def _tok_ok(s, lo=1, hi=64):
+    return isinstance(s, str) and lo <= len(s) <= hi and all(c in _TOK_ID_RE for c in s)
 
 
-def public_origin(config):
-    valid = validate_config(config)
-    return 'http://{}:{}'.format(valid['server_ip'], valid['remote_port'])
+# ---------------- WebSocket 帧（RFC6455，客户端侧必须掩码） ----------------
+def _ws_frame(opcode, payload, mask=True):
+    b0 = 0x80 | opcode
+    ln = len(payload)
+    mbit = 0x80 if mask else 0x00
+    if ln < 126:
+        head = bytes([b0, mbit | ln])
+    elif ln < 65536:
+        head = bytes([b0, mbit | 126]) + struct.pack('>H', ln)
+    else:
+        head = bytes([b0, mbit | 127]) + struct.pack('>Q', ln)
+    if not mask:
+        return head + payload
+    mk = secrets.token_bytes(4)
+    masked = bytes(b ^ mk[i % 4] for i, b in enumerate(payload))
+    return head + mk + masked
 
 
-def _check_directory(path):
-    for directory in (path,) + tuple(path.parents):
-        info = directory.lstat()
-        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
-                or getattr(info, 'st_file_attributes', 0) & 0x400):
-            raise OSError('runtime directory rejected')
+def _send_all(sock, data):
+    sock.sendall(data)
 
 
-def _safe_metadata(path):
-    _check_directory(path.parent)
-    info = path.lstat()
-    if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
-            or getattr(info, 'st_file_attributes', 0) & 0x400
-            or info.st_nlink != 1):
-        raise OSError('runtime file rejected')
-    changed = _file_change_time(path) if os.name == 'nt' else info.st_ctime_ns
-    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
-            info.st_ctime_ns, changed)
+class _WSock:
+    """一条已建立的 WS 连接：同步读帧 + 线程安全写帧。"""
 
+    def __init__(self, sock, masked_out):
+        self.sock = sock
+        self.masked_out = masked_out     # True=发帧掩码（worker→VPS）
+        self.wlock = threading.Lock()
+        self.rbuf = bytearray()
+        self.alive = True
 
-def _verified_file(path, size, digest):
-    before = _safe_metadata(path)
-    if before[2] != size or _hash_file(path) != digest:
-        return False
-    return before == _safe_metadata(path)
-
-
-def _read_packaged_license():
-    package_root = Path(os.path.realpath(str(_PACKAGED_ROOT)))
-    license_path = package_root / 'assets' / 'vendor' / 'frp-0.67.0-LICENSE'
-    before = _safe_metadata(license_path)
-    with license_path.open('rb') as stream:
-        data = stream.read(LICENSE_SIZE + 1)
-    if (len(data) != LICENSE_SIZE or hashlib.sha256(data).hexdigest() != LICENSE_SHA256
-            or before != _safe_metadata(license_path)):
-        raise ValueError('license integrity check')
-    return data
-
-
-def _allowed_download_url(url):
-    try:
-        parsed = urllib.parse.urlsplit(url)
-        if (parsed.scheme != 'https' or parsed.username is not None
-                or parsed.password is not None or parsed.port not in (None, 443)
-                or parsed.fragment):
+    def send_frame(self, opcode, payload=b''):
+        if not self.alive:
             return False
-        if parsed.hostname in _CDN_HOSTS:
+        try:
+            data = _ws_frame(opcode, payload, mask=self.masked_out)
+            with self.wlock:
+                self.sock.sendall(data)
             return True
-        return (parsed.hostname == 'github.com'
-                and parsed.path == urllib.parse.urlsplit(ARCHIVE_URL).path
-                and not parsed.query)
-    except (ValueError, TypeError):
-        return False
-
-
-class _OfficialRedirects(urllib.request.HTTPRedirectHandler):
-    max_redirections = 5
-    max_repeats = 2
-
-    def __init__(self, deadline):
-        self.deadline = deadline
-
-    def redirect_request(self, request, fp, code, message, headers, newurl):
-        if time.monotonic() >= self.deadline or not _allowed_download_url(newurl):
-            raise urllib.error.URLError('download redirect rejected')
-        return super().redirect_request(request, fp, code, message, headers, newurl)
-
-
-def _download(destination, deadline, cancelled):
-    remaining = deadline - time.monotonic()
-    if remaining <= 0 or cancelled():
-        raise TimeoutError('download deadline')
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
-                                        _OfficialRedirects(deadline))
-    request = urllib.request.Request(ARCHIVE_URL, headers={
-        'User-Agent': 'kimi-mobile-relay/0.67.0', 'Accept-Encoding': 'identity'})
-    with opener.open(request, timeout=min(DOWNLOAD_TIMEOUT, remaining)) as response:
-        if not _allowed_download_url(response.geturl()):
-            raise ValueError('download host rejected')
-        declared = response.headers.get('Content-Length')
-        if declared is not None and (not declared.isdigit() or int(declared) != ARCHIVE_SIZE):
-            raise ValueError('download size rejected')
-        received = 0
-        read = getattr(response, 'read1', response.read)
-        with destination.open('xb') as stream:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or cancelled():
-                    raise TimeoutError('download deadline')
-                sock = getattr(getattr(getattr(response, 'fp', None), 'raw', None), '_sock', None)
-                if sock is not None:
-                    sock.settimeout(min(DOWNLOAD_TIMEOUT, remaining))
-                block = read(min(65536, ARCHIVE_SIZE - received + 1))
-                if time.monotonic() >= deadline or cancelled():
-                    raise TimeoutError('download deadline')
-                if not block:
-                    break
-                received += len(block)
-                if received > ARCHIVE_SIZE:
-                    raise ValueError('download size rejected')
-                stream.write(block)
-            if received != ARCHIVE_SIZE:
-                raise ValueError('download truncated')
-            stream.flush()
-            os.fsync(stream.fileno())
-
-
-def _extract_fixed(archive, exe, license_path, license_data):
-    if not _verified_file(archive, ARCHIVE_SIZE, ARCHIVE_SHA256):
-        raise ValueError('archive integrity check')
-    signature = _safe_metadata(archive)
-    with zipfile.ZipFile(archive) as source:
-        for member, target, size, digest in (
-                (EXE_MEMBER, exe, CONNECTOR_SIZE, CONNECTOR_SHA256),
-                (LICENSE_MEMBER, license_path, LICENSE_SIZE, LICENSE_SHA256)):
-            matches = [info for info in source.infolist() if info.filename == member]
-            if len(matches) != 1:
-                raise ValueError('archive member rejected')
-            info = matches[0]
-            mode = info.external_attr >> 16
-            if (info.is_dir() or info.file_size != size or info.flag_bits & 1
-                    or stat.S_IFMT(mode) not in (0, stat.S_IFREG)):
-                raise ValueError('archive member rejected')
-            received = 0
-            with source.open(info) as stream, target.open('xb') as output:
-                while True:
-                    block = stream.read(min(65536, size - received + 1))
-                    if not block:
-                        break
-                    received += len(block)
-                    if received > size:
-                        raise ValueError('archive size rejected')
-                    output.write(block)
-                output.flush()
-                os.fsync(output.fileno())
-            if received != size or not _verified_file(target, size, digest):
-                raise ValueError('member integrity check')
-    if signature != _safe_metadata(archive) or license_path.read_bytes() != license_data:
-        raise ValueError('archive changed')
-
-
-def _write_private(path, data):
-    _check_directory(path.parent)
-    with path.open('xb') as stream:
-        _set_protected_dacl(str(path), False)
-        _safe_metadata(path)
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    _safe_metadata(path)
-
-
-def _config_bytes(config, port, ca_path, proxy_name):
-    quote = json.dumps
-    lines = [
-        'serverAddr = ' + quote(config['server_ip']),
-        'serverPort = ' + str(config['server_port']),
-        'loginFailExit = true',
-        'log.to = "console"', 'log.level = "info"', 'log.disablePrintColor = true',
-        'webServer.port = 0',
-        'auth.method = "token"', 'auth.token = ' + quote(config['token']),
-        'auth.additionalScopes = ["HeartBeats", "NewWorkConns"]',
-        'transport.protocol = "tcp"', 'transport.tcpMux = false',
-        'transport.dialServerTimeout = 10',
-        'transport.heartbeatInterval = ' + str(HEARTBEAT_INTERVAL),
-        'transport.heartbeatTimeout = ' + str(HEARTBEAT_TIMEOUT),
-        'transport.tls.enable = true', 'transport.tls.disableCustomTLSFirstByte = true',
-        'transport.tls.trustedCaFile = ' + quote(ca_path.as_posix()),
-        'transport.tls.serverName = ' + quote(config['server_ip']),
-        '', '[[proxies]]', 'name = ' + quote(proxy_name), 'type = "tcp"',
-        'localIP = "127.0.0.1"', 'localPort = ' + str(port),
-        'remotePort = ' + str(config['remote_port']),
-        'transport.useEncryption = false', 'transport.useCompression = false', '']
-    return '\n'.join(lines).encode('utf-8')
-
-
-class _LogSignals:
-    def __init__(self, proxy_name):
-        self._partial = bytearray()
-        self.proxy_name = proxy_name
-        self.logged_in = False
-        self.registered = False
-        self.failure = None
-
-    def _line(self, raw):
-        if self.failure:
-            return
-        line = raw.decode('utf-8', errors='replace').strip()
-        record = re.fullmatch(
-            r'(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? )?'
-            r'\[([IWED])\] \[(?:client/)?(service|control|connector)\.go:\d+\] '
-            r'(?:\[[^\]\r\n]+\] )?(.*)', line)
-        if record is None:
-            return
-        level, source, message = record.groups()
-        if source == 'service':
-            if (level == 'I' and re.fullmatch(
-                    r'login to server success, get run id \[[A-Za-z0-9_-]{1,128}\]', message)):
-                if self.logged_in:
-                    self.failure = 'TUNNEL_EXITED'
-                self.logged_in = True
-            elif message == 'try to connect to server...' and self.logged_in:
-                self.failure = 'TUNNEL_EXITED'
-            elif message.startswith(('connect to server error:', 'new control error:')):
-                self.failure = 'TUNNEL_START_FAILED' if not self.logged_in else 'TUNNEL_EXITED'
-        if source == 'control':
-            if message == 'heartbeat timeout':
-                self.failure = 'TUNNEL_TIMEOUT'
-            elif (message.startswith('pong message contains error:')
-                  or message == 'control message dispatcher exited'
-                  or 'session closed' in message.lower()):
-                self.failure = 'TUNNEL_EXITED'
-            elif message.startswith('[' + self.proxy_name + '] start error:'):
-                self.failure = 'TUNNEL_START_FAILED'
-            elif level == 'I' and message == '[' + self.proxy_name + '] start proxy success':
-                if self.logged_in:
-                    self.registered = True
-        if self.logged_in and ('session closed' in message.lower()
-                               or 'connection closed' in message.lower()
-                               or message.startswith('StartWorkConn contains error:')):
-            self.failure = 'TUNNEL_EXITED'
-
-    def feed(self, chunk):
-        if type(chunk) is not bytes or len(chunk) > LOG_CHUNK_MAX_BYTES:
-            self.failure = 'TUNNEL_START_FAILED'
-            self._partial.clear()
-            return
-        for piece in chunk.splitlines(keepends=True):
-            if len(self._partial) + len(piece) > LOG_LINE_MAX_BYTES:
-                self.failure = 'TUNNEL_START_FAILED'
-                self._partial.clear()
-                return
-            self._partial.extend(piece)
-            if piece.endswith((b'\n', b'\r')):
-                self._line(bytes(self._partial))
-                self._partial.clear()
-
-    def clear(self):
-        self._partial.clear()
-
-
-def _cleanup_session(directory):
-    if directory is None:
-        return
-    _check_directory(directory)
-    for name in ('frpc.toml', 'ca.pem'):
-        path = directory / name
-        try:
-            _safe_metadata(path)
-        except FileNotFoundError:
-            continue
-        path.unlink()
-    directory.rmdir()
-
-
-class RelayRuntime:
-    def __init__(self, kimi_home):
-        self._home = Path(os.path.realpath(os.path.abspath(str(kimi_home))))
-        self._root = self._home / 'usage-dashboard' / 'runtime' / 'frp' / RELAY_VERSION
-        package = Path(os.path.realpath(str(_PACKAGED_ROOT)))
-        runtime = Path(os.path.realpath(str(self._root)))
-        if runtime == package or package in runtime.parents:
-            raise ValueError('RELAY_CONFIG_INVALID')
-        self._exe = self._root / 'frpc.exe'
-        self._license = self._root / 'LICENSE'
-        self._lock = threading.RLock()
-        self._closed = False
-        self._connector_state = 'missing'
-        self._connector_error = None
-        self._tunnel_state = 'off'
-        self._tunnel_error = None
-        self._public_origin = None
-        self._cache = None
-        self._install_generation = 0
-        self._generation = 0
-        self._install_thread = None
-        self._start_thread = None
-        self._process = None
-        self._session = None
-
-    def _check_directories(self, create=False):
-        directories = (self._home, self._home / 'usage-dashboard',
-                       self._root.parent.parent, self._root.parent, self._root)
-        for index, directory in enumerate(directories):
-            if create:
-                directory.mkdir(parents=index == 0, exist_ok=True)
-            _check_directory(directory)
-        if create:
-            _set_protected_dacl(str(self._root), True)
-
-    def _verified(self, full=False):
-        try:
-            self._check_directories()
-            signature = (_safe_metadata(self._exe), _safe_metadata(self._license))
-            if signature[0][2] != CONNECTOR_SIZE or signature[1][2] != LICENSE_SIZE:
-                self._cache = None
-                return False
-            if not full and signature == self._cache:
-                return True
-            if (not _verified_file(self._exe, CONNECTOR_SIZE, CONNECTOR_SHA256)
-                    or not _verified_file(self._license, LICENSE_SIZE, LICENSE_SHA256)
-                    or signature != (_safe_metadata(self._exe), _safe_metadata(self._license))):
-                self._cache = None
-                return False
-            self._cache = signature
-            return True
-        except OSError:
-            self._cache = None
-            return False
-
-    def _snapshot(self):
-        connector = {'state': self._connector_state, 'version': RELAY_VERSION}
-        tunnel = {'state': self._tunnel_state}
-        if self._connector_error:
-            connector['error_code'] = self._connector_error
-        if self._tunnel_error:
-            tunnel['error_code'] = self._tunnel_error
-        result = {'connector': connector, 'tunnel': tunnel}
-        if (self._tunnel_state == 'ready' and self._public_origin and self._process
-                and self._process.is_alive()):
-            result['public_origin'] = self._public_origin
-        return result
-
-    def status(self):
-        with self._lock:
-            if self._connector_state not in ('installing', 'failed'):
-                self._connector_state = 'installed' if self._verified() else 'missing'
-            return self._snapshot()
-
-    def install(self, consent, consent_version):
-        with self._lock:
-            error = None
-            if self._closed:
-                error = 'START_CANCELLED'
-            elif consent is not True or consent_version != CONSENT_VERSION:
-                error = 'CONSENT_REQUIRED'
-            elif not _supported_windows():
-                error = 'CONNECTOR_UNSUPPORTED'
-            elif (self._tunnel_state in ('starting', 'ready')
-                    or self._start_thread is not None and self._start_thread.is_alive()
-                    or self._install_thread is not None and self._install_thread.is_alive()):
-                error = 'CONNECTOR_BUSY'
-            if error:
-                result = self._snapshot()
-                result['connector']['error_code'] = error
-                return result
-            if self._verified(full=True):
-                self._connector_state = 'installed'
-                self._connector_error = None
-                return self._snapshot()
-            self._install_generation += 1
-            generation = self._install_generation
-            self._connector_state = 'installing'
-            self._connector_error = None
-            self._cache = None
-            result = self._snapshot()
-            self._install_thread = threading.Thread(target=self._install_worker,
-                args=(generation,), daemon=True)
-            self._install_thread.start()
-            return result
-
-    def _install_cancelled(self, generation):
-        with self._lock:
-            return self._closed or generation != self._install_generation
-
-    def _install_expired(self, generation):
-        with self._lock:
-            if not self._install_cancelled(generation) and self._connector_state == 'installing':
-                self._install_generation += 1
-                self._connector_state = 'failed'
-                self._connector_error = 'CONNECTOR_INSTALL_FAILED'
-
-    def _install_worker(self, generation):
-        paths = []
-        deadline = time.monotonic() + INSTALL_TIMEOUT
-        timer = threading.Timer(INSTALL_TIMEOUT, self._install_expired, args=(generation,))
-        timer.daemon = True
-        timer.start()
-        code = 'CONNECTOR_INSTALL_FAILED'
-        try:
-            if self._install_cancelled(generation):
-                return
-            try:
-                license_data = _read_packaged_license()
-            except ValueError:
-                code = 'CONNECTOR_HASH_MISMATCH'
-                raise
-            with self._lock:
-                if self._install_cancelled(generation):
-                    return
-                self._check_directories(create=True)
-                suffix = secrets.token_hex(12)
-                archive = self._root / ('archive-' + suffix + '.part')
-                exe = self._root / ('exe-' + suffix + '.part')
-                license_path = self._root / ('license-' + suffix + '.part')
-                paths = [archive, exe, license_path]
-            _download(archive, deadline, lambda: self._install_cancelled(generation))
-            if self._install_cancelled(generation):
-                return
-            try:
-                _extract_fixed(archive, exe, license_path, license_data)
-            except (ValueError, zipfile.BadZipFile):
-                code = 'CONNECTOR_HASH_MISMATCH'
-                raise
-            with self._lock:
-                if self._install_cancelled(generation):
-                    return
-                if time.monotonic() >= deadline:
-                    raise TimeoutError('install deadline')
-                self._check_directories()
-                for target in (self._exe, self._license):
-                    try:
-                        _safe_metadata(target)
-                    except FileNotFoundError:
-                        pass
-                os.replace(str(license_path), str(self._license))
-                os.replace(str(exe), str(self._exe))
-                if not self._verified(full=True):
-                    code = 'CONNECTOR_HASH_MISMATCH'
-                    raise ValueError('install integrity check')
-                self._connector_state = 'installed'
-                self._connector_error = None
         except Exception:
-            with self._lock:
-                if not self._install_cancelled(generation):
-                    self._connector_state = 'failed'
-                    self._connector_error = code
-                    self._cache = None
-        finally:
-            timer.cancel()
-            for path in paths:
-                try:
-                    _safe_metadata(path)
-                    path.unlink()
-                except OSError:
-                    pass
+            self.alive = False
+            return False
 
-    @staticmethod
-    def _callback(callback, value):
+    def send_json(self, msg):
+        return self.send_frame(1, json.dumps(msg, ensure_ascii=False).encode('utf-8'))
+
+    def _recv_n(self, n, deadline):
+        while len(self.rbuf) < n:
+            if not self.alive or time.monotonic() > deadline:
+                return None
+            try:
+                chunk = self.sock.recv(min(65536, n - len(self.rbuf)))
+            except socket.timeout:
+                continue
+            except Exception:
+                return None
+            if not chunk:
+                return None
+            self.rbuf += chunk
+        out = bytes(self.rbuf[:n])
+        del self.rbuf[:n]
+        return out
+
+    def read_frame(self, timeout):
+        """读一帧；返回 (fin, opcode, payload) 或 None（断开/违例/超时）。"""
+        deadline = time.monotonic() + timeout
+        head = self._recv_n(2, deadline)
+        if head is None:
+            return None
+        b0, b1 = head[0], head[1]
+        fin = bool(b0 & 0x80)
+        opcode = b0 & 0x0F
+        masked = bool(b1 & 0x80)
+        if b0 & 0x70 or opcode not in (0, 1, 2, 8, 9, 10):
+            return None
+        ln = b1 & 0x7F
+        if opcode >= 8 and (not fin or ln > 125):
+            return None
+        if ln == 126:
+            ext = self._recv_n(2, deadline)
+            if ext is None:
+                return None
+            ln = struct.unpack('>H', ext)[0]
+        elif ln == 127:
+            ext = self._recv_n(8, deadline)
+            if ext is None:
+                return None
+            ln = struct.unpack('>Q', ext)[0]
+            if ln < 65536:
+                return None
+        if ln > MAX_WS_MESSAGE:
+            return None
+        mask = None
+        if masked:
+            mask = self._recv_n(4, deadline)
+            if mask is None:
+                return None
+        payload = self._recv_n(ln, deadline) if ln else b''
+        if payload is None:
+            return None
+        if mask is not None:
+            payload = bytes(v ^ mask[i % 4] for i, v in enumerate(payload))
+        return fin, opcode, payload
+
+    def close(self):
+        self.alive = False
         try:
-            callback(value)
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            self.sock.close()
         except Exception:
             pass
 
-    def start(self, loopback_port, config, on_ready, on_failure):
-        try:
-            valid = validate_config(config)
-        except ValueError:
-            threading.Thread(target=self._callback,
-                args=(on_failure, 'RELAY_CONFIG_INVALID'), daemon=True).start()
-            return
-        with self._lock:
-            error = None
-            if self._closed:
-                error = 'START_CANCELLED'
-            elif not _supported_windows():
-                error = 'CONNECTOR_UNSUPPORTED'
-            elif type(loopback_port) is not int or not 1 <= loopback_port <= 65535:
-                error = 'TUNNEL_START_FAILED'
-            elif (self._tunnel_state in ('starting', 'ready')
-                    or self._connector_state == 'installing'
-                    or self._start_thread is not None and self._start_thread.is_alive()):
-                error = 'CONNECTOR_BUSY'
-            if error:
-                threading.Thread(target=self._callback, args=(on_failure, error), daemon=True).start()
-                return
-            self._generation += 1
-            generation = self._generation
-            self._tunnel_state = 'starting'
-            self._tunnel_error = None
-            self._public_origin = None
-            self._start_thread = threading.Thread(target=self._start_worker,
-                args=(generation, loopback_port, valid, on_ready, on_failure), daemon=True)
-            self._start_thread.start()
 
-    def _fail(self, generation, code, on_failure):
-        with self._lock:
-            if (self._closed or generation != self._generation
-                    or self._tunnel_state in ('failed', 'off')):
-                return
-            self._tunnel_state = 'failed'
-            self._tunnel_error = code
-            self._public_origin = None
-            process, self._process = self._process, None
-            directory, self._session = self._session, None
-            if process is not None:
-                process.close()
-            try:
-                _cleanup_session(directory)
-            except OSError:
-                pass
-        self._callback(on_failure, code)
-
-    def _start_worker(self, generation, port, config, on_ready, on_failure):
-        process = directory = signals = None
-        failure_code = 'TUNNEL_START_FAILED'
-        deadline = time.monotonic() + STARTUP_TIMEOUT
-        try:
-            with self._lock:
-                if self._closed or generation != self._generation:
-                    return
-                if not self._verified(full=True):
-                    self._connector_state = 'missing'
-                    failure_code = 'CONNECTOR_MISSING'
-                    raise OSError('connector missing')
-                directory = Path(tempfile.mkdtemp(prefix='session-', dir=str(self._root)))
-                self._session = directory
-                _check_directory(directory)
-                _set_protected_dacl(str(directory), True)
-                proxy_name = 'kimi-mobile-' + secrets.token_hex(12)
-                ca_path = directory / 'ca.pem'
-                config_path = directory / 'frpc.toml'
-                _write_private(ca_path, config['ca_cert'].encode('ascii'))
-                _write_private(config_path, _config_bytes(config, port, ca_path, proxy_name))
-                origin = 'http://{}:{}'.format(config['server_ip'], config['remote_port'])
-                config.clear()
-                if not self._verified(full=True):
-                    raise OSError('connector changed')
-                if time.monotonic() >= deadline:
-                    raise TimeoutError('startup deadline')
-                process = _WindowsJobProcess([str(self._exe), '-c', str(config_path)],
-                    str(directory), _private_environment(directory))
-                self._process = process
-                self._connector_state = 'installed'
-                self._connector_error = None
-            signals = _LogSignals(proxy_name)
-            ready = False
+# ---------------- 本机桥 HTTP 转发 ----------------
+def _bridge_http(port, method, path, headers, body, host_header):
+    """对 127.0.0.1:<port> 发一次 HTTP，返回 (status, headers_list, body)。
+    host_header：桥端 Host/Origin 校验期望的 'host:port'（公网 origin 的
+    host 部分）——由 RelayClient 按当前配置传入，不再读模块常量。"""
+    sock = socket.create_connection(('127.0.0.1', port), timeout=CONNECT_TIMEOUT)
+    sock.settimeout(HTTP_TIMEOUT)
+    try:
+        req = bytearray()
+        req += ('%s %s HTTP/1.1\r\n' % (method, path)).encode('latin-1')
+        req += ('Host: %s\r\n' % host_header).encode('latin-1')
+        sent_cl = False
+        for k, v in (headers or {}).items():
+            lk = k.lower()
+            if lk in ('host', 'connection', 'content-length', 'transfer-encoding',
+                      'x-relay-token', 'sec-websocket-key', 'sec-websocket-version',
+                      'sec-websocket-extensions', 'upgrade'):
+                continue
+            # 剥转发注入/逐跳头，桥端 Host/Origin 校验基于公网 origin
+            if lk.startswith('x-forwarded-') or lk.startswith('cf-'):
+                continue
+            req += ('%s: %s\r\n' % (k, v)).encode('latin-1')
+        req += ('Content-Length: %d\r\n' % len(body)).encode('latin-1')
+        req += b'Connection: close\r\n\r\n'
+        req += body
+        sock.sendall(bytes(req))
+        # 读响应头
+        head = bytearray()
+        while b'\r\n\r\n' not in head:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise OSError('bridge closed')
+            head += chunk
+            if len(head) > HEADER_MAX:
+                raise OSError('head too large')
+        head_b, rest = bytes(head).split(b'\r\n\r\n', 1)
+        lines = head_b.split(b'\r\n')
+        status = int(lines[0].split(b' ', 2)[1])
+        rheaders = []
+        rmap = {}
+        for line in lines[1:]:
+            name, sep, value = line.partition(b':')
+            if not sep:
+                continue
+            n_ = name.decode('latin-1').strip()
+            v_ = value.decode('latin-1').strip()
+            rheaders.append((n_, v_))
+            rmap[n_.lower()] = v_
+        # 读响应体：Content-Length 或读到 close
+        out = bytearray(rest)
+        cl = rmap.get('content-length')
+        if cl is not None:
+            need = int(cl)
+            while len(out) < need:
+                chunk = sock.recv(min(65536, need - len(out)))
+                if not chunk:
+                    break
+                out += chunk
+            out = out[:need]
+        else:
             while True:
-                with self._lock:
-                    if self._closed or generation != self._generation:
-                        return
-                if not ready and time.monotonic() >= deadline:
-                    raise TimeoutError('startup deadline')
-                for _ in range(LOG_BLOCKS_PER_POLL):
-                    chunk = process.read_chunk()
-                    if chunk is None:
-                        self._fail(generation, 'TUNNEL_EXITED', on_failure)
-                        return
-                    if not chunk:
-                        break
-                    signals.feed(chunk)
-                    if signals.failure:
-                        self._fail(generation, signals.failure, on_failure)
-                        return
-                if not process.is_alive():
-                    self._fail(generation, 'TUNNEL_EXITED', on_failure)
-                    return
-                if not ready and signals.logged_in and signals.registered:
-                    with self._lock:
-                        if self._closed or generation != self._generation:
-                            return
-                        if not process.is_alive():
-                            failure_code = 'TUNNEL_EXITED'
-                            raise OSError('connector exited')
-                        if time.monotonic() >= deadline:
-                            raise TimeoutError('startup deadline')
-                        ready = True
-                        self._tunnel_state = 'ready'
-                        self._public_origin = origin
-                    self._callback(on_ready, origin)
-                time.sleep(0.03)
-        except TimeoutError:
-            self._fail(generation, 'TUNNEL_TIMEOUT', on_failure)
+                try:
+                    chunk = sock.recv(65536)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                out += chunk
+                if len(out) > MAX_HTTP_BODY:
+                    break
+        return status, rheaders, bytes(out)
+    finally:
+        try:
+            sock.close()
         except Exception:
-            self._fail(generation, failure_code, on_failure)
-        finally:
-            config.clear()
-            if signals is not None:
-                signals.clear()
-            if process is not None:
-                process.close()
+            pass
+
+
+# ---------------- 本机桥 WS 转发 ----------------
+def _bridge_ws(port, path, headers, host_header):
+    """对本机桥发起 WS 升级，返回已握手完成的 socket；失败返回 None。
+    host_header 同 _bridge_http。"""
+    try:
+        sock = socket.create_connection(('127.0.0.1', port), timeout=CONNECT_TIMEOUT)
+        sock.settimeout(REGISTER_TIMEOUT)
+        key = base64.b64encode(secrets.token_bytes(16)).decode('ascii')
+        req = ('GET %s HTTP/1.1\r\n'
+               'Host: %s\r\n'
+               'Upgrade: websocket\r\n'
+               'Connection: Upgrade\r\n'
+               'Sec-WebSocket-Key: %s\r\n'
+               'Sec-WebSocket-Version: 13\r\n'
+               % (path, host_header, key))
+        # 透传桥裁决所需头（Origin / Sec-Fetch-* / Cookie / Sec-WebSocket-Protocol）
+        for k, v in (headers or {}).items():
+            lk = k.lower()
+            if lk in ('host', 'connection', 'upgrade', 'sec-websocket-key',
+                      'sec-websocket-version', 'content-length', 'x-relay-token'):
+                continue
+            req += '%s: %s\r\n' % (k, v)
+        req += '\r\n'
+        sock.sendall(req.encode('latin-1'))
+        head = bytearray()
+        while b'\r\n\r\n' not in head:
+            chunk = sock.recv(4096)
+            if not chunk:
+                sock.close()
+                return None
+            head += chunk
+            if len(head) > HEADER_MAX:
+                sock.close()
+                return None
+        head_b, rest = bytes(head).split(b'\r\n\r\n', 1)
+        lines = head_b.split(b'\r\n')
+        if not lines[0].startswith(b'HTTP/1.') or b' 101' not in lines[0]:
+            sock.close()
+            return None
+        # 握手后把已读到的 rest 交还给帧读循环（不丢首帧）
+        sock.settimeout(RECV_POLL)
+        return sock, rest
+    except Exception:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        return None
+
+
+def _pump_ws_to_tunnel(bridge_sock, tun_ws, cid, initial_rest):
+    """本机桥→隧道方向：把桥来的帧原样封进 ws_data。
+
+    _WSock 包的是「到本机桥」的连接：本模块对桥而言是 WS 客户端，发向桥的
+    帧必须掩码（masked_out=True）；桥回来的帧是服务端语义（不掩码），
+    read_frame 按对端形态解析。"""
+    ws = _WSock(bridge_sock, masked_out=True)
+    ws.rbuf = bytearray(initial_rest or b'')
+    try:
+        while tun_ws.alive and ws.alive:
+            frame = ws.read_frame(RECV_POLL)
+            if frame is None:
+                if not ws.alive or not tun_ws.alive:
+                    break
+                # read 超时：只要连接活着就继续（RECV_POLL 是轮询步长）
+                if not tun_ws.alive:
+                    break
+                continue
+            fin, opcode, payload = frame
+            if opcode == 9:      # 桥 ping → 回 pong（本模块是桥的客户端，帧仍掩码）
+                ws.send_frame(10, payload)
+                continue
+            if opcode == 8:
+                break
+            ok = tun_ws.send_json({'type': 'ws_data', 'id': cid, 'opcode': opcode,
+                                   'fin': fin,
+                                   'payload': base64.b64encode(payload).decode('ascii')})
+            if not ok:
+                break
+    finally:
+        try:
+            tun_ws.send_json({'type': 'ws_close', 'id': cid})
+        except Exception:
+            pass
+        ws.close()
+
+
+# ---------------- RelayClient ----------------
+class RelayClient:
+    """与 ConnectorRuntime 同形：start(bound_port, on_ready, on_fail)。
+
+    全部可配置参数经构造注入；默认即「未配置」的内置回退。public_host_header
+    不传时由 relay_host + public_port 派生（桥 Host/Origin 校验期望的
+    'host:port'）——relay_server 的 --public-host 须与之吻合，否则注册到的
+    origin 与桥白名单不匹配。"""
+
+    def __init__(self, relay_host=RELAY_HOST, relay_port=RELAY_PORT,
+                 public_port=RELAY_PUBLIC_PORT, token=None,
+                 public_host_header=None):
+        self.relay_host = relay_host
+        self.relay_port = relay_port
+        self.public_port = public_port
+        if isinstance(public_host_header, str) and public_host_header.strip():
+            self.public_host_header = public_host_header.strip()
+        else:
+            self.public_host_header = '%s:%d' % (relay_host, public_port)
+        if token is None:
             try:
-                _cleanup_session(directory)
-            except OSError:
-                pass
-            with self._lock:
-                if self._process is process:
-                    self._process = None
-                if self._session == directory:
-                    self._session = None
+                import os
+                token = os.environ.get('KIMI_RELAY_TOKEN') or DEFAULT_RELAY_TOKEN
+            except Exception:
+                token = DEFAULT_RELAY_TOKEN
+        self._token = token
+        self._lock = threading.RLock()
+        self._closing = False
+        self._started = False
+        self._thread = None
+        self._ws = None            # _WSock 到 VPS
+        self.tunnel_id = ''        # 注册成功后由回调线程置位
+        self.public_origin = ''    # 'http://<vps>:<public_port>'（无 /t/<id>）
+        self._bound_port = 0
+        self._on_ready = None
+        self._on_fail = None
+        self._ws_channels = {}     # cid -> bridge socket（本机桥连接）
+        self._ws_lock = threading.Lock()
+        self._connected_once = False  # 本轮 _run_once 是否成功走到 _ready
+
+    # ---------- 生命周期 ----------
+    def start(self, bound_port, on_ready, on_failure):
+        with self._lock:
+            if self._closing or self._started:
+                return
+            self._started = True
+            self._bound_port = bound_port
+            self._on_ready = on_ready
+            self._on_fail = on_failure
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
 
     def stop(self):
+        """同步停当前隧道（允许之后再 start 新一轮）。"""
         with self._lock:
-            if self._connector_state == 'installing':
-                self._install_generation += 1
-                self._connector_state = 'failed'
-                self._connector_error = 'START_CANCELLED'
-            self._generation += 1
-            self._tunnel_state = 'off'
-            self._tunnel_error = None
-            self._public_origin = None
-            process, self._process = self._process, None
-            directory, self._session = self._session, None
-            if process is not None:
-                process.close()
+            ws = self._ws
+            self._ws = None
+            self._started = False
+        if ws is not None:
             try:
-                _cleanup_session(directory)
-            except OSError:
+                ws.send_frame(8, b'')
+            except Exception:
                 pass
-            thread = self._start_thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=3.0)
+            ws.close()
+        self._close_channels()
 
     def shutdown(self):
         with self._lock:
-            if self._closed:
-                return
-            self._closed = True
+            self._closing = True
         self.stop()
+
+    def status(self):
+        with self._lock:
+            return {'state': 'ready' if (self._ws and self._ws.alive) else 'off',
+                    'tunnel_id': self.tunnel_id}
+
+    # ---------- 内部 ----------
+    def _close_channels(self):
+        with self._ws_lock:
+            chans = list(self._ws_channels.values())
+            self._ws_channels.clear()
+        for s in chans:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    def _fail(self, code):
+        cb = None
+        with self._lock:
+            cb = self._on_fail
+        if cb is not None:
+            try:
+                cb(code)
+            except Exception:
+                pass
+
+    def _ready(self, origin):
+        cb = None
+        with self._lock:
+            cb = self._on_ready
+        if cb is not None:
+            try:
+                cb(origin)
+            except Exception:
+                pass
+
+    def _run(self):
+        """主循环：注册 → 处理隧道消息 → 断线自动重连（指数退避）。
+
+        断线不再立即判失败：网络抖动/VPS 重启时原地重连，已配对会话与
+        本机桥端口不动。仅当主动 stop/shutdown（_closing 或 _started 清
+        位）才退出；连续 RECONNECT_GIVEUP 秒仍连不上才回调
+        _fail('TUNNEL_EXITED') 让桥 teardown。
+        """
+        backoff = RECONNECT_BASE
+        dead_since = None
+        while True:
+            with self._lock:
+                self._connected_once = False
+            try:
+                self._run_once()
+            except Exception:
+                pass
+            self._close_channels()
+            with self._lock:
+                ws = self._ws
+                self._ws = None
+                closing = self._closing or not self._started
+                connected = self._connected_once
+            if ws is not None:
+                ws.close()
+            if closing:
+                return
+            if connected:
+                # 本轮曾连上又掉：视作新一段故障，退避与计时复位。
+                backoff = RECONNECT_BASE
+                dead_since = None
+            now = time.monotonic()
+            if dead_since is None:
+                dead_since = now
+            elif now - dead_since >= RECONNECT_GIVEUP:
+                with self._lock:
+                    self._started = False
+                self._fail('TUNNEL_EXITED')
+                return
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, RECONNECT_MAX)
+            with self._lock:
+                if self._closing or not self._started:
+                    return
+
+
+    def _run_once(self):
+        # 1) TCP + WS 握手 + X-Relay-Token 注册
+        sock = socket.create_connection((self.relay_host, self.relay_port),
+                                        timeout=CONNECT_TIMEOUT)
+        sock.settimeout(REGISTER_TIMEOUT)
+        key = base64.b64encode(secrets.token_bytes(16)).decode('ascii')
+        resume = ''
+        with self._lock:
+            resume = self.tunnel_id or ''
+        resume_hdr = ('X-Relay-Resume: %s\r\n' % resume) if resume else ''
+        req = ('GET /relay/register HTTP/1.1\r\n'
+               'Host: %s:%d\r\n'
+               'Upgrade: websocket\r\n'
+               'Connection: Upgrade\r\n'
+               'Sec-WebSocket-Key: %s\r\n'
+               'Sec-WebSocket-Version: 13\r\n'
+               'X-Relay-Token: %s\r\n'
+               '%s'
+               '\r\n' % (self.relay_host, self.relay_port, key, self._token,
+                        resume_hdr))
+        sock.sendall(req.encode('latin-1'))
+        head = bytearray()
+        while b'\r\n\r\n' not in head:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise OSError('register closed')
+            head += chunk
+            if len(head) > HEADER_MAX:
+                raise OSError('register head too large')
+        head_b, rest = bytes(head).split(b'\r\n\r\n', 1)
+        if b' 101' not in head_b.split(b'\r\n', 1)[0]:
+            raise OSError('register refused')
+        sock.settimeout(RECV_POLL)
+        ws = _WSock(sock, masked_out=True)
+        ws.rbuf = bytearray(rest)
+        with self._lock:
+            if self._closing:
+                ws.close()
+                return
+            self._ws = ws
+
+        # 2) 等 registered
+        deadline = time.monotonic() + REGISTER_TIMEOUT
+        origin = ''
+        while time.monotonic() < deadline:
+            frame = ws.read_frame(RECV_POLL)
+            if frame is None:
+                if not ws.alive:
+                    raise OSError('register read failed')
+                continue
+            fin, opcode, payload = frame
+            if opcode == 8:
+                raise OSError('register close')
+            if opcode != 1:
+                continue
+            try:
+                msg = json.loads(payload.decode('utf-8'))
+            except Exception:
+                continue
+            if msg.get('type') == 'registered':
+                self.tunnel_id = str(msg.get('tunnel_id') or '')
+                # origin 形如 'http://<vps>:<port>/t/<id>'；桥只存不带 /t/ 的公网
+                # origin（Host/Origin 校验用），tid 经 self.tunnel_id 另取。
+                full = str(msg.get('origin') or '')
+                if '/t/' in full:
+                    origin = full.split('/t/', 1)[0]
+                else:
+                    origin = full
+                self.public_origin = origin
+                break
+        if not origin:
+            raise OSError('no registered')
+
+        # 3) 通知桥就绪
+        with self._lock:
+            self._connected_once = True
+        self._ready(origin)
+
+        # 4) 主读循环：http / ws_open / ws_data / ws_close / ping
+        last_ping = time.monotonic()
+        while ws.alive:
+            with self._lock:
+                if self._closing or self._ws is not ws:
+                    break
+            # 保活 ping
+            if time.monotonic() - last_ping >= PING_INTERVAL:
+                if not ws.send_frame(9, b''):
+                    break
+                last_ping = time.monotonic()
+            frame = ws.read_frame(RECV_POLL)
+            if frame is None:
+                if not ws.alive:
+                    break
+                continue
+            fin, opcode, payload = frame
+            if opcode == 8:
+                break
+            if opcode == 10:      # pong
+                continue
+            if opcode != 1:
+                continue
+            try:
+                msg = json.loads(payload.decode('utf-8'))
+            except Exception:
+                continue
+            if not isinstance(msg, dict):
+                continue
+            mtype = msg.get('type')
+            if mtype == 'http':
+                threading.Thread(target=self._serve_http,
+                                 args=(ws, msg), daemon=True).start()
+            elif mtype == 'ws_open':
+                self._ws_open(ws, msg)
+            elif mtype in ('ws_data', 'ws_close'):
+                self._ws_dispatch(msg)
+            elif mtype == 'ping':
+                ws.send_json({'type': 'pong'})
+
+    def _serve_http(self, ws, msg):
+        """把一条公网 HTTP 请求转给本机桥，回传 http_resp。"""
+        rid = msg.get('id')
+        try:
+            body = base64.b64decode(msg.get('body') or '')
+            if len(body) > MAX_HTTP_BODY:
+                raise ValueError('body')
+            status, rheaders, rbody = _bridge_http(
+                self._bound_port, str(msg.get('method') or 'GET'),
+                str(msg.get('path') or '/'),
+                msg.get('headers') or {}, body, self.public_host_header)
+            resp = {'type': 'http_resp', 'id': rid, 'status': status,
+                    'headers': rheaders,
+                    'body': base64.b64encode(rbody).decode('ascii')}
+        except Exception:
+            resp = {'type': 'http_resp', 'id': rid, 'status': 502,
+                    'headers': [], 'body': ''}
+        ws.send_json(resp)
+
+    def _ws_open(self, ws, msg):
+        cid = msg.get('id')
+        try:
+            got = _bridge_ws(self._bound_port, str(msg.get('path') or '/'),
+                             msg.get('headers') or {}, self.public_host_header)
+            if got is None:
+                ws.send_json({'type': 'ws_close', 'id': cid})
+                return
+            bsock, rest = got
+            with self._ws_lock:
+                self._ws_channels[cid] = bsock
+            threading.Thread(target=_pump_ws_to_tunnel,
+                             args=(bsock, ws, cid, rest), daemon=True).start()
+        except Exception:
+            try:
+                ws.send_json({'type': 'ws_close', 'id': cid})
+            except Exception:
+                pass
+
+    def _ws_dispatch(self, msg):
+        """隧道来的 ws_data/ws_close → 落到对应本机桥 socket。"""
+        cid = msg.get('id')
+        with self._ws_lock:
+            bsock = self._ws_channels.get(cid)
+        if bsock is None:
+            return
+        if msg['type'] == 'ws_close':
+            try:
+                bsock.close()
+            except Exception:
+                pass
+            with self._ws_lock:
+                self._ws_channels.pop(cid, None)
+            return
+        try:
+            opcode = int(msg.get('opcode', 1))
+            payload = base64.b64decode(msg.get('payload') or '')
+            # worker→桥方向是 WS 服务端→客户端：桥读的是未掩码帧？不——桥侧
+            # _ws_tunnel 里 upstream 是手机→桥的 socket（桥当服务端），本模块
+            # 是它的「手机」对等端：发给桥的帧必须掩码（客户端语义）。
+            frame = _ws_frame(opcode, payload, mask=True)
+            bsock.sendall(frame)
+        except Exception:
+            try:
+                bsock.close()
+            except Exception:
+                pass
+            with self._ws_lock:
+                self._ws_channels.pop(cid, None)

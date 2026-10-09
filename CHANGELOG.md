@@ -2,33 +2,43 @@
 
 > 格式说明：每个版本以 `## vX.Y.Z · 发布日期` 开头；`###` 为分组标题，`-` 为条目。面板里的「发现新版本」弹窗会读取最新版本这一节。
 
-## v3.3.8 · 2026-10-09
+## v3.4.0 · 2026-10-09
 
-### 新增：手机端会话归档 / 删除 / 导出
-- 放开手机侧会话级**归档、删除、导出**：`POST /api/v1/sessions/{id}:archive`、`:delete` 与 `/export`（导出返回 ZIP）。
-- 批量归档与恢复放行 v2 精确写动作 `POST /api/v2/sessions:archive` 与 `:restore`（桌面侧栏多选「归档」走的是这套 v2 路由，此前一并被拒）。
-- 放行面**只加精确路径与 POST**：不做前缀匹配；`GET` 版本的归档/删除/导出、v2 其它动作与子资源（如 `:delete`）、以及供应商/权限/终端等机器级面继续一律拒绝。
-- 已配对设备在手机上删除或归档后不可自动恢复旧状态；归档可用恢复撤回，删除不可逆，界面保留原生的危险操作二次确认。
+### 合并：自建中继（Python 版）+ 模式滑杆 + 本地安全加固
+- 本次以「自建 Python 中继」分支为基底合并回主线：中继由 `scripts/relay_server.py`（VPS 侧）+ `scripts/relay_config.py`（配置持久化）+ `scripts/mobile_relay.py` 的 `RelayClient`（worker 侧隧道客户端）组成，不再依赖 frp 二进制。原 frp 中继方案（固定 frpc、TLS + CA 固定、SHA-256 完整性校验）随之退场，`deploy/frp/` 与 frp 许可证一并移除。
+- 新增 `GET /api/mobile/relay/config` 与 `POST /api/mobile/relay/config`：中继服务器地址、隧道注册端口、公网端口与 token 由本机 `~/.kimi-code/usage-dashboard/relay.json` 持久化；读取只返回 `token_set` 布尔值，**永不回显 token 明文**。`POST /api/mobile/start` 的 relay 模式身体因此简化为 `{owner_origin, mode:"relay"}`，不再携带 `relay_config`/`relay_consent`。
+- 手机聊天 WebSocket 修复：桥在握手后主动发 `client_hello`，并对上游每个应用层 `ping` 直接回 `pong`，不再被 owner 以 heartbeat timeout 在约 20 秒后断开。
+- owner 掉线判定改为连续 3 次巡检失败才撤销（`OWNER_LOST_GRACE`）：单次 healthz 抖动不再拆隧道、不再作废全部配对会话。
+- 中继隧道支持断线自动重连（指数退避 1s→30s，300s 后放弃）与 `X-Relay-Resume` 续期，已发出的 `/t/<tid>/` 配对地址在重连后仍然可用。
+
+### 保留并移植：本地安全加固
+- **`server.token` 自助补建**：新增 `scripts/mobile_credentials.py`（`read_server_token` / `ensure_server_token`）与 `scripts/mobile_security.py`（共享受保护 DACL 原语）。首次显式开启手机连接时，若 `~/.kimi-code/server.token` 缺失即原子补建（`os.link` 不覆盖、先设受保护 DACL 再写入秘密），而不是报 `OWNER_LOST` 导致全新安装无法连接。读取侧拒绝软链/联接/重解析点，校验 inode+mtime+size，要求单行 ASCII。新增错误码 `SERVER_TOKEN_UNAVAILABLE`。
+- **手机端会话归档 / 删除 / 导出**：放行 `POST /api/v1/sessions/{id}:archive|:delete`、`/restore`、`/export`（导出返回 ZIP），以及批量归档/恢复的 `POST /api/v2/sessions:archive` 与 `:restore`。放行面只加**精确路径 + POST**，不做前缀匹配；对应 `GET` 版本与 v2 其它动作继续一律拒绝。删除不可逆、归档可用恢复撤回。
+
+### 模式滑杆
+- 侧栏卡片顶部新增「模式」滑杆（内置 4 档预设，可编辑 2~6 档）。切换只改 `config.toml` 的 `default_model`、`[secondary_model]`/`[secondary_model.models]` 与 `[tools].disabled` 三处，写入前用 `tomllib` 逐项比对，一旦波及无关段就拒绝写入；每次写入生成 `.bak` 备份，另存一份「切换前快照」可一键还原。
+- 新接口：`GET /api/modes`，`POST /api/modes/save`、`/reset`、`/apply`、`/restore`。档位存于 `~/.kimi-code/usage-dashboard/modes.json`。切换后需在会话执行 `/reload` 才生效（apply 会尽力即时同步活动会话，失败则降级提示）。
 
 ### 升级须知
-- `WORKER_VERSION` 升到 `3.3.8`。桥代码运行在独立 worker 进程中，**必须停止并重新开启手机连接**才会换上新 worker，仅重启用量服务不会生效（同版本 worker 会被直接接管）。
+- `WORKER_VERSION` 升到 `3.4.0`。桥运行在独立 worker 进程中，**必须先停止手机连接再重新开启**才会换上新 worker（同版本 worker 会被直接接管，旧版本只读并须显式停止）。
 - 停止会作废原配对链接，手机需重新扫码配对。
+- 更新器成组交付清单同步调整：加入 `scripts/relay_config.py` 与 `scripts/relay_server.py`，移除 `assets/vendor/frp-0.67.0-LICENSE`。
 
-### 验收边界
-- 公网真机（蜂窝网）配对、消息与文件往返、以及 relay 服务器部署仍待实测，本次不改变该结论。此节不声明公网验收已通过。
+### 风险与验收边界
+- **自建中继为明文传输**（`ws://` / `http://`，第一阶段不做手机 HTTPS）：手机到服务器的配对码、Cookie、会话与文件内容经过 VPS 时为明文，可能被窃听或篡改；`relay_server.py` 在未传 `--token` 时不校验注册，且**仓库不内置 token 默认值**——服务器 `--token` 与本机 `relay.json` 需各自填入同一把共享 token 并妥善保管。请仅在自控服务器、临时联调场景使用。
+- 手机远程连接整体仍为**预览功能**：真实 VPS 部署、公网真机（蜂窝网）扫码配对、消息与文件往返、长时连接稳定性均**尚未验收**。本节不声明公网验收已通过。
 
 ## v3.3.7 · 2026-10-09
 
-### 新增：自建 frp 中继（HTTP 联调预览）
-- 补齐手机浮层第三个「中继服务器」模式，保留内网与 CF 隧道；用户配置自己的服务器 IPv4、控制端口、访问端口、frp 认证 token 与公开 CA 证书。
-- 使用固定版本 frpc 的 TCP 转发，只连接本机回环手机桥；电脑到服务器使用 TLS 并验证服务器证书，代理注册成功才签发手机配对二维码。
-- 第一阶段手机通过 `http://IP:端口` 访问，未提供手机 HTTPS。手机到服务器的配对、Cookie、会话与文件是明文，可能被窃听或篡改，须显式确认风险，仅用于临时联调。
-- 中继认证秘密不进入命令行、状态、URL、localStorage 或日志；专有运行配置使用受保护权限，停止清理。停止、桌面实例失联或隧道失联撤销配对、会话和 WebSocket。
-- frpc 由独立 worker 管理，用量服务重启只 detach；升级已有连接时须先停止旧 worker，再重新开启和配对。
-- 新增模块纳入更新器成组交付检查，frp 许可证随插件分发，服务器配置模板见 `deploy/frp/frps.toml.example`。
-
-### 验收边界
-- 自建服务器部署、实体手机蜂窝网配对与真实消息/文件往返仍需授权与实测，不能以本地检查代替公网验收。此节不声明测试已经通过。
+- 侧栏卡片顶部多了一行「模式」滑杆。从左到右依次是：单模型省钱干活 → 主模型 + 1 个挂件 → 主模型 + 2~3 个挂件（挂件就是子代理）。拖动后松手即切换，点刻度上的档名也能切换。
+- 内置 4 档预设：省钱单干（gpt-6-luna，不派子代理）、标准（gpt-6-sol + swe-2）、协作（claude-opus-5-5 + swe-2 / mimo-v2.6-pro）、全力（claude-opus-5-5 + swe-2 / mimo-v2.6-pro / mimo-v2.6-flash）。
+- 「编辑」弹窗：每档可以改名称、场景说明、主模型、0~3 个挂件、子代理思考强度；可以增删档位（2~6 档）、调整顺序，也可以一键恢复预设。档位存放在 `~/.kimi-code/usage-dashboard/modes.json`。
+- 切换某一档只改 `config.toml` 的三处：`default_model`、`[secondary_model]` / `[secondary_model.models]`（第一个挂件同时作为子代理的默认模型）、`[tools].disabled`。0 个挂件的档位会把 `Agent` / `AgentSwarm` 加进禁用列表；切到其他档时只移除插件自己加进去的那两项。其他配置段一律不动：写入前用 tomllib 逐项比对，一旦波及无关段就拒绝写入。
+- 每次写入照常生成 `config.toml.<时间戳>.bak` 备份。第一次切换前会记录快照，「恢复切换前」按钮可以把这三处还原成原样。
+- 新接口：`GET /api/modes`，`POST /api/modes/save`、`/api/modes/reset`、`/api/modes/apply`、`/api/modes/restore`。
+- 切换后要在会话里执行 `/reload` 才生效。
+- 即时同步：apply 成功后会尽力把活动会话的发送框模型、daemon 子代理池通过 `/api/v1/sessions/{id}/profile` 与 `/api/v1/config` 立即换血；失败则降级为「/reload 生效」并在提示里说明。
+- 拖动体验：松手后滑杆会吸附到最近档位，拖动中实时预览档名与说明；保存档位成功后弹窗会自动关闭并给提示。
 
 ## v3.3.6 · 2026-10-09
 

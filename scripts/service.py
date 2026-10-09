@@ -153,6 +153,7 @@ def save_pricing(alias, entry):
 
 sys.path.insert(0, SCRIPT_DIR)
 import scanner  # noqa: E402
+import relay_config  # noqa: E402
 
 
 def log(msg):
@@ -1348,6 +1349,538 @@ def auto_enable_all_in_text(content):
     return cur
 
 
+# ---------------- 模式滑杆（主模型 + 挂件子代理档位） ----------------
+MODES_PATH = os.path.join(KIMI_HOME, 'usage-dashboard', 'modes.json')
+MODES_MIN, MODES_MAX, MODE_SUBS_MAX = 2, 6, 3
+_AGENT_TOOLS = ('Agent', 'AgentSwarm')
+_MODE_EFFORTS = ('', 'on', 'off') + EFFORT_LEVELS
+# 空白模板：main/subagents 用 '' 占位，load_modes 时解析成该机器
+# config.toml [models] 里的真实别名，不绑定任何具体环境。
+DEFAULT_MODES = [
+    {'name': '省钱单干', 'scene': '问答、查资料、小改动：最便宜的模型自己干，不派子代理',
+     'main': '', 'subagents': [], 'effort': ''},
+    {'name': '标准', 'scene': '日常编码：主模型规划 + 1 个挂件落地',
+     'main': '', 'subagents': [], 'effort': ''},
+    {'name': '协作', 'scene': '跨文件改动、排障：强主模型 + 2 个挂件分工',
+     'main': '', 'subagents': [], 'effort': ''},
+    {'name': '全力', 'scene': '大任务并行：强主模型 + 3 个挂件（实现 / 长上下文 / 极速）',
+     'main': '', 'subagents': [], 'effort': ''},
+]
+
+
+def _resolve_mode_alias(alias, data, want_subs):
+    """占位别名 '' → 该机器 config 里的真实别名。
+    want_subs=True 时挑一个能作挂件的（有 tool_use）；否则拿 default_model 或第一个模型。"""
+    if alias:
+        return alias
+    models = data.get('models') or {}
+    if not models:
+        return ''
+    if want_subs:
+        for a, m in models.items():
+            caps = _effective(m, 'capabilities') or []
+            if 'tool_use' in caps:
+                return a
+        return ''
+    return data.get('default_model') or sorted(models.keys())[0]
+
+
+def _normalize_default_modes(modes, data):
+    """把 DEFAULT_MODES 里的 '' 占位解析成该机器真实别名；不动已有具体别名。"""
+    out = []
+    for m in modes:
+        m = dict(m)
+        m['main'] = _resolve_mode_alias(m.get('main'), data, False)
+        m['subagents'] = [_resolve_mode_alias(s, data, True) for s in (m.get('subagents') or [])]
+        m['subagents'] = [s for s in m['subagents'] if s]
+        out.append(m)
+    return out
+
+_HEADER_RE = re.compile(r'^[ \t]*\[\[?[ \t]*(.+?)[ \t]*\]\]?[ \t]*(?:#.*)?$')
+
+
+def _table_root(name):
+    """表头名的第一段（去引号）：'secondary_model.models' → 'secondary_model'。"""
+    name = name.strip()
+    if name.startswith('"'):
+        end = name.find('"', 1)
+        return name[1:end] if end > 0 else name
+    return re.split(r'[ \t]*\.[ \t]*', name, 1)[0]
+
+
+def _split_blocks(content):
+    """按表头切块：[(header_name|None, text)]；首块为表头前的顶层键值。"""
+    blocks, cur_name, cur = [], None, []
+    for line in content.splitlines(keepends=True):
+        m = _HEADER_RE.match(line.rstrip('\r\n'))
+        if m:
+            blocks.append((cur_name, ''.join(cur)))
+            cur_name, cur = m.group(1), []
+        cur.append(line)
+    blocks.append((cur_name, ''.join(cur)))
+    return blocks
+
+
+def _extract_sections(content, is_target):
+    """拿出所有 is_target(name) 的块，返回 (剩余文本, 被拿出文本, 插入位置)。"""
+    keep, taken, pos = [], [], None
+    for name, text in _split_blocks(content):
+        if name is not None and is_target(name):
+            if pos is None:
+                pos = len(''.join(keep))
+            taken.append(text)
+        else:
+            keep.append(text)
+    rest = ''.join(keep)
+    return rest, ''.join(taken), (len(rest) if pos is None else pos)
+
+
+def _insert_block(rest, pos, block):
+    if not block:
+        return rest
+    before, after = rest[:pos], rest[pos:]
+    if before and not before.endswith('\n'):
+        before += '\n'
+    if before and not before.endswith('\n\n'):
+        before += '\n'
+    block = block.rstrip('\n') + '\n'
+    if after.strip():
+        block += '\n'
+    return before + block + after.lstrip('\n')
+
+
+def _is_secondary(name):
+    return _table_root(name) == 'secondary_model'
+
+
+def _is_tools_root(name):
+    return name.strip() in ('tools', '"tools"')
+
+
+def load_modes(data=None):
+    try:
+        with open(MODES_PATH, encoding='utf-8') as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            d = {}
+    except Exception:
+        d = {}
+    modes = d.get('modes')
+    if not isinstance(modes, list) or not (MODES_MIN <= len(modes) <= MODES_MAX):
+        d['modes'] = json.loads(json.dumps(DEFAULT_MODES))
+    # 空白模板：DEFAULT_MODES 里的 '' 占位在该机器 config 上解析成真实别名
+    if data is None:
+        data = _load_toml(get_config_content()) or {}
+    d['modes'] = _normalize_default_modes(d['modes'], data)
+    if not isinstance(d.get('pool_hints'), dict):
+        d['pool_hints'] = {}
+    return d
+
+
+def save_modes(d):
+    os.makedirs(os.path.dirname(MODES_PATH), exist_ok=True)
+    safe_write(MODES_PATH, json.dumps(d, ensure_ascii=False, indent=2))
+
+
+def _defined_aliases(data):
+    return set((data.get('models') or {}).keys())
+
+
+def validate_modes(modes, data):
+    """校验档位列表，返回 (规范化列表, 错误)。别名必须存在于 config 的 [models]。"""
+    if not isinstance(modes, list) or not (MODES_MIN <= len(modes) <= MODES_MAX):
+        return None, '档位数量需在 %d~%d 之间' % (MODES_MIN, MODES_MAX)
+    defined = _defined_aliases(data)
+    out = []
+    for i, m in enumerate(modes):
+        if not isinstance(m, dict):
+            return None, '第 %d 档格式错误' % (i + 1)
+        name = str(m.get('name') or '').strip()[:20] or ('档位 %d' % (i + 1))
+        scene = str(m.get('scene') or '').strip()[:120]
+        main = str(m.get('main') or '').strip()
+        if main not in defined:
+            return None, '第 %d 档「%s」主模型 %s 不在 config 的 [models] 中' % (i + 1, name, main or '(空)')
+        subs = m.get('subagents') or []
+        if not isinstance(subs, list) or len(subs) > MODE_SUBS_MAX:
+            return None, '第 %d 档「%s」挂件最多 %d 个' % (i + 1, name, MODE_SUBS_MAX)
+        clean = []
+        for s in subs:
+            s = str(s or '').strip()
+            if not s:
+                continue
+            if s == 'primary':
+                return None, '第 %d 档：primary 是保留字，不能作挂件' % (i + 1)
+            if s not in defined:
+                return None, '第 %d 档「%s」挂件 %s 不在 config 的 [models] 中' % (i + 1, name, s)
+            if s in clean:
+                return None, '第 %d 档「%s」挂件 %s 重复' % (i + 1, name, s)
+            clean.append(s)
+        effort = str(m.get('effort') or '').strip()
+        if effort not in _MODE_EFFORTS:
+            return None, '第 %d 档 effort 只能是 %s' % (i + 1, '/'.join(e for e in _MODE_EFFORTS if e))
+        out.append({'name': name, 'scene': scene, 'main': main, 'subagents': clean, 'effort': effort})
+    return out, None
+
+
+def _render_tools_disabled(block, disabled):
+    """改写 [tools] 块里的 disabled 数组（可跨行）；disabled 为空则删掉该键。"""
+    pat = re.compile(r'^[ \t]*disabled[ \t]*=[ \t]*\[.*?\][ \t]*(?:#[^\n]*)?\r?\n?', re.M | re.S)
+    line = ('disabled = [ %s ]\n' % ', '.join(_toml_string(x) for x in disabled)) if disabled else ''
+    if pat.search(block):
+        return pat.sub(lambda _m: line, block, count=1)
+    if not line:
+        return block
+    head, _, body = block.partition('\n')
+    return head + '\n' + line + body
+
+
+def apply_mode_to_text(content, mode, hints, tools_owned):
+    """把一档模式写进 config 文本：default_model、[secondary_model(.models)]、[tools].disabled。
+    返回 (新文本, tools_owned 新值)。tools_owned=本插件曾往 disabled 里加过 Agent 工具。"""
+    data = _load_toml(content) or {}
+    old_sec = data.get('secondary_model') or {}
+    content = set_default_model_in_text(content, mode['main'])
+
+    rest, _, pos = _extract_sections(content, _is_secondary)
+    subs = mode['subagents']
+    keep_keys = []
+    for k, v in old_sec.items():
+        if k in ('default_model', 'force', 'models', 'default_effort') or isinstance(v, dict):
+            continue
+        if isinstance(v, (str, bool, int, list)) and _KEY_RE.match(k):
+            keep_keys.append(_render_toml_kv(k, v))
+    effort = mode.get('effort') or old_sec.get('default_effort') or ''
+    lines = ['[secondary_model]']
+    if subs:
+        lines.append('default_model = %s' % _toml_string(subs[0]))
+    lines += keep_keys
+    if effort:
+        lines.append('default_effort = %s' % _toml_string(effort))
+    block = '\n'.join(lines) + '\n'
+    if subs:
+        block += '\n[secondary_model.models]\n' + ''.join(
+            '%s = %s\n' % (_toml_qkey(s), _toml_string(hints.get(s) or s)) for s in subs)
+    content = _insert_block(rest, pos, block)
+
+    disabled = list(((data.get('tools') or {}).get('disabled')) or [])
+    want_off = not subs
+    owned = tools_owned
+    if want_off:
+        added = [t for t in _AGENT_TOOLS if t not in disabled]
+        if added:
+            disabled += added
+            owned = True
+    elif tools_owned:
+        disabled = [t for t in disabled if t not in _AGENT_TOOLS]
+        owned = False
+    rest, tblock, tpos = _extract_sections(content, _is_tools_root)
+    if tblock:
+        tblock = _render_tools_disabled(tblock, disabled)
+        if not [ln for ln in tblock.splitlines()[1:] if ln.strip() and not ln.strip().startswith('#')]:
+            tblock = ''
+    elif disabled:
+        tblock = '[tools]\n' + _render_tools_disabled('\n', disabled).lstrip('\n')
+        tpos = len(rest)
+    content = _insert_block(rest, tpos, tblock)
+    return content, owned
+
+
+def _diff_outside(old, new, keys=('default_model', 'secondary_model', 'tools')):
+    """模式改写只允许动 keys；其余解析结果必须完全一致。"""
+    a = {k: v for k, v in old.items() if k not in keys}
+    b = {k: v for k, v in new.items() if k not in keys}
+    return a == b
+
+
+def _strict_toml(content):
+    try:
+        import tomllib
+    except ImportError:
+        return None, '缺少 tomllib（需 Python 3.11+），拒绝改写'
+    try:
+        return tomllib.loads(content), None
+    except Exception as e:
+        return None, 'TOML 解析失败：%s' % e
+
+
+def detect_active_mode(modes, data):
+    dm = data.get('default_model', '')
+    sec = data.get('secondary_model') or {}
+    pool = list((sec.get('models') or {}).keys())
+    disabled = set(((data.get('tools') or {}).get('disabled')) or [])
+    agents_off = all(t in disabled for t in _AGENT_TOOLS)
+    for i, m in enumerate(modes):
+        if m.get('main') != dm:
+            continue
+        subs = m.get('subagents') or []
+        if not subs:
+            if agents_off:
+                return i
+            continue
+        if not agents_off and sorted(pool) == sorted(subs) and sec.get('default_model') == subs[0]:
+            return i
+    return None
+
+
+def get_modes_data():
+    content = get_config_content()
+    data = _load_toml(content) or {}
+    d = load_modes(data)
+    sec = data.get('secondary_model') or {}
+    hints = d['pool_hints']
+    changed = False
+    for k, v in (sec.get('models') or {}).items():
+        if isinstance(v, str) and v and hints.get(k) != v:
+            hints[k] = v
+            changed = True
+    if changed:
+        save_modes(d)
+    pricing = load_pricing()
+    models = []
+    for alias, m in (data.get('models') or {}).items():
+        caps = _effective(m, 'capabilities') or []
+        models.append({'alias': alias, 'display_name': _effective(m, 'display_name') or alias,
+                       'has_tools': 'tool_use' in caps, 'has_image': 'image_in' in caps,
+                       'pricing': pricing.get(alias) or pricing.get(m.get('model', '')) or None})
+    models.sort(key=lambda x: x['alias'])
+    defined = _defined_aliases(data)
+    undefined_pool = [k for k in (sec.get('models') or {}) if k not in defined]
+    disabled = ((data.get('tools') or {}).get('disabled')) or []
+    return {'modes': d['modes'], 'active': detect_active_mode(d['modes'], data),
+            'last_applied': d.get('last_applied'),
+            'has_snapshot': bool(d.get('previous_snapshot')),
+            'current': {'default_model': data.get('default_model', ''),
+                        'secondary_default': sec.get('default_model', ''),
+                        'pool': list((sec.get('models') or {}).keys()),
+                        'agents_disabled': all(t in disabled for t in _AGENT_TOOLS)},
+            'undefined_pool': undefined_pool,
+            'models': models, 'subs_max': MODE_SUBS_MAX,
+            'min': MODES_MIN, 'max': MODES_MAX}
+
+
+def _snapshot_config(content):
+    data = _load_toml(content) or {}
+    _, sec_text, _ = _extract_sections(content, _is_secondary)
+    _, tools_text, _ = _extract_sections(content, _is_tools_root)
+    return {'default_model': data.get('default_model', ''),
+            'secondary_text': sec_text, 'tools_text': tools_text,
+            'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+
+def apply_mode(index):
+    content = get_config_content()
+    old, err = _strict_toml(content)
+    if err:
+        return False, err
+    d = load_modes(old)
+    modes, err = validate_modes(d['modes'], old)
+    if err:
+        return False, err
+    if not isinstance(index, int) or not (0 <= index < len(modes)):
+        return False, '档位序号无效'
+    mode = modes[index]
+    hints = dict(d['pool_hints'])
+    for k, v in ((old.get('secondary_model') or {}).get('models') or {}).items():
+        if isinstance(v, str) and v:
+            hints[k] = v
+    for s in mode['subagents']:
+        if not hints.get(s):
+            mm = (old.get('models') or {}).get(s) or {}
+            hints[s] = _effective(mm, 'display_name') or s
+    new_content, owned = apply_mode_to_text(content, mode, hints, bool(d.get('tools_owned')))
+    new, err = _strict_toml(new_content)
+    if err:
+        return False, '生成的配置无法解析，已拒绝：%s' % err
+    if not _diff_outside(old, new):
+        return False, '改写波及了无关配置段，已拒绝（config 未改动）'
+    if new.get('default_model') != mode['main']:
+        return False, '改写校验失败：default_model 未生效'
+    if not d.get('previous_snapshot'):
+        d['previous_snapshot'] = _snapshot_config(content)
+    ok, msg = safe_apply_config(new_content)
+    if not ok:
+        return False, msg
+    d['pool_hints'] = hints
+    d['tools_owned'] = owned
+    d['last_applied'] = {'index': index, 'name': mode['name'],
+                         'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    save_modes(d)
+    n = len(mode['subagents'])
+    desc = '单干（已禁用 Agent/AgentSwarm）' if not n else '%d 个挂件' % n
+    live = _apply_session_live(mode, old)
+    extra = ('；%s' % live) if live else '，会话内 /reload 生效'
+    return True, '已切到「%s」：主 %s · %s%s' % (mode['name'], mode['main'], desc, extra)
+
+
+# ---------------- 模式滑杆：活动会话即时同步 ----------------
+# apply 成功后尝试让当前会话/发送框立刻换档（不依赖 /reload）：
+#   1) POST {server}/api/v1/sessions/{active}/profile  把活动会话的 agent_config.model
+#      改成主模型（发送框模型下拉随之切换；新建会话走 default_model 已改）
+#   2) POST {server}/api/v1/config  提交 secondary_model，daemon 侧子代理池立即换血
+# 失败一律降级：config.toml 已写好，/reload 后完全一致，只在上报文案里提示。
+def _server_endpoint():
+    """从 ~/.kimi-code/server/instances/*.json 找在跑的桌面端 daemon（heartbeat 最新）。"""
+    inst = os.path.join(KIMI_HOME, 'server', 'instances')
+    best = None
+    now = time.time()
+    try:
+        for fn in os.listdir(inst):
+            if not fn.endswith('.json'):
+                continue
+            try:
+                info = json.loads(io.open(os.path.join(inst, fn), encoding='utf-8').read())
+            except Exception:
+                continue
+            host, port = info.get('host'), info.get('port')
+            if not host or not port:
+                continue
+            hb = float(info.get('heartbeat_at') or info.get('started_at') or 0)
+            if best is None or hb > best[0]:
+                best = (hb, str(host), int(port))
+    except Exception:
+        return None
+    if not best or now - best[0] / 1000.0 > 120:
+        return None
+    return 'http://%s:%d' % (best[1], best[2])
+
+
+def _server_token():
+    try:
+        tok = io.open(os.path.join(KIMI_HOME, 'server.token'), encoding='utf-8').read().strip()
+        return tok or None
+    except Exception:
+        return None
+
+
+def _api_json(method, url, token, body=None, timeout=6):
+    req = urllib.request.Request(url, method=method)
+    req.add_header('Authorization', 'Bearer ' + token)
+    data = None
+    if body is not None:
+        req.add_header('Content-Type', 'application/json')
+        data = json.dumps(body).encode('utf-8')
+    try:
+        with urllib.request.urlopen(req, data=data, timeout=timeout) as r:
+            d = json.loads(r.read().decode('utf-8', 'replace'))
+            return d if isinstance(d, dict) and d.get('code') in (0, '0') else None
+    except Exception:
+        return None
+
+
+def _api_data(payload):
+    d = payload.get('data')
+    return d if isinstance(d, dict) else {}
+
+
+def _thinking_for_model(model_item, prefer):
+    """按桌面端 store 的 thinking 语义映射：off/on/effort；无能力模型 → 'off'。"""
+    caps = model_item.get('capabilities') or []
+    se = model_item.get('support_efforts') or []
+    can_think = 'thinking' in caps or 'always_thinking' in caps or bool(se)
+    if not can_think or prefer == 'off':
+        return 'off'
+    if prefer == 'on' or prefer == '':
+        if se:
+            return model_item.get('default_effort') or se[len(se) // 2]
+        return 'on'
+    return prefer if prefer in se else (model_item.get('default_effort') or (se[len(se) // 2] if se else 'on'))
+
+
+def _apply_session_live(mode, old_data):
+    """尽力把档位落到运行中的会话：会话模型 + daemon secondary_model。返回提示文本。"""
+    base = _server_endpoint()
+    token = _server_token()
+    if not base or not token:
+        return '后台服务未找到，配置已落盘（/reload 生效）'
+    notes = []
+
+    want_sec = mode['subagents']
+    cur = _api_data(_api_json('GET', base + '/api/v1/config', token) or {})
+    sec = cur.get('secondary_model')
+    if isinstance(sec, dict):
+        # 只推 daemon 认识的键（model/defaultModel/defaultEffort/models 会被忽略并污染）
+        sub = {}
+        if want_sec:
+            sub['defaultModel'] = want_sec[0]
+            sub['models'] = {s: s for s in want_sec}
+            if mode.get('effort'):
+                sub['defaultEffort'] = mode['effort']
+        else:
+            sub['models'] = {}
+        r = _api_json('POST', base + '/api/v1/config', token, {'secondary_model': sub})
+        if r is None:
+            notes.append('子代理池未能即时下发（/reload 后生效）')
+        else:
+            # 校验写回了
+            ok = _api_data(_api_json('GET', base + '/api/v1/config', token) or {}).get('secondary_model') or {}
+            live = ok.get('models') or {}
+            miss = [s for s in want_sec if s not in live]
+            extra = [k for k in live if k not in want_sec]
+            if not miss and not extra and (not want_sec or ok.get('defaultModel') == want_sec[0]):
+                notes.append('子代理池已即时更新')
+            else:
+                notes.append('子代理池校验偏差（/reload 修正）')
+    else:
+        notes.append('config 接口异常，子代理池 /reload 后生效')
+
+    sess = _api_data(_api_json('GET', base + '/api/v1/sessions?page_size=1&sort=updated_desc', token) or {})
+    items = sess.get('items') or []
+    if not items:
+        notes.append('无活动会话，发送框将在新会话自动应用')
+    else:
+        active = items[0]
+        sid = active.get('id')
+        models = _api_data(_api_json('GET', base + '/api/v1/models', token) or {}).get('items') or []
+        mid = mode['main']
+        # 发送框要 daemon 的 provider/model id，config 里可能存的是 alias
+        mi = next((m for m in models if m.get('model') == mid or m.get('id') == mid), None)
+        if mi is None:
+            mi = next((m for m in models if (m.get('model') or '').endswith('/' + mid.split('/')[-1])), None)
+        if mi is None:
+            notes.append('发送框模型 %s 不在 daemon 模型表（未切换）' % mid)
+        else:
+            send_id = mi.get('id') or mi.get('model')
+            thinking = _thinking_for_model(mi, mode.get('effort') or '')
+            body = {'agent_config': {'model': send_id, 'thinking': thinking}}
+            r = _api_json('POST', base + '/api/v1/sessions/%s/profile' % sid, token, body)
+            if r is None:
+                notes.append('会话模型未即时切换（/reload 或手动选档）')
+            else:
+                notes.append('发送框模型已同步为 %s' % (mi.get('display_name') or send_id))
+    return '；'.join(notes)
+
+
+def restore_mode_snapshot():
+    content = get_config_content()
+    old, err = _strict_toml(content)
+    if err:
+        return False, err
+    d = load_modes(old)
+    snap = d.get('previous_snapshot')
+    if not snap:
+        return False, '没有可恢复的快照（尚未用滑杆切换过）'
+    new_content = content
+    if snap.get('default_model'):
+        new_content = set_default_model_in_text(new_content, snap['default_model'])
+    rest, _, pos = _extract_sections(new_content, _is_secondary)
+    new_content = _insert_block(rest, pos, snap.get('secondary_text') or '')
+    rest, _, pos = _extract_sections(new_content, _is_tools_root)
+    new_content = _insert_block(rest, pos, snap.get('tools_text') or '')
+    new, err = _strict_toml(new_content)
+    if err:
+        return False, '快照还原后无法解析，已拒绝：%s' % err
+    if not _diff_outside(old, new):
+        return False, '还原波及了无关配置段，已拒绝（config 未改动）'
+    ok, msg = safe_apply_config(new_content)
+    if not ok:
+        return False, msg
+    d.pop('previous_snapshot', None)
+    d['tools_owned'] = False
+    d['last_applied'] = None
+    save_modes(d)
+    return True, '已恢复到使用滑杆之前的配置（%s 的快照），会话内 /reload 生效' % snap.get('time', '')
+
+
 # ---------------- 自更新 ----------------
 _UPDATE_CACHE = {'t': 0.0, 'data': None}
 
@@ -1492,8 +2025,7 @@ _MOBILE_ERROR_CODES = frozenset((
     'CONNECTOR_MISSING', 'CONNECTOR_INSTALL_FAILED', 'CONNECTOR_HASH_MISMATCH',
     'CONNECTOR_UNSUPPORTED', 'CONNECTOR_BUSY', 'CONSENT_REQUIRED',
     'TUNNEL_START_FAILED', 'TUNNEL_TIMEOUT', 'TUNNEL_EXITED', 'OWNER_LOST',
-    'START_CANCELLED', 'SERVER_TOKEN_UNAVAILABLE', 'OWNER_AUTH_FAILED',
-    'OWNER_AUTH_CHECK_FAILED', 'RELAY_CONFIG_INVALID',
+    'START_CANCELLED', 'SERVER_TOKEN_UNAVAILABLE',
     # mobile_worker spawn/ensure 阶段码（与 mobile_bridge._MOBILE_ERROR_CODES
     # 同集合）：只透出固定码，不含 stage/stderr/路径/secret 等诊断细节。
     'WORKER_STATE_DIR_UNAVAILABLE', 'WORKER_STARTUP_BUSY', 'WORKER_LOCK_HELD',
@@ -1573,12 +2105,38 @@ def _mobile_error(handler, origin, code, msg):
     _mobile_send(handler, code, payload, origin)
 
 
+def _relay_config_validate(body):
+    """写侧严格校验（返回错误文案或 ''）。token 可留空表示清除/回退默认。
+
+    host：非空 hostname/IP（去空白小写后 ≤253，字母数字点横线冒号方括号）；
+    tunnel_port/public_port：1-65535 整数；token：≤256 字符串。"""
+    if 'host' in body:
+        h = body['host']
+        if not isinstance(h, str) or not relay_config._clean_host(h):
+            return '中继服务器地址无效'
+    for k in ('tunnel_port', 'public_port'):
+        if k in body:
+            v = body[k]
+            ok = isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 65535
+            if not ok:
+                try:
+                    ok = 1 <= int(str(v).strip()) <= 65535
+                except Exception:
+                    ok = False
+            if not ok:
+                return '中继端口需在 1-65535 之间'
+    if 'token' in body:
+        t = body['token']
+        if not isinstance(t, str) or len(t.strip()) > relay_config.TOKEN_MAX:
+            return '密钥格式无效'
+    return ''
+
+
 def _mobile_read_body(handler):
     """控制面小 JSON：CL 已在外层校验为单值纯数字；这里有界读取。"""
     cls = handler.headers.get_all('Content-Length') or []
     n = int(cls[0]) if cls else 0
-    from mobile_bridge import RELAY_CONTROL_MAX_BODY
-    if n > RELAY_CONTROL_MAX_BODY:
+    if n > _MOBILE_MAX_BODY:
         raise ValueError('请求体过大')
     if n == 0:
         return {}
@@ -1590,15 +2148,11 @@ def _mobile_read_body(handler):
     if len(raw) != n:
         raise ValueError('请求体不完整')
     try:
-        from mobile_bridge import _json_no_dup_object
-        body = json.loads(raw.decode('utf-8'), object_pairs_hook=_json_no_dup_object)
+        body = json.loads(raw.decode('utf-8'))
     except Exception:
         raise ValueError('请求体不是合法 JSON')
     if not isinstance(body, dict):
         raise ValueError('请求体格式错误')
-    if n > _MOBILE_MAX_BODY and (body.get('mode') != 'relay'
-                                or handler.path != _MOBILE_PREFIX + '/start'):
-        raise ValueError('请求体过大')
     return body
 
 
@@ -1682,17 +2236,53 @@ def _mobile_dispatch(handler):
         return True
     # --- 已核实请求映射到 worker 客户端 ---
     try:
-        if method == 'GET' and path == _MOBILE_PREFIX + '/status':
+        # relay 配置是 daemon 本地文件（usage-dashboard/relay.json），
+        # 不经 worker 代理；GET 永不回显 token 明文，POST 只写不落回执。
+        if method == 'GET' and path == _MOBILE_PREFIX + '/relay/config':
+            _mobile_send(handler, 200,
+                         {'relay': relay_config.redacted(relay_config.load(KIMI_HOME))},
+                         origin)
+        elif method == 'POST' and path == _MOBILE_PREFIX + '/relay/config':
+            body = _mobile_read_body(handler)
+            if set(body) - {'host', 'tunnel_port', 'public_port', 'token'}:
+                raise ValueError('请求参数不被允许')
+            # 校验：host 非空 hostname/IP、端口 1-65535、token 限长；
+            # 缺省字段继承现有值（便于部分更新）。
+            cur = relay_config.load(KIMI_HOME)
+            err = _relay_config_validate(body)
+            if err:
+                raise ValueError(err)
+            nxt = dict(cur)
+            for k in ('host', 'tunnel_port', 'public_port', 'token'):
+                if k in body:
+                    nxt[k] = body[k]
+            saved = relay_config.save(KIMI_HOME, nxt)
+            _mobile_send(handler, 200,
+                         {'success': True, 'relay': relay_config.redacted(saved)},
+                         origin)
+        elif method == 'GET' and path == _MOBILE_PREFIX + '/status':
             _mobile_send(handler, 200, mgr.status(), origin)
         elif method == 'POST' and path == _MOBILE_PREFIX + '/connector/install':
             body = _mobile_read_body(handler)
-            from mobile_bridge import _install_body_params
-            _mobile_send(handler, 200, mgr.install_connector(*_install_body_params(body)), origin)
+            if set(body) - {'consent', 'consent_version'}:
+                raise ValueError('请求参数不被允许')
+            _mobile_send(handler, 200, mgr.install_connector(
+                body.get('consent'), body.get('consent_version')), origin)
         elif method == 'POST' and path == _MOBILE_PREFIX + '/start':
             body = _mobile_read_body(handler)
-            from mobile_bridge import _start_body_params
-            _mobile_send(handler, 200, mgr.start(*_start_body_params(body)), origin)
-            body = None
+            mode = body.get('mode', 'lan')
+            if mode == 'internet':
+                allowed = {'owner_origin', 'mode', 'relay_consent', 'consent_version'}
+            elif mode == 'relay':
+                allowed = {'owner_origin', 'mode'}
+            else:
+                allowed = {'owner_origin', 'mode', 'address'}
+            if set(body) - allowed:
+                raise ValueError('请求参数不被允许')
+            _mobile_send(handler, 200, mgr.start(
+                body.get('owner_origin'), body.get('address'), mode,
+                body.get('relay_consent', False), body.get('consent_version')),
+                origin)
         elif method == 'POST' and path == _MOBILE_PREFIX + '/stop':
             if _mobile_read_body(handler):
                 raise ValueError('请求参数不被允许')
@@ -1712,7 +2302,7 @@ def _mobile_dispatch(handler):
         elif type(e).__name__ == 'MobileBridgeError':
             _mobile_error(handler, origin, 400, msg[:160])
         else:
-            log('mobile control error')
+            log('mobile control error: %r' % e)
             _mobile_fail_closed(handler)
     return True
 
@@ -1923,6 +2513,8 @@ class Handler(BaseHTTPRequestHandler):
                         'official': LATEST_OFFICIAL})
         elif path == '/api/data':
             self._json(get_models_data())
+        elif path == '/api/modes':
+            self._json(get_modes_data())
         elif path == '/api/reload':
             self._json({'success': True, 'data': collect_once() or {}})
         else:
@@ -2115,6 +2707,38 @@ class Handler(BaseHTTPRequestHandler):
                 if ok and errs:
                     msg += '（另有未处理：%s）' % '；'.join(sorted(set(errs)))
                 return self._json({'success': ok, 'message': msg if not ok else '已修复 %d 项，会话内 /reload 生效' % done}, 200 if ok else 400)
+
+            if path == '/api/modes/save':
+                data = _load_toml(get_config_content()) or {}
+                modes, err = validate_modes(req.get('modes'), data)
+                if err:
+                    return self._json({'success': False, 'message': err}, 400)
+                d = load_modes(data)
+                d['modes'] = modes
+                save_modes(d)
+                return self._json({'success': True, 'message': '已保存 %d 个档位' % len(modes),
+                                   'data': get_modes_data()})
+
+            if path == '/api/modes/reset':
+                data = _load_toml(get_config_content()) or {}
+                d = load_modes(data)
+                d['modes'] = json.loads(json.dumps(DEFAULT_MODES))
+                save_modes(d)
+                return self._json({'success': True, 'message': '档位已恢复为内置预设',
+                                   'data': get_modes_data()})
+
+            if path == '/api/modes/apply':
+                idx = req.get('index')
+                if isinstance(idx, bool) or not isinstance(idx, int):
+                    return self._json({'success': False, 'message': 'index 必须是整数'}, 400)
+                ok, msg = apply_mode(idx)
+                return self._json({'success': ok, 'message': msg, 'data': get_modes_data()},
+                                  200 if ok else 400)
+
+            if path == '/api/modes/restore':
+                ok, msg = restore_mode_snapshot()
+                return self._json({'success': ok, 'message': msg, 'data': get_modes_data()},
+                                  200 if ok else 400)
 
             if path == '/api/auto-enable-all':
                 ok, msg = safe_apply_config(auto_enable_all_in_text(get_config_content()))

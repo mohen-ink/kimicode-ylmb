@@ -46,6 +46,9 @@ LOCAL_ONLY_KEEP = frozenset((
     'scripts/mobile_worker.py',
     'scripts/mobile_credentials.py',
     'scripts/mobile_security.py',
+    # relay_config 被 service.py 顶层 import——若包不含手机运行时（"partial" 为空、
+    # 完整性闸门放行）就会被同步删除，导致用量服务直接起不来，故必须保护。
+    'scripts/relay_config.py',
 ))
 LOCAL_ONLY_KEEP_PREFIX = ('docs/', 'assets/vendor/')
 # 不完整更新包（缺核心运行文件）一律拒绝：宁可回到旧版本，也不留下半套运行树。
@@ -60,6 +63,8 @@ PACKAGE_REQUIRED = frozenset((
 # 移动端运行时是成组交付的：3.3.3 起上游正式包已含这一组，但若只给了一部分——
 # 例如只更新了 bridge 而没给 worker——那就是不完整包，覆盖后同步删除会清掉剩下的
 # 运行时文件，把插件变成不可启动状态，故必须整体拒绝。
+# 3.4.0 起中继改用自建 Python 中继，组内相应去掉 frp 许可证、加入 relay_config.py
+# （service.py 顶层 import）与 relay_server.py（VPS 侧随包分发）。
 MOBILE_RUNTIME_GROUP = frozenset((
     'scripts/mobile_bridge.py',
     'scripts/mobile_tunnel.py',
@@ -68,8 +73,9 @@ MOBILE_RUNTIME_GROUP = frozenset((
     'scripts/mobile_worker.py',
     'scripts/mobile_credentials.py',
     'scripts/mobile_security.py',
+    'scripts/relay_config.py',
+    'scripts/relay_server.py',
     'assets/kimi-mobile-api.js',
-    'assets/vendor/frp-0.67.0-LICENSE',
 ))
 # 退出码：3 = 旧服务未退出，4 = 更新包损坏/应用失败，5 = 本地预览自保护，6 = 更新包不完整
 GUARD_LOCAL_PREVIEW = 5
