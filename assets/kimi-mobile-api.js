@@ -47,6 +47,7 @@
     TUNNEL_START_FAILED: '外网通道启动失败，请停止后再试。',
     TUNNEL_TIMEOUT: '外网通道启动超时，请检查网络后重试。',
     TUNNEL_EXITED: '外网通道已断开，请停止后重新开启。',
+    TUNNEL_AUTH_FAILED: '中继密钥错误或未授权，请检查中继服务器 token 配置。',
     OWNER_LOST: '桌面端服务已断开，连接已撤销。',
     START_CANCELLED: '连接启动已取消。',
     SERVER_TOKEN_UNAVAILABLE: '手机连接凭据创建或读取失败，请检查目录权限。',

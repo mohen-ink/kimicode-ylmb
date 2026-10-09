@@ -82,6 +82,13 @@ def _tok_ok(s, lo=1, hi=64):
     return isinstance(s, str) and lo <= len(s) <= hi and all(c in _TOK_ID_RE for c in s)
 
 
+class RelayAuthError(Exception):
+    """注册被服务器明确拒绝（HTTP 401/403）——共享密钥错/未授权。
+    这是确定性配置错误，重连无意义：区别于超时/断连等瞬时故障，
+    触发后应立即 _fail 让桥报「密钥错误」，不进退避重连循环
+    （否则用户只能看到「一直正在开启中」直到 RECONNECT_GIVEUP）。"""
+
+
 # ---------------- WebSocket 帧（RFC6455，客户端侧必须掩码） ----------------
 def _mask_payload(data, mask):
     """RFC6455 掩码。大整数一次异或，MB 级帧比逐字节生成器快两个数量级——
@@ -509,6 +516,13 @@ class RelayClient:
                 self._connected_once = False
             try:
                 self._run_once()
+            except RelayAuthError:
+                # 服务器明确拒绝（401/403 密钥错/未授权）：确定性失败，
+                # 不重连，立即回调让桥报「密钥错误」、状态转 failed。
+                with self._lock:
+                    self._started = False
+                self._fail('TUNNEL_AUTH_FAILED')
+                return
             except Exception:
                 pass
             self._close_channels()
@@ -570,7 +584,15 @@ class RelayClient:
             if len(head) > HEADER_MAX:
                 raise OSError('register head too large')
         head_b, rest = bytes(head).split(b'\r\n\r\n', 1)
-        if b' 101' not in head_b.split(b'\r\n', 1)[0]:
+        status_line = head_b.split(b'\r\n', 1)[0]
+        if b' 101' not in status_line:
+            # 401/403 = 服务器明确拒绝（共享密钥错/未授权）：确定性配置错误，
+            # 重连只会原地打转，立刻失败让桥报「密钥错误」而非卡「开启中」。
+            parts = status_line.split(b' ')
+            code = parts[1] if len(parts) > 1 else b''
+            if code in (b'401', b'403'):
+                raise RelayAuthError('register refused: HTTP '
+                                     + code.decode('ascii', 'replace'))
             raise OSError('register refused')
         sock.settimeout(RECV_POLL)
         ws = _WSock(sock, masked_out=True)
