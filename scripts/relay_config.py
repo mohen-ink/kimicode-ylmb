@@ -21,9 +21,9 @@ import json
 import os
 import time
 
-# ---------------- 默认值（与现有硬编码一致，未配置时的兼容回退） ----------------
+# ---------------- 默认值（未配置回退；host 空串 = 未配置） ----------------
 DEFAULTS = {
-    'host': 'your-relay-host',
+    'host': '',            # '' = 未配置；须在面板「中继服务器配置」填入服务器地址
     'tunnel_port': 48213,
     'public_port': 47961,
     'token': '',           # '' = 本机未配置；由 relay.json / KIMI_RELAY_TOKEN 提供

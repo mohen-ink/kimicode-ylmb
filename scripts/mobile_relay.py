@@ -43,7 +43,7 @@ import time
 # 默认值即「未配置」的兼容回退；持久化在 usage-dashboard/relay.json，由
 # relay_config.py 统一读写校验。运行时经 RelayClient(...) 构造参数注入——
 # 本模块不再用模块级常量写死目标 VPS（host/port/header 全部实例化）。
-RELAY_HOST = 'your-relay-host'
+RELAY_HOST = ''
 RELAY_PORT = 48213           # VPS 隧道注册口（ws://<vps>:<RELAY_PORT>/relay/register）
 RELAY_PUBLIC_PORT = 47961    # VPS 公网口（http://<vps>:<RELAY_PUBLIC_PORT>/t/<id>/...）
 # 共享密钥：运行期经 KIMI_RELAY_TOKEN 环境变量，或本机 usage-dashboard/relay.json
@@ -509,6 +509,16 @@ class RelayClient:
         位）才退出；连续 RECONNECT_GIVEUP 秒仍连不上才回调
         _fail('TUNNEL_EXITED') 让桥 teardown。
         """
+        if not isinstance(self.relay_host, str) or not self.relay_host.strip():
+            # 未配置中继服务器地址（relay.json host 为空/非法被清洗成 ''）：
+            # 确定性配置错误，拿空串去 create_connection 只会白重连到
+            # RECONNECT_GIVEUP。直接拒绝并回报 TUNNEL_AUTH_FAILED——现有
+            # 白名单码，前端文案指向「中继服务器配置」，且不污染
+            # _MOBILE_ERROR_CODES / mobile_worker 合同。
+            with self._lock:
+                self._started = False
+            self._fail('TUNNEL_AUTH_FAILED')
+            return
         backoff = RECONNECT_BASE
         dead_since = None
         while True:

@@ -343,7 +343,7 @@
       lab.appendChild(inp);
       return lab;
     };
-    relayPanel.appendChild(mkField('服务器地址', 'kur-relay-host', 'text', '例如 your-relay-host 或 relay.example.com'));
+    relayPanel.appendChild(mkField('服务器地址', 'kur-relay-host', 'text', '例如 relay.example.com 或你的服务器 IP'));
     var portRow = doc.createElement('div');
     portRow.style.cssText = 'display:flex;gap:10px;';
     var pf1 = mkField('隧道端口', 'kur-relay-tport', 'number', '48213');

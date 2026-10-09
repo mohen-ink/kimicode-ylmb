@@ -903,8 +903,9 @@ class MobileBridgeManager(object):
             import relay_config
             return relay_config.load(self.kimi_home)
         except Exception:
-            # 模块不可用/读取异常：仍给一份默认，让 RelayClient 自行兜底
-            return {'host': 'your-relay-host', 'tunnel_port': 48213,
+            # 模块不可用/读取异常：仍给一份默认（host 空 = 未配置），
+            # 让 RelayClient 自行兜底（空 host 启动即拒绝，见 _run）
+            return {'host': '', 'tunnel_port': 48213,
                     'public_port': 47961, 'token': ''}
 
     # ---------- 状态 ----------

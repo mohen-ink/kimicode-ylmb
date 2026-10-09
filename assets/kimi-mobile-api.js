@@ -35,8 +35,10 @@
   var PAIR_PATH = '/mobile/pair';
   var PAIR_TOKEN_RE = /^[A-Za-z0-9_-]{8,256}$/;
   var PUBLIC_ORIGIN_RE = /^https:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.trycloudflare\.com$/;
-  // relay 公网 origin：固定 VPS IP + 端口（不带 /t/<id> 路径，tid 只在配对 URL 里）
-  var RELAY_ORIGIN_RE = /^http:\/\/114\.66\.24\.119:\d+$/;
+  // relay 公网 origin：http://<中继 host>:<port>（不带 /t/<id> 路径，tid 只在配对
+  // URL 里）。不写死任何具体服务器——host 取字符集白名单（hostname/IPv4/IPv6
+  // 字面量），配对链接的 hostname 另须等于 status.public_origin 的 host。
+  var RELAY_ORIGIN_RE = /^http:\/\/[A-Za-z0-9._:\[\]-]+:\d+$/;
   var ERROR_MESSAGES = {
     CONNECTOR_MISSING: '请先安装外网连接组件。',
     CONNECTOR_INSTALL_FAILED: '连接组件安装失败，请重新确认后再试。',
@@ -119,6 +121,12 @@
     if (typeof origin !== 'string' || /\s/.test(origin)) return false;
     if (mode === 'relay') return RELAY_ORIGIN_RE.test(origin);
     return PUBLIC_ORIGIN_RE.test(origin);
+  }
+
+  // 从 public_origin（'http://<host>:<port>'）解析 host 部分；解析不出返回 ''。
+  function relayOriginHost(origin) {
+    if (typeof origin !== 'string') return '';
+    try { return new URL(origin).hostname; } catch (e) { return ''; }
   }
 
   // owner_origin：http + 回环 host，无 userinfo/路径/查询/锚点
@@ -290,7 +298,8 @@
       if (!m) return reject();
       if (status.enabled !== true || status.state !== 'on' || !isObj(status.tunnel)
           || status.tunnel.state !== 'ready' || !validPublicOrigin(status.public_origin, 'relay')
-          || u.protocol !== 'http:' || u.hostname !== 'your-relay-host' || !u.port
+          || u.protocol !== 'http:' || !u.port
+          || u.hostname !== relayOriginHost(status.public_origin)
           || u.origin !== status.public_origin
           || text !== status.public_origin + u.pathname + u.hash) return reject();
     } else {

@@ -7,11 +7,13 @@ Kimi Code 用量面板 · 私人测试用公网中继（VPS 侧，纯标准库�
   worker --ws--> 隧道注册口 :<listen_port>（X-Relay-Token 共享密钥）
 
 用法（CLI 与 worker 侧 relay.json 对应，默认值即未配置回退）：
-  python3 relay_server.py [--tunnel-port 48213] [--public-port 47961]
-                          [--public-host <host:port>] [--token <共享密钥>]
+  python3 relay_server.py --public-host <host:port>
+                          [--tunnel-port 48213] [--public-port 47961]
+                          [--token <共享密钥>]
   --tunnel-port  worker 隧道注册口（默认 48213，worker relay.json 的 tunnel_port）
   --public-port  手机公网口（默认 47961，worker relay.json 的 public_port）
-  --public-host  注册回执里 origin 的 host:port（默认 <本机 IP>:<public_port>；
+  --public-host  注册回执里 origin 的 host:port（**必填**，也可经环境变量
+                 PUBLIC_HOST 提供；缺省直接报错退出——不默认任何具体地址。
                  须与 worker 桥白名单一致——worker 用 relay.json host:public_port）
   --token        X-Relay-Token 共享密钥（默认空 = 不校验；worker 用 relay.json token）
 
@@ -45,8 +47,9 @@ LISTEN_HOST = '0.0.0.0'
 TUNNEL_PORT = 48213         # worker 隧道注册口（ws://<vps>:<TUNNEL_PORT>/relay/register）
 PUBLIC_PORT = 47961         # 手机公网口（http://<vps>:<PUBLIC_PORT>/t/<id>/...）
 # 注册回执 origin 的 host:port（worker 桥按它做 Host/Origin 校验——必须与
-# worker relay.json 的 host:public_port 一致；默认值在 main() 里按参数改写）。
-PUBLIC_HOST_HEADER = '127.0.0.1:%d' % PUBLIC_PORT
+# worker relay.json 的 host:public_port 一致；无内置默认，由 main() 强制要求
+# --public-host 或 PUBLIC_HOST 环境变量提供）。
+PUBLIC_HOST_HEADER = ''
 
 MAX_HTTP_BODY = 32 * 1024 * 1024     # 与桥 PROXY_MAX_REQUEST_BODY 对齐
 MAX_WS_MESSAGE = 4 * 1024 * 1024     # 与桥 _WS_MAX_MESSAGE 对齐（手机侧 WS 帧上限）
@@ -711,14 +714,18 @@ def main():
             i += 1
     if not token:
         token = __import__('os').environ.get('RELAY_TOKEN', '')
-    # --public-host 决定注册回执里 origin 的 host:port（worker 桥白名单须匹配）；
-    # 不传时回退到与旧版一致的固定 VPS IP（本脚本本来就只服务这一台机器，
-    # 需要换机请显式传 --public-host <host:port>）。
+    if not public_host:
+        public_host = __import__('os').environ.get('PUBLIC_HOST', '').strip()
+    # --public-host（或 PUBLIC_HOST env）决定注册回执里 origin 的 host:port，
+    # worker 桥白名单须与之匹配。**必填**：不默认任何具体地址——默认错 IP 会
+    # 让注册回执 origin 与桥白名单不符且来源不可审计，fail-closed 直接退出。
+    if not public_host:
+        print('error: --public-host <host:port> is required '
+              '(or set PUBLIC_HOST env)', file=sys.stderr)
+        sys.exit(2)
     global PUBLIC_HOST_HEADER
-    if public_host:
-        PUBLIC_HOST_HEADER = public_host if ':' in public_host else '%s:%d' % (public_host, public)
-    else:
-        PUBLIC_HOST_HEADER = 'your-relay-host:%d' % public
+    PUBLIC_HOST_HEADER = (public_host if ':' in public_host
+                          else '%s:%d' % (public_host, public))
     try:
         asyncio.run(main_async(listen, public, token))
     except KeyboardInterrupt:
