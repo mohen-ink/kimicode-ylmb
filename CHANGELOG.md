@@ -2,13 +2,6 @@
 
 > 格式说明：每个版本以 `## vX.Y.Z · 发布日期` 开头；`###` 为分组标题，`-` 为条目。面板里的「发现新版本」弹窗会读取最新版本这一节。
 
-## 未发布（v3.4.0 之后）
-
-### 文档与修复
-- 新增 [自建中继搭建教程](docs/自建中继服务器-搭建教程.md)：VPS 部署 `relay_server.py`（`--public-host` 必填、`--token` 准入）、本机 `relay.json` 配置、防火墙/安全组放行、systemd 常驻与故障排查表全流程。
-- 修复中继配对 hostname 校验：配对链接 host 校验不再写死固定 IP，改为与当前 `public_origin` 的 host 比对，换服务器后配对不再永久失败。
-- 修复中继注册鉴权失败卡「正在开启中」：VPS 以 401/403 拒绝注册（密钥错/未授权）时立即上报 `TUNNEL_AUTH_FAILED` 并提示密钥错误；`relay.json` `host` 为空（未配置）同样立即报错，不再空转重连。
-
 ## v3.4.0 · 2026-10-09
 
 ### 合并：自建中继（Python 版）+ 模式滑杆 + 本地安全加固
@@ -30,6 +23,11 @@
 - `WORKER_VERSION` 升到 `3.4.0`。桥运行在独立 worker 进程中，**必须先停止手机连接再重新开启**才会换上新 worker（同版本 worker 会被直接接管，旧版本只读并须显式停止）。
 - 停止会作废原配对链接，手机需重新扫码配对。
 - 更新器成组交付清单同步调整：加入 `scripts/relay_config.py` 与 `scripts/relay_server.py`，移除 `assets/vendor/frp-0.67.0-LICENSE`。
+
+### 文档与修复
+- 新增 [自建中继搭建教程](docs/自建中继服务器-搭建教程.md)：VPS 部署 `relay_server.py`（`--public-host` 必填、`--token` 准入）、本机 `relay.json` 配置、防火墙/安全组放行、systemd 常驻与故障排查表全流程。
+- 修复中继配对 hostname 校验：配对链接 host 校验不再写死固定 IP，改为与当前 `public_origin` 的 host 比对，换服务器后配对不再永久失败。
+- 修复中继注册鉴权失败卡「正在开启中」：VPS 以 401/403 拒绝注册（密钥错/未授权）时立即上报 `TUNNEL_AUTH_FAILED` 并提示密钥错误；`relay.json` `host` 为空（未配置）同样立即报错，不再空转重连。
 
 ### 风险与验收边界
 - **自建中继为明文传输**（`ws://` / `http://`，第一阶段不做手机 HTTPS）：手机到服务器的配对码、Cookie、会话与文件内容经过 VPS 时为明文，可能被窃听或篡改；`relay_server.py` 在未传 `--token` 时不校验注册，且**仓库不内置 token 默认值**——服务器 `--token` 与本机 `relay.json` 需各自填入同一把共享 token 并妥善保管。请仅在自控服务器、临时联调场景使用。
