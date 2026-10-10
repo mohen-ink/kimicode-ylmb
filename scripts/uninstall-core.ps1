@@ -147,13 +147,69 @@ if (-not $runningFromTemp) {
     }
 }
 
+# ------------------------------------------------------------- UI reload ---
+# index.html is already scrubbed and the injected assets are gone, but the live
+# renderer still holds the widget until the page navigates again. Trigger the
+# exact path the app's own Ctrl+R takes: the View > Reload menu accelerator
+# (CommandOrControl+R, still registered on packaged Windows builds) forwards
+# 'browser-reload' to the renderer, which calls window.location.reload().
+# We cannot call webContents.reload() from here, so drive the accelerator with
+# synthetic input aimed at the main window (never the console, whose title also
+# starts with "Kimi Code").
+# NOTE: Interaction.AppActivate(<pid>) returns void, so it cannot be used as a
+# success test; verify the foreground window by handle before sending keys so a
+# stray Ctrl+R can never land on another application.
+try {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class KcWin {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+'@ -ErrorAction Stop
+} catch {}
+function Invoke-MainWindowReload {
+    $main = Get-Process -Name 'Kimi Code' -ErrorAction SilentlyContinue |
+        Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } |
+        Sort-Object { if ($_.MainWindowTitle -eq 'Kimi Code') { 0 } else { 1 } } |
+        Select-Object -First 1
+    if (-not $main) {
+        Write-Ok 'Kimi Code is not running; nothing to reload'
+        return $false
+    }
+    $h = $main.MainWindowHandle
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        [KcWin]::ShowWindow($h, 9) | Out-Null
+        [KcWin]::SetForegroundWindow($h) | Out-Null
+        Start-Sleep -Milliseconds 600
+        if ([KcWin]::GetForegroundWindow() -ne $h) {
+            Write-WarnLine 'Could not bring the Kimi Code window to the front; press Ctrl+R there to unload the widget'
+            return $false
+        }
+        [System.Windows.Forms.SendKeys]::SendWait('^r')
+        return $true
+    } catch {
+        Write-WarnLine 'Could not send Ctrl+R; press it in the Kimi Code window to unload the widget'
+        return $false
+    }
+}
+$reloaded = $false
+if ($dist) { $reloaded = Invoke-MainWindowReload }
+
 Write-Host ''
 if (Test-Path -LiteralPath $Root) {
     Write-Host 'Uninstall finished with warnings (see lines marked with !).' -ForegroundColor Yellow
 } else {
     Write-Host 'Uninstall finished. The usage panel will not start again.' -ForegroundColor Green
 }
-Write-Host 'Restart Kimi Code to unload the sidebar widget from this session.'
+if ($reloaded) {
+    Write-Host 'Kimi Code was reloaded (Ctrl+R); the sidebar widget is now unloaded.'
+} else {
+    Write-Host 'Restart Kimi Code to unload the sidebar widget from this session.'
+}
 Write-Host ''
 Remove-Item -LiteralPath $tempCopy -Force -ErrorAction SilentlyContinue
 Read-Host 'Press Enter to close this window'
