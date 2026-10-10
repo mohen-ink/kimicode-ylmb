@@ -2,7 +2,7 @@
 
 > 格式说明：每个版本以 `## vX.Y.Z · 发布日期` 开头；`###` 为分组标题，`-` 为条目。面板里的「发现新版本」弹窗会读取最新版本这一节。
 
-## 未发布
+## v3.4.1 · 2026-10-10
 
 ### 卸载
 - 侧栏面板右上角「更新」旁新增「卸载」按钮。一次确认后打开独立命令行窗口（`scripts/uninstall.cmd`，输出为英文）执行清理：写入 `~/.kimi-code/usage-dashboard/plugin-uninstall.json` 保护标记阻止心跳复活 → 按命令行核实并结束全部插件进程（daemon / 手机 worker / cloudflared 连接器）→ 正则清除 `desktop-dist/index.html` 注入标签并删除注入资产 → 删除 `~/.kimi-code/usage-dashboard` 状态目录与插件目录本体。脚本通过复制自身到 `%TEMP%` 执行，可删除插件目录自身。
