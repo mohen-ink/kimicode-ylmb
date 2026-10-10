@@ -438,8 +438,13 @@ def _kill_legacy_processes():
 
 def kill_port_owner():
     """端口被占且 API 无响应时，只杀经 _daemon_pid_verified 核实为本插件 service.py 的
-    残留 daemon（如挂死进程）；陌生占用者一律不杀，只记录冲突日志。"""
+    残留 daemon（如挂死进程）；陌生占用者一律不杀，只记录冲突日志。
+    有 daemon 正在拉起（spawn.lock 新鲜）时一律不杀——并发的 tick/run_once 会走到这里，
+    若把对方刚 bind、/api 尚未就绪的 daemon 当残留杀掉，就会互相清场、谁都不起来。"""
     if port_is_ours():
+        return
+    if _recent_spawn():
+        log('port %d busy but a daemon was just spawned; not killing' % PORT)
         return
     try:
         out = subprocess.run(
@@ -481,6 +486,16 @@ def spawn_lock():
         return True
     except Exception:
         return True
+
+
+def _recent_spawn(window=15.0):
+    """spawn.lock 刚被写过 → 有 daemon 正在拉起（bind 完成但 /api 尚未就绪也算）。
+    此时绝不能把端口占用者当残留 daemon 杀掉，否则并发 tick 会互相清场、谁都起不来。"""
+    lock = os.path.join(KIMI_HOME, 'usage-dashboard', 'spawn.lock')
+    try:
+        return (time.time() - os.stat(lock).st_mtime) < window
+    except OSError:
+        return False
 
 
 def migrate_legacy():
@@ -3145,13 +3160,18 @@ def _urlopen(url, timeout=3):
 
 
 def port_is_ours():
+    """本机探活。先用 bind 测试排除空闲端口：部分环境（安全软件拦截回环）下连接未监听
+    端口要 ~2s 才回 RST，直接 urlopen 会把每次 tick 拖慢数秒而超过 hook 超时；
+    bind 测试不受该延迟影响。_port_free 定义见下方。"""
+    if _port_free():
+        return False
     for _ in range(2):
         try:
-            with _urlopen('http://127.0.0.1:%d/api/status' % PORT, timeout=4) as r:
+            with _urlopen('http://127.0.0.1:%d/api/status' % PORT, timeout=1) as r:
                 d = json.loads(r.read().decode())
                 return d.get('name') == 'kimi-code-usage'
         except Exception:
-            time.sleep(0.3)
+            time.sleep(0.1)
     return False
 
 

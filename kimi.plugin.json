@@ -22,12 +22,12 @@
     {
       "event": "SessionStart",
       "command": ".\\scripts\\bootstrap.cmd",
-      "timeout": 15
+      "timeout": 30
     },
     {
       "event": "SessionHeartbeat",
       "command": ".\\scripts\\bootstrap.cmd",
-      "timeout": 15
+      "timeout": 30
     }
   ],
   "interface": {
