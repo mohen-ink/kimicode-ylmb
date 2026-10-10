@@ -28,16 +28,6 @@
       "event": "SessionHeartbeat",
       "command": ".\\scripts\\bootstrap.cmd",
       "timeout": 15
-    },
-    {
-      "event": "Stop",
-      "command": ".\\scripts\\bootstrap.cmd",
-      "timeout": 15
-    },
-    {
-      "event": "SessionEnd",
-      "command": ".\\scripts\\bootstrap.cmd",
-      "timeout": 15
     }
   ],
   "interface": {

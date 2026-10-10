@@ -19,4 +19,4 @@ description: 启动/自愈 Kimi Code 用量面板后台服务（采集+注入+39
 
 3. 向用户报告：端口、pid、以及面板数据文件 `desktop-dist/assets/kimi-usage-data.js` 的更新时间。
 
-说明：服务平时随会话 hook（SessionStart/Heartbeat/Stop/SessionEnd）自动拉起，本命令只是手动兜底。参数：$ARGUMENTS
+说明：服务平时随会话 hook（SessionStart/Heartbeat）自动拉起，本命令只是手动兜底。参数：$ARGUMENTS

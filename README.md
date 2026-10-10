@@ -90,7 +90,7 @@
 ## 架构（v3.x）
 
 ```
-插件 hooks (SessionStart/Heartbeat/Stop/SessionEnd, cwd=插件根)
+插件 hooks (SessionStart/Heartbeat, cwd=插件根)
         │  ./scripts/bootstrap.cmd
         ▼
 scripts/service.py ──单进程──┬─ scanner.py 增量扫描 wire.jsonl（字节偏移续扫）
@@ -146,7 +146,7 @@ python "%USERPROFILE%\.kimi-code\plugins\managed\kimi-code-usage\scripts\service
 
 ```text
 kimi-code-usage/
-├── kimi.plugin.json            # 清单（4 个 hook：SessionStart/Heartbeat/Stop/SessionEnd）
+├── kimi.plugin.json            # 清单（2 个 hook：SessionStart/SessionHeartbeat）
 ├── LICENSE / README.md / SYSTEM.md
 ├── assets/
 │   ├── kimi-usage-widget.js    # 侧栏卡片+大屏+模型弹窗（注入链最后一个脚本）
