@@ -9,7 +9,7 @@ Kimi Code 用量面板 · 本地服务（单进程）
        assets/kimi-usage-widget.js (侧栏卡片本体，自愈看护)
        kimi-usage.json            (面板/Skill/命令可读的报表数据)
   3. 看护 index.html 注入点（桌面端更新覆盖后自动重注入，清理旧套件残留注入）
-  4. HTTP API :39281 模型能力管理（config.toml 安全改写：备份+kimi doctor 校验）
+  4. HTTP API :39281 模型与供应商管理（版本冲突检测、严格解析、档位归一化与原子写入）
   5. --tick      : hook 调用入口——确保服务在跑、跑一次采集、注入检查，然后退出
      --restart   : 核实旧 daemon 为本插件 service.py 后停止并拉起新代码（升级后手动换版本用）
      --once      : 只采集+写文件，不常驻（无服务时的降级刷新）
@@ -154,6 +154,129 @@ def save_pricing(alias, entry):
 sys.path.insert(0, SCRIPT_DIR)
 import scanner  # noqa: E402
 import relay_config  # noqa: E402
+import model_manager  # noqa: E402
+import model_catalog  # noqa: E402
+
+CONFIG_LOCK = threading.RLock()
+CONFIG_CONFLICT = '配置已被其他操作更改，请刷新后重试'
+
+
+def _config_locked(function):
+    def locked(*args, **kwargs):
+        with CONFIG_LOCK:
+            return function(*args, **kwargs)
+    return locked
+
+
+def _config_change(transform):
+    with CONFIG_LOCK:
+        base = get_config_content()
+        return safe_apply_config(transform(base), base_content=base)
+
+
+@_config_locked
+def get_model_manager_data():
+    try:
+        content = get_config_content()
+        result = model_manager.snapshot(content)
+        if result['editable']:
+            try:
+                references = _model_manager_mode_references(model_manager.parse(content))
+                for model in result['models']:
+                    if not model['delete_protected'] and model['alias'] in references:
+                        model.update(delete_protected=True, delete_reason=references[model['alias']])
+            except model_manager.ConfigError as error:
+                for model in result['models']:
+                    if not model['delete_protected']:
+                        model.update(delete_protected=True, delete_reason=str(error))
+    except Exception:
+        result = model_manager.snapshot('')
+        result.update(editable=False, message='无法读取配置，拒绝改写')
+    return result
+
+
+def get_model_manager_catalog(req):
+    result = {'success': False, 'version': '', 'provider': '', 'models': [], 'message': ''}
+    try:
+        if not isinstance(req, dict) or set(req) != {'version', 'provider'}:
+            raise model_manager.ConfigError('请求参数不被允许或缺少必填字段')
+        model_manager._string(req['version'], 'version', True)
+        model_manager._string(req['provider'], 'provider', True)
+        result.update(version=req['version'], provider=req['provider'])
+        with CONFIG_LOCK:
+            base = get_config_content()
+            result['version'] = model_manager.version(base)
+            if req['version'] != result['version']:
+                result.update(code='CONFIG_CONFLICT', message=CONFIG_CONFLICT)
+                return result, 409
+            provider = model_catalog.provider_snapshot(model_manager.parse(base), req['provider'])
+        failure = None
+        try:
+            models, message = model_catalog.fetch_models(req['provider'], provider)
+        except model_catalog.CatalogError as error:
+            failure = str(error)
+            models, message = [], failure
+        except Exception:
+            failure = '上游模型探测失败，请检查供应商配置；仍可手动添加模型'
+            models, message = [], failure
+        with CONFIG_LOCK:
+            current_version = model_manager.version(get_config_content())
+            if current_version != req['version']:
+                result.update(version=current_version, code='CONFIG_CONFLICT', message=CONFIG_CONFLICT)
+                return result, 409
+        result.update(success=failure is None, models=models, message=message)
+        return result, 400 if failure else 200
+    except model_manager.ConfigError as error:
+        result['message'] = str(error)
+        return result, 400
+    except Exception:
+        result['message'] = '无法读取配置或执行模型探测'
+        return result, 500
+
+
+@_config_locked
+def save_model_manager(path, req):
+    try:
+        is_batch = path == '/api/model-manager/batch'
+        is_provider = path == '/api/model-manager/provider'
+        if is_batch:
+            allowed = required = {'version', 'provider', 'upserts', 'removes'}
+        else:
+            item_key = 'provider' if is_provider else 'model'
+            original_key = 'original_name' if is_provider else 'original_alias'
+            required = {'version', original_key, item_key}
+            allowed = required | (set() if is_provider else {'set_default'})
+        if not isinstance(req, dict) or set(req) - allowed or not required <= set(req):
+            raise model_manager.ConfigError('请求参数不被允许或缺少必填字段')
+        model_manager._string(req['version'], 'version', True)
+        base = get_config_content()
+        if req['version'] != model_manager.version(base):
+            return {'success': False, 'code': 'CONFIG_CONFLICT', 'message': CONFIG_CONFLICT}, 409
+        modes_version = None
+        if is_batch:
+            if not isinstance(req['removes'], list):
+                raise model_manager.ConfigError('removes 必须是数组')
+            references = None
+            if req['removes']:
+                modes_version = _model_manager_modes_version()
+                references = _model_manager_mode_references(model_manager.parse(base))
+            new = model_manager.batch_models(base, req['provider'], req['upserts'], req['removes'], references)
+        elif is_provider:
+            new = model_manager.upsert_provider(base, req[original_key], req[item_key])
+        else:
+            new = model_manager.upsert_model(base, req[original_key], req[item_key], req.get('set_default', False))
+        if modes_version is not None and _model_manager_modes_version() != modes_version:
+            return {'success': False, 'code': 'CONFIG_CONFLICT', 'message': CONFIG_CONFLICT}, 409
+        ok, msg = safe_apply_config(new, base_content=base)
+        if not ok:
+            if msg == CONFIG_CONFLICT:
+                return {'success': False, 'code': 'CONFIG_CONFLICT', 'message': msg}, 409
+            return {'success': False, 'message': msg}, 400
+        return {'success': True, 'message': msg, 'version': model_manager.version(get_config_content())}, 200
+    except model_manager.ConfigError as e:
+        return {'success': False, 'message': str(e)}, 400
+    except Exception:
+        return {'success': False, 'message': '模型管理操作失败，配置未改动'}, 500
 
 
 def log(msg):
@@ -905,66 +1028,62 @@ def service_alive_flag():
 # ---------------- config.toml 读写（模型管理） ----------------
 def _load_toml(content):
     try:
-        import tomllib  # py3.11+
-        return tomllib.loads(content)
-    except Exception:
-        pass
+        import tomllib
+    except ImportError:
+        try:
+            import toml
+        except ImportError:
+            return _mini_toml(content)
     try:
-        import toml
-        return toml.loads(content)
-    except Exception:
-        return _mini_toml(content)
+        return model_manager.parse(content)
+    except model_manager.ConfigError:
+        return {}
 
 
 def _mini_toml(content):
-    """极简 TOML 兜底解析：只够 [models.*]/[providers.*] 读字段。"""
-    data = {}
-    section = []
+    """仅供无严格解析器时读取用量模型摘要，不能用于配置写入。"""
+    data, section = {}, []
     for raw in content.split('\n'):
         line = raw.strip()
         if not line or line.startswith('#'):
             continue
         if line.startswith('[') and line.endswith(']'):
             name = line.strip('[] ')
-            parts = [p.strip().strip('"') for p in re.split(r'\.(?=(?:[^"]*"[^"]*")*[^"]*$)', name)]
-            section = parts
-            d = data
-            for p in parts:
-                d = d.setdefault(p, {})
+            section = [p.strip().strip('"') for p in re.split(r'\.(?=(?:[^"]*"[^"]*")*[^"]*$)', name)]
+            current = data
+            for part in section:
+                current = current.setdefault(part, {})
             continue
         if '=' in line:
-            k, _, v = line.partition('=')
-            k = k.strip().strip('"')
-            v = v.strip()
-            d = data
-            for p in section:
-                d = d.setdefault(p, {})
-            d[k] = _mini_val(v)
+            key, _, value = line.partition('=')
+            current = data
+            for part in section:
+                current = current.setdefault(part, {})
+            current[key.strip().strip('"')] = _mini_val(value.strip())
     return data
 
 
-def _mini_val(v):
-    if v.startswith('"') and v.endswith('"'):
-        return v[1:-1]
-    if v.startswith('['):
-        inner = v.strip('[] ')
-        return [x.strip().strip('"') for x in inner.split(',') if x.strip()]
-    if v in ('true', 'false'):
-        return v == 'true'
+def _mini_val(value):
+    if value.startswith('"') and value.endswith('"'):
+        return value[1:-1]
+    if value.startswith('['):
+        return [item.strip().strip('"') for item in value.strip('[] ').split(',') if item.strip()]
+    if value in ('true', 'false'):
+        return value == 'true'
     try:
-        return int(v)
+        return int(value)
     except ValueError:
         try:
-            return float(v)
+            return float(value)
         except ValueError:
-            return v
+            return value
 
 
 def get_config_content():
     if not os.path.exists(CONFIG_PATH):
         return ''
     with open(CONFIG_PATH, 'rb') as f:
-        return f.read().decode('utf-8', errors='replace')
+        return f.read().decode('utf-8')
 
 
 EFFORT_LEVELS = ('low', 'medium', 'high', 'xhigh', 'max')
@@ -974,7 +1093,7 @@ EFFORT_KEYS = ('support_efforts', 'default_effort')
 def _is_managed(model, provider):
     """托管/目录导入的模型：官方刷新可能改写其顶层 support_efforts / default_effort。"""
     name = str(model.get('provider') or '')
-    return name.startswith('managed:') or bool((provider or {}).get('oauth'))
+    return name.startswith('managed:') or 'oauth' in (provider or {})
 
 
 def _effective(m, key):
@@ -1051,25 +1170,32 @@ def _fix_base_url(base):
     return '%s://%s' % ('https' if scheme.endswith('s') else 'http', m.group(2).strip())
 
 
-def update_provider_field_in_text(content, provider, key, value):
-    """白名单内单字段改写（键/值类型校验失败直接返回 False）。"""
+def _update_provider_field_data(data, provider, key, value):
     if _valid_field_updates({key: value}, _PROVIDER_FIELD_TYPES, 'provider') is not None:
-        return content, False
-    pattern = r'(\[providers\.(?:"%s"|%s)\])(.*?)(?=\n\[|\Z)' % (re.escape(provider), re.escape(provider))
-    m = re.search(pattern, content, re.DOTALL)
-    if not m:
-        return content, False
-    body = m.group(2)
-    line = _render_toml_kv(key, value)
-    if re.search(r'^[ \t]*%s[ \t]*=' % re.escape(key), body, re.MULTILINE):
-        body = re.sub(r'^[ \t]*%s[ \t]*=.*$' % re.escape(key), lambda _m: line, body, count=1, flags=re.MULTILINE)
-    else:
-        body = body.rstrip('\n') + '\n' + line + '\n'
-    return content[:m.start()] + m.group(1) + body + content[m.end():], True
+        return False
+    old = model_manager._table(data, ('providers',)).get(provider)
+    if not isinstance(old, dict) or model_manager.managed_provider(provider, old):
+        return False
+    item = {'name': provider, 'type': old.get('type', ''),
+            'base_url': old.get('base_url', ''), 'key_action': 'keep'}
+    item[key] = value
+    model_manager._upsert_provider_data(data, provider, item)
+    return True
 
 
-def get_models_data():
-    content = get_config_content()
+def update_provider_field_in_text(content, provider, key, value):
+    try:
+        data = model_manager.parse(content)
+        if not _update_provider_field_data(data, provider, key, value):
+            return content, False
+        return model_manager.dumps(data), True
+    except model_manager.ConfigError:
+        return content, False
+
+
+def get_models_data(content=None):
+    if content is None:
+        content = get_config_content()
     data = _load_toml(content) or {}
     default_model = data.get('default_model', '')
     providers = data.get('providers', {}) or {}
@@ -1131,60 +1257,46 @@ def get_models_data():
             'models': models}
 
 
-def safe_apply_config(new_content):
-    """写 config-new.toml → kimi doctor 校验 → 时间戳备份 → 原子替换。"""
-    with open(CONFIG_NEW_PATH, 'wb') as f:
-        f.write(new_content.encode('utf-8'))
-    kimi = shutil.which('kimi') or shutil.which('kimi.cmd') or 'kimi'
+@_config_locked
+def safe_apply_config(new_content, *, base_content):
     try:
-        res = subprocess.run([kimi, 'doctor', 'config', CONFIG_NEW_PATH],
-                             capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW)
-        if res.returncode != 0:
+        if get_config_content() != base_content:
+            return False, CONFIG_CONFLICT
+        model_manager.parse(base_content)
+        data = model_manager.parse(new_content)
+        model_manager.normalize_support_efforts_data(data)
+        new_content = model_manager.dumps(data)
+    except model_manager.ConfigError as e:
+        return False, str(e)
+    except Exception:
+        return False, '无法读取配置，拒绝改写'
+    tmp = None
+    try:
+        from mobile_security import _set_protected_dacl
+        directory = os.path.dirname(CONFIG_PATH)
+        fd, tmp = tempfile.mkstemp(prefix='.config-write-', suffix='.toml', dir=directory)
+        with os.fdopen(fd, 'wb') as f:
+            _set_protected_dacl(tmp)
+            f.write(new_content.encode('utf-8'))
+            f.flush()
+            os.fsync(f.fileno())
+        if get_config_content() != base_content:
+            return False, CONFIG_CONFLICT
+        os.replace(tmp, CONFIG_PATH)
+        tmp = None
+        STATE_DIRTY['v'] = True
+        return True, '配置已保存，会话内 /reload 生效'
+    except Exception:
+        return False, '配置写入或原子替换失败，拒绝改写'
+    finally:
+        if tmp:
             try:
-                os.remove(CONFIG_NEW_PATH)
+                os.remove(tmp)
             except OSError:
                 pass
-            return False, '校验失败：\n%s\n%s' % (res.stdout, res.stderr)
-    except FileNotFoundError:
-        # kimi CLI 不在 PATH：跳过校验但保留备份
-        pass
-    except Exception as e:
-        try:
-            os.remove(CONFIG_NEW_PATH)
-        except OSError:
-            pass
-        return False, '校验异常：%r' % e
-
-    ts = datetime.now().strftime('%Y%m%d-%H%M%S')
-    try:
-        if os.path.exists(CONFIG_PATH):
-            shutil.copy2(CONFIG_PATH, CONFIG_PATH + '.' + ts + '.bak')
-        shutil.move(CONFIG_NEW_PATH, CONFIG_PATH)
-    except Exception as e:
-        return False, '替换失败：%r' % e
-    collect_once()
-    return True, '配置已校验并应用，会话内 /reload 生效'
-
-
-# TOML 安全序列化：字符串一律经 JSON 转义（与 TOML basic string 兼容：
-# 引号/反斜杠/换行/控制字符全部被转义，无法注入表头或键值）。
-def _toml_string(v):
-    return json.dumps(str(v), ensure_ascii=False)
-
-
-def _toml_qkey(v):
-    """表头内 quoted key：models."<v>" —— 引号/反斜杠/控制字符安全。"""
-    return json.dumps(str(v), ensure_ascii=False)
 
 
 _KEY_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_-]{0,63}$')
-
-# 可写字段白名单：未知字段一律拒写，只保留受支持操作。
-_MODEL_FIELD_TYPES = {
-    'capabilities': list, 'support_efforts': list, 'default_effort': str,
-    'provider': str, 'model': str, 'display_name': str, 'max_context_size': int,
-    'adaptive_thinking': bool,
-}
 _MODEL_SUB_WHITELIST = frozenset({'', 'overrides'})
 _PROVIDER_FIELD_TYPES = {'base_url': str, 'type': str}
 
@@ -1207,111 +1319,59 @@ def _valid_field_updates(updates, allowed, label):
     return None
 
 
-def _render_toml_kv(k, v):
-    if isinstance(v, bool):
-        return '%s = %s' % (k, str(v).lower())
-    if isinstance(v, int):
-        return '%s = %d' % (k, v)
-    if isinstance(v, list):
-        return '%s = [ %s ]' % (k, ', '.join(_toml_string(x) for x in v))
-    return '%s = %s' % (k, _toml_string(v))
-
-
 def update_model_in_text(content, alias, updates, sub=''):
-    """改写 [models.<alias>] 的字段；sub='overrides' 时改写 [models.<alias>.overrides]（不存在则新建）。
-    未知字段/非法值/非法子表直接拒写（返回原样 + False）。"""
     if sub not in _MODEL_SUB_WHITELIST:
         return content, False
-    if _valid_field_updates(updates, _MODEL_FIELD_TYPES, '模型') is not None:
+    try:
+        return model_manager.update_model(content, alias, updates), True
+    except model_manager.ConfigError:
         return content, False
-    escaped = re.escape(alias)
-    suffix = r'\.' + re.escape(sub) if sub else ''
-    pattern = r'(\[models\.(?:"%s"|%s)%s\])(.*?)(?=\n\[|\Z)' % (escaped, escaped, suffix)
-    m = re.search(pattern, content, re.DOTALL)
-    if not m and sub:
-        main = re.search(r'(\[models\.(?:"%s"|%s)\])(.*?)(?=\n\[|\Z)' % (escaped, escaped), content, re.DOTALL)
-        if not main:
-            return content, False
-        kvs = ''.join(_render_toml_kv(k, v) + '\n' for k, v in updates.items())
-        block = '[models.%s.%s]\n%s' % (_toml_qkey(alias), sub, kvs)
-        return content[:main.end()].rstrip('\n') + '\n\n' + block + content[main.end():], True
-    if not m:
-        return content, False
-    header, body = m.group(1), m.group(2)
-    lines = body.split('\n')
-    new_lines = []
-    handled = set()
-    render = _render_toml_kv
-
-    for line in lines:
-        s = line.strip()
-        if '=' in s and not s.startswith('#'):
-            k = s.split('=')[0].strip()
-            if k in updates:
-                new_lines.append(render(k, updates[k]))
-                handled.add(k)
-                continue
-        new_lines.append(line)
-    tail = []
-    while new_lines and not new_lines[-1].strip():
-        tail.append(new_lines.pop())
-    for k, v in updates.items():
-        if k not in handled:
-            new_lines.append(render(k, v))
-    new_lines.extend(tail)
-    new_content = content[:m.start()] + header + '\n'.join(new_lines) + content[m.end():]
-    return new_content, True
 
 
 def update_model_effort_in_text(content, alias, updates):
-    """思考档位写入：校验合法性与 default ∈ support；托管模型写 overrides 固定。返回 (新内容, 错误信息)。"""
-    err = _valid_field_updates(updates, _MODEL_FIELD_TYPES, '模型')
-    if err:
-        return content, err
-    data = _load_toml(content) or {}
-    m = (data.get('models', {}) or {}).get(alias)
-    if m is None:
-        return content, '模型 %s 不存在' % alias
-    sup_new = updates.get('support_efforts')
-    dflt_new = updates.get('default_effort')
-    if sup_new is not None and (not isinstance(sup_new, list) or any(x not in EFFORT_LEVELS for x in sup_new)):
-        return content, 'support_efforts 只能包含：%s' % '/'.join(EFFORT_LEVELS)
-    if dflt_new is not None and dflt_new not in EFFORT_LEVELS:
-        return content, 'default_effort 只能是：%s' % '/'.join(EFFORT_LEVELS)
-    sup = sup_new if sup_new is not None else (_effective(m, 'support_efforts') or [])
-    dflt = dflt_new if dflt_new is not None else _effective(m, 'default_effort')
-    if sup and dflt and dflt not in sup:
-        return content, 'default_effort "%s" 不在 support_efforts %s 内' % (dflt, sup)
-    provider = (data.get('providers', {}) or {}).get(m.get('provider'), {}) or {}
-    rest = {k: v for k, v in updates.items() if k not in EFFORT_KEYS}
-    eff = {k: v for k, v in updates.items() if k in EFFORT_KEYS}
-    new = content
-    if rest:
-        new, _ = update_model_in_text(new, alias, rest)
-    if eff:
-        new, _ = update_model_in_text(new, alias, eff, sub='overrides' if _is_managed(m, provider) else '')
-    return new, None
+    try:
+        return model_manager.update_model(content, alias, updates), None
+    except model_manager.ConfigError as e:
+        return content, str(e)
+
+
+def _apply_issue_fix_data(data, model, issue):
+    code, alias = issue.get('code'), model['alias']
+    try:
+        if code == 'bad_base_url':
+            if not issue.get('fix_value'):
+                return '无法自动判断正确地址，请手动修改 config.toml 中 provider「%s」的 base_url' % model['provider']
+            if not _update_provider_field_data(data, model['provider'], 'base_url', issue['fix_value']):
+                return '未找到 provider「%s」' % model['provider']
+        elif code == 'no_thinking_tag':
+            target = model_manager._table(data, ('models',)).get(alias)
+            if not isinstance(target, dict):
+                return '模型 %s 不存在' % alias
+            caps = list(model_manager.effective(target, 'capabilities') or [])
+            if 'thinking' not in caps:
+                caps.append('thinking')
+            model_manager._update_model_data(data, alias, {'capabilities': caps})
+        elif code == 'no_support_efforts':
+            model_manager._update_model_data(data, alias, {'support_efforts': list(EFFORT_LEVELS)})
+        elif code == 'default_not_in_support':
+            model_manager._update_model_data(data, alias, {'default_effort': issue['fix_value']})
+        else:
+            return '该问题没有自动修复方案'
+    except model_manager.ConfigError as error:
+        return str(error)
+    return None
 
 
 def apply_issue_fix(content, model, issue):
-    """对单个 (模型, 问题) 套用修复，返回 (新内容, 错误信息)。"""
-    code, alias = issue.get('code'), model['alias']
-    if code == 'bad_base_url':
-        if not issue.get('fix_value'):
-            return content, '无法自动判断正确地址，请手动修改 config.toml 中 provider「%s」的 base_url' % model['provider']
-        new, ok = update_provider_field_in_text(content, model['provider'], 'base_url', issue['fix_value'])
-        return (new, None) if ok else (content, '未找到 provider「%s」' % model['provider'])
-    if code == 'no_thinking_tag':
-        caps = list(model['capabilities'])
-        if 'thinking' not in caps:
-            caps.append('thinking')
-        new, ok = update_model_in_text(content, alias, {'capabilities': caps})
-        return (new, None) if ok else (content, '模型 %s 不存在' % alias)
-    if code == 'no_support_efforts':
-        return update_model_effort_in_text(content, alias, {'support_efforts': list(EFFORT_LEVELS)})
-    if code == 'default_not_in_support':
-        return update_model_effort_in_text(content, alias, {'default_effort': issue['fix_value']})
-    return content, '该问题没有自动修复方案'
+    """对单个 (模型, 问题) 套用修复，返回 (完整 TOML, 错误信息)。"""
+    try:
+        data = model_manager.parse(content)
+        error = _apply_issue_fix_data(data, model, issue)
+        if error:
+            return content, error
+        return model_manager.dumps(data), None
+    except model_manager.ConfigError as error:
+        return content, str(error)
 
 
 def _global_effort_note(alias, level):
@@ -1326,27 +1386,76 @@ def _global_effort_note(alias, level):
 
 
 def set_default_model_in_text(content, alias):
-    line = 'default_model = %s' % _toml_string(alias)
-    if re.search(r'^default_model\s*=', content, re.MULTILINE):
-        # 替换串含 \ 会被 re.sub 按转义解释，必须走 lambda
-        return re.sub(r'^default_model\s*=.*$',
-                      lambda _m: line, content, flags=re.MULTILINE)
-    return line + '\n' + content
+    return model_manager.set_default_model(content, alias)
 
 
 def auto_enable_all_in_text(content):
-    data = _load_toml(content) or {}
-    cur = content
-    for alias, m in (data.get('models', {}) or {}).items():
-        caps = list(m.get('capabilities', []) or [])
+    data = model_manager.parse(content)
+    models = data.get('models', {})
+    if not isinstance(models, dict):
+        raise model_manager.ConfigError('models 必须是表')
+    for alias, m in models.items():
+        caps = list(model_manager.effective(m, 'capabilities') or [])
         changed = False
         for cap in ('tool_use', 'thinking', 'image_in'):
             if cap not in caps:
                 caps.append(cap)
                 changed = True
         if changed:
-            cur, _ = update_model_in_text(cur, alias, {'capabilities': caps})
-    return cur
+            model_manager._update_model_data(data, alias, {'capabilities': caps})
+    return model_manager.dumps(data)
+
+
+def toggle_capability_in_text(content, alias, cap, enabled):
+    if cap not in ('tool_use', 'thinking', 'image_in') or type(enabled) is not bool:
+        raise model_manager.ConfigError('能力仅支持 tool_use/thinking/image_in，enabled 必须是布尔值')
+    data = model_manager.parse(content)
+    target = model_manager._table(data, ('models',)).get(alias)
+    if not isinstance(target, dict):
+        raise model_manager.ConfigError('模型不存在')
+    caps = list(model_manager.effective(target, 'capabilities') or [])
+    if cap == 'thinking' and not enabled and 'always_thinking' in caps:
+        raise model_manager.ConfigError('always_thinking 模型的思考能力不可关闭')
+    if enabled and cap not in caps:
+        caps.append(cap)
+    elif not enabled and cap in caps:
+        caps.remove(cap)
+    model_manager._update_model_data(data, alias, {'capabilities': caps})
+    return model_manager.dumps(data)
+
+
+@_config_locked
+def fix_issues(action, alias, code):
+    base = get_config_content()
+    report = get_models_data(base)
+    if action not in ('fix', 'fix_all'):
+        return False, '未知 action'
+    try:
+        data = model_manager.parse(base)
+    except model_manager.ConfigError as error:
+        return False, str(error)
+    done, errs = 0, []
+    for mdl in report['models']:
+        for issue in mdl['effort_issues']:
+            if issue.get('dismissed') or not issue.get('code') or issue['level'] == 'info':
+                continue
+            if action == 'fix' and (mdl['alias'] != alias or issue['code'] != code):
+                continue
+            if action == 'fix_all' and (issue['code'] == 'no_support_efforts' or not issue.get('fix')):
+                continue
+            err = _apply_issue_fix_data(data, mdl, issue)
+            if err:
+                errs.append(err)
+            else:
+                done += 1
+    if not done:
+        return (False, '；'.join(sorted(set(errs)))) if errs else (True, '没有需要修复的项')
+    try:
+        content = model_manager.dumps(data)
+    except model_manager.ConfigError as error:
+        return False, str(error)
+    ok, msg = safe_apply_config(content, base_content=base)
+    return ok, msg if not ok else '已修复 %d 项，会话内 /reload 生效' % done
 
 
 # ---------------- 模式滑杆（主模型 + 挂件子代理档位） ----------------
@@ -1396,65 +1505,83 @@ def _normalize_default_modes(modes, data):
         out.append(m)
     return out
 
-_HEADER_RE = re.compile(r'^[ \t]*\[\[?[ \t]*(.+?)[ \t]*\]\]?[ \t]*(?:#.*)?$')
+def _model_manager_modes_bytes():
+    try:
+        with open(MODES_PATH, 'rb') as f:
+            raw = f.read(1024 * 1024 + 1)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise model_manager.ConfigError('无法读取模式预设，删除已禁用') from None
+    if len(raw) > 1024 * 1024:
+        raise model_manager.ConfigError('模式预设文件过大，删除已禁用')
+    return raw
 
 
-def _table_root(name):
-    """表头名的第一段（去引号）：'secondary_model.models' → 'secondary_model'。"""
-    name = name.strip()
-    if name.startswith('"'):
-        end = name.find('"', 1)
-        return name[1:end] if end > 0 else name
-    return re.split(r'[ \t]*\.[ \t]*', name, 1)[0]
+def _model_manager_modes_version():
+    raw = _model_manager_modes_bytes()
+    return 'missing' if raw is None else hashlib.sha256(raw).hexdigest()
 
 
-def _split_blocks(content):
-    """按表头切块：[(header_name|None, text)]；首块为表头前的顶层键值。"""
-    blocks, cur_name, cur = [], None, []
-    for line in content.splitlines(keepends=True):
-        m = _HEADER_RE.match(line.rstrip('\r\n'))
-        if m:
-            blocks.append((cur_name, ''.join(cur)))
-            cur_name, cur = m.group(1), []
-        cur.append(line)
-    blocks.append((cur_name, ''.join(cur)))
-    return blocks
+def _model_manager_mode_references(data):
+    raw = _model_manager_modes_bytes()
+    if raw is None:
+        stored = {}
+    else:
+        try:
+            stored = json.loads(raw.decode('utf-8'))
+        except (ValueError, UnicodeError):
+            raise model_manager.ConfigError('模式预设或恢复快照损坏，请先修复再删除模型') from None
+    if not isinstance(stored, dict):
+        raise model_manager.ConfigError('模式预设格式无效，删除已禁用')
+    references = {}
 
+    def add(alias, reason):
+        if alias is not None and alias != '':
+            model_manager._string(alias, '模式模型引用', True)
+            references.setdefault(alias, reason)
 
-def _extract_sections(content, is_target):
-    """拿出所有 is_target(name) 的块，返回 (剩余文本, 被拿出文本, 插入位置)。"""
-    keep, taken, pos = [], [], None
-    for name, text in _split_blocks(content):
-        if name is not None and is_target(name):
-            if pos is None:
-                pos = len(''.join(keep))
-            taken.append(text)
-        else:
-            keep.append(text)
-    rest = ''.join(keep)
-    return rest, ''.join(taken), (len(rest) if pos is None else pos)
-
-
-def _insert_block(rest, pos, block):
-    if not block:
-        return rest
-    before, after = rest[:pos], rest[pos:]
-    if before and not before.endswith('\n'):
-        before += '\n'
-    if before and not before.endswith('\n\n'):
-        before += '\n'
-    block = block.rstrip('\n') + '\n'
-    if after.strip():
-        block += '\n'
-    return before + block + after.lstrip('\n')
-
-
-def _is_secondary(name):
-    return _table_root(name) == 'secondary_model'
-
-
-def _is_tools_root(name):
-    return name.strip() in ('tools', '"tools"')
+    modes = stored.get('modes')
+    if not isinstance(modes, list) or not MODES_MIN <= len(modes) <= MODES_MAX:
+        modes = DEFAULT_MODES
+    for mode in modes:
+        if not isinstance(mode, dict):
+            raise model_manager.ConfigError('模式预设格式无效，删除已禁用')
+        main = mode.get('main')
+        if main is not None:
+            model_manager._string(main, '模式主模型')
+        add(_resolve_mode_alias(main, data, False), '被模式滑杆预设引用，请先编辑档位解除引用')
+        subs = mode.get('subagents') or []
+        if not isinstance(subs, list):
+            raise model_manager.ConfigError('模式子代理预设格式无效，删除已禁用')
+        for alias in subs:
+            model_manager._string(alias, '模式子代理模型')
+            add(_resolve_mode_alias(alias, data, True), '被模式子代理预设引用，请先编辑档位解除引用')
+    locked = stored.get('locked')
+    if locked is not None:
+        if not isinstance(locked, dict):
+            raise model_manager.ConfigError('模式锁定信息无效，删除已禁用')
+        if locked.get('locked'):
+            add(locked.get('main'), '被锁定模式引用，请先解锁并解除档位引用')
+            subs = locked.get('subagents') or []
+            if not isinstance(subs, list):
+                raise model_manager.ConfigError('模式锁定信息无效，删除已禁用')
+            for alias in subs:
+                add(alias, '被锁定模式子代理引用，请先解锁并解除档位引用')
+    snap = stored.get('previous_snapshot')
+    if snap is not None:
+        if not isinstance(snap, dict):
+            raise model_manager.ConfigError('模式恢复快照无效，删除已禁用')
+        add(snap.get('default_model'), '被模式恢复快照引用，请先恢复或解除快照')
+        secondary_text = snap.get('secondary_text') or ''
+        if not isinstance(secondary_text, str):
+            raise model_manager.ConfigError('模式恢复快照无效，删除已禁用')
+        secondary = model_manager.parse(secondary_text)
+        if set(secondary) - {'secondary_model'}:
+            raise model_manager.ConfigError('模式恢复快照包含非预期配置，删除已禁用')
+        for alias in model_manager.config_references(secondary):
+            add(alias, '被模式恢复快照的子代理引用，请先恢复或解除快照')
+    return references
 
 
 def load_modes(data=None):
@@ -1577,90 +1704,72 @@ def validate_modes(modes, data):
     return out, None
 
 
-def _render_tools_disabled(block, disabled):
-    """改写 [tools] 块里的 disabled 数组（可跨行）；disabled 为空则删掉该键。"""
-    pat = re.compile(r'^[ \t]*disabled[ \t]*=[ \t]*\[.*?\][ \t]*(?:#[^\n]*)?\r?\n?', re.M | re.S)
-    line = ('disabled = [ %s ]\n' % ', '.join(_toml_string(x) for x in disabled)) if disabled else ''
-    if pat.search(block):
-        return pat.sub(lambda _m: line, block, count=1)
-    if not line:
-        return block
-    head, _, body = block.partition('\n')
-    return head + '\n' + line + body
-
-
 def apply_mode_to_text(content, mode, hints, tools_owned):
-    """把一档模式写进 config 文本：default_model、[secondary_model(.models)]、[tools].disabled。
-    返回 (新文本, tools_owned 新值)。tools_owned=本插件曾往 disabled 里加过 Agent 工具。"""
-    data = _load_toml(content) or {}
-    old_sec = data.get('secondary_model') or {}
-    content = set_default_model_in_text(content, mode['main'])
-
-    rest, _, pos = _extract_sections(content, _is_secondary)
+    """在完整配置对象上应用模式，返回 (完整 TOML, tools_owned 新值)。"""
+    data = model_manager.parse(content)
+    model_manager._set_default_model_data(data, mode['main'])
+    old_sec = data.get('secondary_model', {})
+    if isinstance(old_sec, str):
+        old_sec = {}
+    if not isinstance(old_sec, dict):
+        raise model_manager.ConfigError('secondary_model 必须是表或模型别名')
+    secondary = dict(old_sec)
+    for key in ('default_model', 'force', 'models'):
+        secondary.pop(key, None)
     subs = mode['subagents']
-    keep_keys = []
-    for k, v in old_sec.items():
-        if k in ('default_model', 'force', 'models', 'default_effort') or isinstance(v, dict):
-            continue
-        if isinstance(v, (str, bool, int, list)) and _KEY_RE.match(k):
-            keep_keys.append(_render_toml_kv(k, v))
+    if subs:
+        secondary['default_model'] = subs[0]
+        secondary['models'] = {alias: hints.get(alias) or alias for alias in subs}
     effort = mode.get('effort') or old_sec.get('default_effort') or ''
-    lines = ['[secondary_model]']
-    if subs:
-        lines.append('default_model = %s' % _toml_string(subs[0]))
-    lines += keep_keys
     if effort:
-        lines.append('default_effort = %s' % _toml_string(effort))
-    block = '\n'.join(lines) + '\n'
-    if subs:
-        block += '\n[secondary_model.models]\n' + ''.join(
-            '%s = %s\n' % (_toml_qkey(s), _toml_string(hints.get(s) or s)) for s in subs)
-    content = _insert_block(rest, pos, block)
+        secondary['default_effort'] = effort
+    data['secondary_model'] = secondary
 
-    disabled = list(((data.get('tools') or {}).get('disabled')) or [])
-    want_off = not subs
+    tools = data.get('tools', {})
+    if not isinstance(tools, dict):
+        raise model_manager.ConfigError('tools 必须是表')
+    disabled = tools.get('disabled', [])
+    if not isinstance(disabled, list) or any(not isinstance(item, str) for item in disabled):
+        raise model_manager.ConfigError('tools.disabled 必须是字符串数组')
+    disabled = list(disabled)
     owned = tools_owned
-    if want_off:
-        added = [t for t in _AGENT_TOOLS if t not in disabled]
+    if not subs:
+        added = [tool for tool in _AGENT_TOOLS if tool not in disabled]
         if added:
             disabled += added
             owned = True
     elif tools_owned:
-        disabled = [t for t in disabled if t not in _AGENT_TOOLS]
+        disabled = [tool for tool in disabled if tool not in _AGENT_TOOLS]
         owned = False
-    rest, tblock, tpos = _extract_sections(content, _is_tools_root)
-    if tblock:
-        tblock = _render_tools_disabled(tblock, disabled)
-        if not [ln for ln in tblock.splitlines()[1:] if ln.strip() and not ln.strip().startswith('#')]:
-            tblock = ''
-    elif disabled:
-        tblock = '[tools]\n' + _render_tools_disabled('\n', disabled).lstrip('\n')
-        tpos = len(rest)
-    content = _insert_block(rest, tpos, tblock)
-    return content, owned
+    if disabled:
+        tools['disabled'] = disabled
+        data['tools'] = tools
+    elif 'disabled' in tools:
+        del tools['disabled']
+        if not tools:
+            data.pop('tools', None)
+    return model_manager.dumps(data), owned
 
 
 def _diff_outside(old, new, keys=('default_model', 'secondary_model', 'tools')):
     """模式改写只允许动 keys；其余解析结果必须完全一致。"""
     a = {k: v for k, v in old.items() if k not in keys}
     b = {k: v for k, v in new.items() if k not in keys}
-    return a == b
+    return model_manager.semantic_equal(a, b)
 
 
 def _strict_toml(content):
     try:
-        import tomllib
-    except ImportError:
-        return None, '缺少 tomllib（需 Python 3.11+），拒绝改写'
-    try:
-        return tomllib.loads(content), None
-    except Exception as e:
-        return None, 'TOML 解析失败：%s' % e
+        return model_manager.parse(content), None
+    except model_manager.ConfigError as e:
+        return None, str(e)
 
 
 def detect_active_mode(modes, data):
     dm = data.get('default_model', '')
     sec = data.get('secondary_model') or {}
+    if isinstance(sec, str):
+        sec = {'default_model': sec}
     pool = list((sec.get('models') or {}).keys())
     disabled = set(((data.get('tools') or {}).get('disabled')) or [])
     agents_off = all(t in disabled for t in _AGENT_TOOLS)
@@ -1677,11 +1786,14 @@ def detect_active_mode(modes, data):
     return None
 
 
+@_config_locked
 def get_modes_data():
     content = get_config_content()
     data = _load_toml(content) or {}
     d = load_modes(data)
     sec = data.get('secondary_model') or {}
+    if isinstance(sec, str):
+        sec = {'default_model': sec}
     hints = d['pool_hints']
     changed = False
     for k, v in (sec.get('models') or {}).items():
@@ -1715,15 +1827,29 @@ def get_modes_data():
 
 
 def _snapshot_config(content):
-    data = _load_toml(content) or {}
-    _, sec_text, _ = _extract_sections(content, _is_secondary)
-    _, tools_text, _ = _extract_sections(content, _is_tools_root)
+    data = model_manager.parse(content)
+    secondary = {key: data[key] for key in ('secondary_model',) if key in data}
+    tools = {key: data[key] for key in ('tools',) if key in data}
     return {'default_model': data.get('default_model', ''),
-            'secondary_text': sec_text, 'tools_text': tools_text,
+            'secondary_text': model_manager.dumps(secondary),
+            'tools_text': model_manager.dumps(tools),
             'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 
 def apply_mode(index):
+    ok, result = _apply_mode_config(index)
+    if not ok:
+        return False, result
+    mode, old = result
+    n = len(mode['subagents'])
+    desc = '单干（已禁用 Agent/AgentSwarm）' if not n else '%d 个挂件' % n
+    live = _apply_session_live(mode, old)
+    extra = ('；%s' % live) if live else '，会话内 /reload 生效'
+    return True, '已切到「%s」：主 %s · %s%s' % (mode['name'], mode['main'], desc, extra)
+
+
+@_config_locked
+def _apply_mode_config(index):
     content = get_config_content()
     old, err = _strict_toml(content)
     if err:
@@ -1736,14 +1862,22 @@ def apply_mode(index):
         return False, '档位序号无效'
     mode = modes[index]
     hints = dict(d['pool_hints'])
-    for k, v in ((old.get('secondary_model') or {}).get('models') or {}).items():
+    secondary = old.get('secondary_model', {})
+    if isinstance(secondary, str):
+        secondary = {}
+    if not isinstance(secondary, dict) or not isinstance(secondary.get('models', {}), dict):
+        return False, 'secondary_model 及其 models 必须是表或模型别名'
+    for k, v in secondary.get('models', {}).items():
         if isinstance(v, str) and v:
             hints[k] = v
     for s in mode['subagents']:
         if not hints.get(s):
             mm = (old.get('models') or {}).get(s) or {}
             hints[s] = _effective(mm, 'display_name') or s
-    new_content, owned = apply_mode_to_text(content, mode, hints, bool(d.get('tools_owned')))
+    try:
+        new_content, owned = apply_mode_to_text(content, mode, hints, bool(d.get('tools_owned')))
+    except model_manager.ConfigError as error:
+        return False, str(error)
     new, err = _strict_toml(new_content)
     if err:
         return False, '生成的配置无法解析，已拒绝：%s' % err
@@ -1753,7 +1887,7 @@ def apply_mode(index):
         return False, '改写校验失败：default_model 未生效'
     if not d.get('previous_snapshot'):
         d['previous_snapshot'] = _snapshot_config(content)
-    ok, msg = safe_apply_config(new_content)
+    ok, msg = safe_apply_config(new_content, base_content=content)
     if not ok:
         return False, msg
     d['pool_hints'] = hints
@@ -1761,11 +1895,7 @@ def apply_mode(index):
     d['last_applied'] = {'index': index, 'name': mode['name'],
                          'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
     save_modes(d)
-    n = len(mode['subagents'])
-    desc = '单干（已禁用 Agent/AgentSwarm）' if not n else '%d 个挂件' % n
-    live = _apply_session_live(mode, old)
-    extra = ('；%s' % live) if live else '，会话内 /reload 生效'
-    return True, '已切到「%s」：主 %s · %s%s' % (mode['name'], mode['main'], desc, extra)
+    return True, (mode, old)
 
 
 # ---------------- 模式滑杆：活动会话即时同步 ----------------
@@ -1997,18 +2127,24 @@ def lock_mode(index):
     ok, msg = apply_mode(index)
     if not ok:
         return False, msg
-    d = load_modes()
-    d['locked'] = {'locked': True, 'index': index,
-                   'name': (d['modes'][index] or {}).get('name', ''),
-                   'main': (d['modes'][index] or {}).get('main', ''),
-                   'subagents': list((d['modes'][index] or {}).get('subagents') or []),
-                   'effort': (d['modes'][index] or {}).get('effort', ''),
-                   'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-    save_modes(d)
+    with CONFIG_LOCK:
+        data = _load_toml(get_config_content()) or {}
+        d = load_modes(data)
+        modes, err = validate_modes(d['modes'], data)
+        if err or not isinstance(index, int) or not 0 <= index < len(modes):
+            return False, err or '档位序号无效'
+        d['locked'] = {'locked': True, 'index': index,
+                       'name': modes[index]['name'],
+                       'main': modes[index]['main'],
+                       'subagents': list(modes[index]['subagents']),
+                       'effort': modes[index].get('effort', ''),
+                       'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        save_modes(d)
     _start_lock_guard()
     return True, '%s；已锁定' % msg
 
 
+@_config_locked
 def unlock_mode():
     """解锁：停守护 + 清 locked；不改当前模型。"""
     d = load_modes()
@@ -2020,6 +2156,7 @@ def unlock_mode():
     return True, '已解锁%s' % (('（原档：%s）' % name) if name else '')
 
 
+@_config_locked
 def restore_mode_snapshot():
     content = get_config_content()
     old, err = _strict_toml(content)
@@ -2029,19 +2166,26 @@ def restore_mode_snapshot():
     snap = d.get('previous_snapshot')
     if not snap:
         return False, '没有可恢复的快照（尚未用滑杆切换过）'
-    new_content = content
-    if snap.get('default_model'):
-        new_content = set_default_model_in_text(new_content, snap['default_model'])
-    rest, _, pos = _extract_sections(new_content, _is_secondary)
-    new_content = _insert_block(rest, pos, snap.get('secondary_text') or '')
-    rest, _, pos = _extract_sections(new_content, _is_tools_root)
-    new_content = _insert_block(rest, pos, snap.get('tools_text') or '')
-    new, err = _strict_toml(new_content)
-    if err:
-        return False, '快照还原后无法解析，已拒绝：%s' % err
+    try:
+        if not isinstance(snap, dict):
+            raise model_manager.ConfigError('模式恢复快照必须是对象')
+        new = model_manager.parse(content)
+        if snap.get('default_model'):
+            model_manager._set_default_model_data(new, snap['default_model'])
+        for key, field in (('secondary_model', 'secondary_text'), ('tools', 'tools_text')):
+            saved = model_manager.parse(snap.get(field) or '')
+            if set(saved) - {key}:
+                raise model_manager.ConfigError('模式恢复快照包含非预期配置')
+            if key in saved:
+                new[key] = saved[key]
+            else:
+                new.pop(key, None)
+        new_content = model_manager.dumps(new)
+    except model_manager.ConfigError as error:
+        return False, '快照还原后无法解析或完整序列化，已拒绝：%s' % error
     if not _diff_outside(old, new):
         return False, '还原波及了无关配置段，已拒绝（config 未改动）'
-    ok, msg = safe_apply_config(new_content)
+    ok, msg = safe_apply_config(new_content, base_content=content)
     if not ok:
         return False, msg
     d.pop('previous_snapshot', None)
@@ -2645,6 +2789,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         origin = getattr(self, '_torigin', '')
         self._cors(origin if origin and self._origin_ok(origin) else '')
+        if self.path.split('?')[0].startswith('/api/model-manager'):
+            self.send_header('Cache-Control', 'no-store')
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
@@ -2673,6 +2819,10 @@ class Handler(BaseHTTPRequestHandler):
         if not self._guard_read():
             return
         path = self.path.split('?')[0]
+        if path == '/api/model-manager':
+            if (self.headers.get(_CONTROL_HEADER) or '').strip() != '1':
+                return self._deny()
+            return self._json(get_model_manager_data())
         if path in ('/api/status', '/api/health'):
             self._json({'status': 'ok', 'name': 'kimi-code-usage', 'port': PORT,
                         'pid': os.getpid(), 'version': PLUGIN_VERSION,
@@ -2741,72 +2891,38 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             req = {}
         try:
+            if path == '/api/model-manager/catalog':
+                payload, status = get_model_manager_catalog(req)
+                return self._json(payload, status)
+
+            if path in ('/api/model-manager/provider', '/api/model-manager/model', '/api/model-manager/batch'):
+                payload, status = save_model_manager(path, req)
+                return self._json(payload, status)
+
             if path == '/api/set-default':
-                alias = req.get('alias', '')
-                if not alias:
-                    return self._json({'success': False, 'message': '缺少 alias'}, 400)
-                ok, msg = safe_apply_config(set_default_model_in_text(get_config_content(), alias))
+                ok, msg = _config_change(lambda base: set_default_model_in_text(base, req.get('alias')))
                 return self._json({'success': ok, 'message': msg}, 200 if ok else 400)
 
             if path == '/api/toggle-capability':
-                alias, cap = req.get('alias', ''), req.get('capability', '')
-                enabled = bool(req.get('enabled', True))
-                if not alias or not cap:
-                    return self._json({'success': False, 'message': '缺少参数'}, 400)
-                data = get_models_data()
-                target = next((m for m in data['models'] if m['alias'] == alias), None)
-                if not target:
-                    return self._json({'success': False, 'message': '模型 %s 不存在' % alias}, 400)
-                caps = list(target['capabilities'])
-                if enabled and cap not in caps:
-                    caps.append(cap)
-                elif not enabled and cap in caps:
-                    caps.remove(cap)
-                new_content, _ = update_model_in_text(get_config_content(), alias, {'capabilities': caps})
-                ok, msg = safe_apply_config(new_content)
+                ok, msg = _config_change(lambda base: toggle_capability_in_text(
+                    base, req.get('alias'), req.get('capability'), req.get('enabled', True)))
                 return self._json({'success': ok, 'message': msg}, 200 if ok else 400)
 
             if path == '/api/update-model':
-                alias, updates = req.get('alias', ''), req.get('updates', {})
-                if not alias or not updates:
-                    return self._json({'success': False, 'message': '缺少参数'}, 400)
-                new_content, err = update_model_effort_in_text(get_config_content(), alias, updates)
-                if err:
-                    return self._json({'success': False, 'message': err}, 400)
-                ok, msg = safe_apply_config(new_content)
+                alias, updates = req.get('alias'), req.get('updates')
+                ok, msg = _config_change(lambda base: model_manager.update_model(base, alias, updates))
                 note = _global_effort_note(alias, updates['default_effort']) if ok and updates.get('default_effort') else ''
                 return self._json({'success': ok, 'message': msg, 'note': note}, 200 if ok else 400)
 
             if path == '/api/add-model':
-                alias = str(req.get('alias') or '').strip()
-                provider = str(req.get('provider') or '').strip()
-                model_id = str(req.get('model') or '').strip()
-                if not alias or not provider or not model_id:
-                    return self._json({'success': False, 'message': 'alias/provider/model 必填'}, 400)
-                efforts = req.get('support_efforts')
-                effort_lines = ''
-                if efforts:
-                    if (not isinstance(efforts, list)
-                            or any(e not in EFFORT_LEVELS for e in efforts)):
-                        return self._json({'success': False,
-                                           'message': 'support_efforts 只能包含 %s' % '/'.join(EFFORT_LEVELS)}, 400)
-                    dflt = req.get('default_effort') or efforts[0]
-                    if dflt not in efforts:
-                        return self._json({'success': False,
-                                           'message': 'default_effort 不在 support_efforts 内'}, 400)
-                    effort_lines = ('support_efforts = [ %s ]\ndefault_effort = %s\n'
-                                    % (', '.join(_toml_string(e) for e in efforts), _toml_string(dflt)))
-                try:
-                    max_ctx = int(req.get('max_context_size', 250000))
-                except (TypeError, ValueError):
-                    return self._json({'success': False, 'message': 'max_context_size 必须是整数'}, 400)
-                block = ('\n[models.%s]\nprovider = %s\nmodel = %s\n'
-                         'max_context_size = %d\ncapabilities = [ "tool_use", "thinking", "image_in" ]\n'
-                         'display_name = %s\n%s'
-                         % (_toml_qkey(alias), _toml_string(provider), _toml_string(model_id),
-                            max_ctx,
-                            _toml_string(str(req.get('display_name') or '').strip() or alias), effort_lines))
-                ok, msg = safe_apply_config(get_config_content() + block)
+                item = {key: req[key] for key in ('alias', 'provider', 'model', 'display_name',
+                        'max_context_size', 'capabilities', 'support_efforts', 'default_effort') if key in req}
+                item.setdefault('display_name', item.get('alias', ''))
+                item.setdefault('max_context_size', 1000000)
+                item.setdefault('capabilities', ['image_in', 'thinking', 'tool_use'])
+                item.setdefault('support_efforts', list(model_manager.EFFORT_LEVELS))
+                item.setdefault('default_effort', 'high')
+                ok, msg = _config_change(lambda base: model_manager.upsert_model(base, None, item))
                 return self._json({'success': ok, 'message': msg}, 200 if ok else 400)
 
             if path == '/api/set-price':
@@ -2852,51 +2968,27 @@ class Handler(BaseHTTPRequestHandler):
                 if action == 'unignore_all':
                     save_dismissed(set())
                     return self._json({'success': True, 'message': '已恢复全部提示'})
-                data = get_models_data()
-                content = get_config_content()
-                done, errs = 0, []
-                for mdl in data['models']:
-                    for it in mdl['effort_issues']:
-                        if it.get('dismissed') or not it.get('code') or it['level'] == 'info':
-                            continue
-                        if action == 'fix':
-                            if mdl['alias'] != alias or it['code'] != code:
-                                continue
-                        elif action == 'fix_all':
-                            if it['code'] == 'no_support_efforts' or not it.get('fix'):
-                                continue
-                        else:
-                            return self._json({'success': False, 'message': '未知 action'}, 400)
-                        content, err = apply_issue_fix(content, mdl, it)
-                        if err:
-                            errs.append(err)
-                        else:
-                            done += 1
-                if errs and not done:
-                    return self._json({'success': False, 'message': '；'.join(sorted(set(errs)))}, 400)
-                if not done:
-                    return self._json({'success': True, 'message': '没有需要修复的项'})
-                ok, msg = safe_apply_config(content)
-                if ok and errs:
-                    msg += '（另有未处理：%s）' % '；'.join(sorted(set(errs)))
-                return self._json({'success': ok, 'message': msg if not ok else '已修复 %d 项，会话内 /reload 生效' % done}, 200 if ok else 400)
+                ok, msg = fix_issues(action, alias, code)
+                return self._json({'success': ok, 'message': msg}, 200 if ok else 400)
 
             if path == '/api/modes/save':
-                data = _load_toml(get_config_content()) or {}
-                modes, err = validate_modes(req.get('modes'), data)
-                if err:
-                    return self._json({'success': False, 'message': err}, 400)
-                d = load_modes(data)
-                d['modes'] = modes
-                save_modes(d)
+                with CONFIG_LOCK:
+                    data = _load_toml(get_config_content()) or {}
+                    modes, err = validate_modes(req.get('modes'), data)
+                    if err:
+                        return self._json({'success': False, 'message': err}, 400)
+                    d = load_modes(data)
+                    d['modes'] = modes
+                    save_modes(d)
                 return self._json({'success': True, 'message': '已保存 %d 个档位' % len(modes),
                                    'data': get_modes_data()})
 
             if path == '/api/modes/reset':
-                data = _load_toml(get_config_content()) or {}
-                d = load_modes(data)
-                d['modes'] = json.loads(json.dumps(DEFAULT_MODES))
-                save_modes(d)
+                with CONFIG_LOCK:
+                    data = _load_toml(get_config_content()) or {}
+                    d = load_modes(data)
+                    d['modes'] = json.loads(json.dumps(DEFAULT_MODES))
+                    save_modes(d)
                 return self._json({'success': True, 'message': '档位已恢复为内置预设',
                                    'data': get_modes_data()})
 
@@ -2933,7 +3025,7 @@ class Handler(BaseHTTPRequestHandler):
                                   200 if ok else 400)
 
             if path == '/api/auto-enable-all':
-                ok, msg = safe_apply_config(auto_enable_all_in_text(get_config_content()))
+                ok, msg = _config_change(auto_enable_all_in_text)
                 return self._json({'success': ok, 'message': msg}, 200 if ok else 400)
 
             if path == '/api/update/apply':
@@ -2949,8 +3041,10 @@ class Handler(BaseHTTPRequestHandler):
                 ok, msg = apply_update()
                 d = {'success': ok, 'message': msg, 'current': PLUGIN_VERSION, 'latest': chk.get('latest')}
                 return self._json(d, 200 if ok else 500)
-        except Exception as e:
-            return self._json({'success': False, 'message': '处理异常：%r' % e}, 500)
+        except model_manager.ConfigError as e:
+            return self._json({'success': False, 'message': str(e)}, 400)
+        except Exception:
+            return self._json({'success': False, 'message': '处理异常，操作未完成'}, 500)
 
         self.send_response(404)
         self.end_headers()

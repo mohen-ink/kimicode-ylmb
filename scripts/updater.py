@@ -55,6 +55,8 @@ LOCAL_ONLY_KEEP_PREFIX = ('docs/', 'assets/vendor/')
 PACKAGE_REQUIRED = frozenset((
     'kimi.plugin.json',
     'scripts/service.py',
+    'scripts/model_manager.py',
+    'scripts/model_catalog.py',
     'scripts/bootstrap.cmd',
     'scripts/scanner.py',
     'scripts/updater.py',

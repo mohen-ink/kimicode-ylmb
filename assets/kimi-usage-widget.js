@@ -1012,7 +1012,67 @@
       color: var(--color-text-faint, #94a3b8); font-size: 15px; cursor: pointer; line-height: 1;
     }
     .kmm-x:hover { background: color-mix(in srgb, var(--color-text, #fff) 8%, transparent); color: var(--color-text, #fff); }
-    .kmm-toolbar { padding: 0 22px 14px; display: flex; gap: 10px; align-items: center; }
+    .kmm-toolbar { padding: 0 22px 14px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    #kmm-modal [hidden] { display: none !important; }
+    #kmm-modal .kmm-tabs { padding: 0 22px 12px; display: flex; gap: 8px; }
+    #kmm-modal .kmm-tabs .on { border-color: var(--color-accent, #1a88ff); color: var(--color-accent, #1a88ff); }
+    #kmm-manager-status { padding: 0 22px 12px; font-size: 12px; color: var(--color-warning, #d29922); overflow-wrap: anywhere; }
+    #kmm-modal button:disabled { opacity: .45; cursor: not-allowed; }
+    #kmm-modal .kmm-editor { min-height: 0; }
+    #kmm-modal .kmm-editor h3 { margin: 0; font-size: 15px; }
+    #kmm-modal .kmm-editor-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    #kmm-modal .kmm-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; font-size: 12px; }
+    #kmm-modal .kmm-field input, #kmm-modal .kmm-field select {
+      width: 100%; min-width: 0; box-sizing: border-box; padding: 8px 10px; border-radius: 8px;
+      border: 1px solid color-mix(in srgb, var(--color-text, #fff) 14%, transparent);
+      background: var(--color-surface-sunken, #121212); color: var(--color-text, #e2e8f0); font: inherit;
+    }
+    #kmm-modal .kmm-field input:focus, #kmm-modal .kmm-field select:focus { outline: 1px solid var(--color-accent, #1a88ff); }
+    #kmm-modal .kmm-field input:disabled, #kmm-modal .kmm-field select:disabled { opacity: .6; }
+    #kmm-modal .kmm-editor-checks { display: flex; flex-wrap: wrap; gap: 8px 14px; font-size: 12px; }
+    #kmm-modal .kmm-editor-checks label { display: inline-flex; gap: 5px; align-items: center; overflow-wrap: anywhere; }
+    #kmm-modal .kmm-editor-actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+    #kmm-editor-note, #kmm-editor-error, #kmm-editor-status { font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+    #kmm-editor-note { color: var(--color-text-secondary, #94a3b8); }
+    #kmm-editor-error, #kmm-editor-status { color: var(--color-warning, #d29922); }
+    #kmm-modal .kmm-provider-name { overflow-wrap: anywhere; }
+    #kmm-batch { display: flex; flex-direction: column; min-height: 0; flex: 1; border-top: 1px solid color-mix(in srgb, var(--color-text, #fff) 7%, transparent); }
+    .kmm-batch-head { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; padding: 14px 22px 10px; }
+    .kmm-batch-head .kmm-field { flex: 1; min-width: 150px; }
+    .kmm-batch-head .kmm-search { flex-basis: 100%; }
+    .kmm-batch-filters { display: flex; flex-wrap: wrap; gap: 5px; padding: 0 22px 12px; }
+    .kmm-batch-filters .kmm-tbtn { padding: 5px 9px; font-size: 11.5px; font-weight: 500; border-color: transparent; }
+    .kmm-batch-filters .kmm-tbtn.on { color: var(--color-accent, #1a88ff); border-color: color-mix(in srgb, var(--color-accent, #1a88ff) 35%, transparent); background: color-mix(in srgb, var(--color-accent, #1a88ff) 10%, transparent); }
+    .kmm-batch-note { padding: 0 22px 10px; color: var(--color-text-secondary, #94a3b8); font-size: 11.5px; line-height: 1.6; overflow-wrap: anywhere; }
+    #kmm-batch-status { color: var(--color-warning, #d29922); }
+    .kmm-batch-list { overflow-y: auto; min-height: 100px; max-height: 44vh; padding: 0 22px 12px; display: flex; flex-direction: column; gap: 6px; }
+    .kmm-batch-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--color-text, #fff) 9%, transparent); border-radius: 10px; background: var(--color-surface-raised, #292929); }
+    .kmm-batch-row.pending { border-color: color-mix(in srgb, var(--color-accent, #1a88ff) 45%, transparent); }
+    .kmm-batch-row.removing { border-color: color-mix(in srgb, var(--color-warning, #d29922) 40%, transparent); }
+    .kmm-batch-info { flex: 1; min-width: 0; }
+    .kmm-batch-title { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; font-size: 12.5px; font-weight: 600; overflow-wrap: anywhere; }
+    .kmm-batch-meta, .kmm-batch-reason { margin-top: 4px; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; color: var(--color-text-secondary, #94a3b8); }
+    .kmm-batch-reason { color: var(--color-warning, #d29922); }
+    .kmm-batch-actions { display: flex; flex-shrink: 0; gap: 6px; }
+    .kmm-row-btn { width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; padding: 0; border-radius: 8px; border: 1px solid color-mix(in srgb, var(--color-text, #fff) 14%, transparent); background: transparent; color: var(--color-text, #e2e8f0); font: inherit; font-size: 19px; cursor: pointer; }
+    .kmm-row-btn:hover { color: var(--color-accent, #1a88ff); border-color: var(--color-accent, #1a88ff); }
+    .kmm-row-btn.selected { background: color-mix(in srgb, var(--color-accent, #1a88ff) 10%, transparent); }
+    .kmm-row-btn svg { width: 14px; height: 14px; }
+    .kmm-batch-footer { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding: 12px 22px; border-top: 1px solid color-mix(in srgb, var(--color-text, #fff) 7%, transparent); }
+    #kmm-batch-count { flex: 1; font-size: 12px; min-width: 180px; color: var(--color-text-secondary, #94a3b8); }
+    .kmm-context-presets { display: flex; gap: 6px; flex-wrap: wrap; }
+    .kmm-context-presets .kmm-tbtn { padding: 4px 8px; font-size: 11px; }
+    @media (max-width: 540px) {
+      #kmm-modal .kmm-search { flex-basis: 100%; }
+      #kmm-modal .kmm-editor-grid { grid-template-columns: 1fr; }
+      #kmm-modal .kmm-top { align-items: flex-start; flex-wrap: wrap; }
+      #kmm-modal .kmm-acts { flex-wrap: wrap; }
+      #kmm-modal .kmm-foot { flex-wrap: wrap; }
+      .kmm-batch-head, .kmm-batch-footer { padding-left: 14px; padding-right: 14px; }
+      .kmm-batch-list, .kmm-batch-note, .kmm-batch-filters { padding-left: 14px; padding-right: 14px; }
+      .kmm-batch-row { padding: 9px; gap: 7px; }
+      .kmm-batch-head .kmm-field { min-width: 100%; }
+    }
     .kmm-search {
       flex: 1; min-width: 0; box-sizing: border-box;
       background: var(--color-surface-sunken, #121212);
@@ -1068,6 +1128,7 @@
     }
     .kmm-link:hover { background: color-mix(in srgb, var(--color-text, #fff) 7%, transparent); color: var(--color-text, #e2e8f0); }
     .kmm-link.accent { color: var(--color-accent, #1a88ff); }
+    .kmm-link.danger { color: var(--color-danger, #f85149); }
     .kmm-meta { margin-top: 3px; font-size: 11.5px; color: var(--color-text-faint, #94a3b8); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .kmm-ctl { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-top: 11px; }
     .kmm-chips { display: flex; gap: 6px; }
@@ -2602,19 +2663,27 @@
       <div id="kmm-modal">
         <div class="kmm-modal-header">
           <div class="kmm-modal-title">
-            <h2>模型与能力</h2>
+            <h2>模型与供应商</h2>
             <span class="kmm-def-badge" id="kmm-modal-default-badge">默认：加载中</span>
           </div>
           <button class="kmm-x" id="kmm-modal-close-btn" title="关闭">✕</button>
         </div>
-        <div class="kmm-toolbar">
-          <input class="kmm-search" id="kmm-modal-filter" placeholder="搜索模型、渠道…">
-          <button class="kmm-tbtn" id="kmm-modal-refresh" title="重新读取 config.toml">刷新</button>
-          <button class="kmm-tbtn primary" id="kmm-modal-auto-all" title="为所有模型补全识图 / 思考 / 工具调用能力标签">一键补全能力</button>
+        <div class="kmm-tabs" role="tablist" aria-label="配置类型">
+          <button class="kmm-tbtn on" id="kmm-tab-models" role="tab" aria-selected="true">模型</button>
+          <button class="kmm-tbtn" id="kmm-tab-providers" role="tab" aria-selected="false">供应商</button>
         </div>
+        <div class="kmm-toolbar" id="kmm-list-toolbar">
+          <input class="kmm-search" id="kmm-modal-filter" placeholder="搜索模型、渠道…">
+          <button class="kmm-tbtn" id="kmm-modal-refresh" title="重新读取 config.toml，不丢弃编辑草稿">刷新</button>
+          <button class="kmm-tbtn primary" id="kmm-manager-add">新增模型</button>
+          <button class="kmm-tbtn" id="kmm-modal-auto-all" title="为所有模型补全识图 / 思考 / 工具调用能力标签">一键补全能力</button>
+        </div>
+        <div id="kmm-manager-status" role="status" aria-live="polite"></div>
         <div class="kmm-modal-body" id="kmm-modal-cards"></div>
+        <div class="kmm-modal-body" id="kmm-provider-cards" hidden></div>
+        <form class="kmm-modal-body kmm-editor" id="kmm-editor" hidden autocomplete="off"></form>
         <div class="kmm-foot">
-          <span>修改会自动备份并校验，在会话中输入 /reload 立即生效</span>
+          <span>全量写入配置（不保留注释），不生成备份；会话中 /reload 加载</span>
           <span>端口 39281</span>
         </div>
       </div>
@@ -2625,21 +2694,801 @@
     var $o = function(id) { return overlay.querySelector('#' + id); };
     $o('kmm-modal-close-btn').onclick = closeModelModal;
     overlay.onclick = function(e) { if (e.target === overlay) closeModelModal(); };
-    $o('kmm-modal-refresh').onclick = fetchModels;
-    $o('kmm-modal-filter').oninput = kmmRenderModalCards;
+    $o('kmm-modal-refresh').onclick = kmmRefreshAll;
+    $o('kmm-modal-filter').oninput = function() { kmmRenderModalCards(); kmmRenderProviders(); };
+    $o('kmm-tab-models').onclick = function() { kmmSwitchTab('models'); };
+    $o('kmm-tab-providers').onclick = function() { kmmSwitchTab('providers'); };
+    $o('kmm-manager-add').onclick = function() {
+      if (kmmManagerTab === 'providers') kmmOpenEditor('provider', null);
+      else kmmOpenBatch();
+    };
+    overlay.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeModelModal(); }
+    });
     $o('kmm-modal-auto-all').onclick = async function() {
+      if (kmmDraft || kmmBatch || !apiAlive) return;
       if (!confirm('确定要为全部模型补全【识图 + 深度思考 + 工具调用】能力标签吗？（不会改动思考强度档位）')) return;
       try {
         const res = await kapiFetch(`${API_BASE}/api/auto-enable-all`, { method: 'POST' });
         const data = await res.json();
         if (data.success) {
-          kmmToast('🎉 全部模型能力已全开并校验通过！');
-          fetchModels();
+          kmmToast('全部模型能力标签已补全并保存！');
+          kmmRefreshAll();
         } else kmmToast(data.message, true);
       } catch (e) { kmmToast('执行失败: 后台服务未响应', true); }
     };
     return overlay;
   }
+
+  var kmmManagerData = null;
+  var kmmManagerOnline = false;
+  var kmmManagerMessage = '正在读取模型管理配置…';
+  var kmmManagerTab = 'models';
+  var kmmManagerRequest = null;
+  var kmmDraft = null;
+  var kmmBatch = null;
+  var kmmEditorReloading = false;
+  var kmmDeleting = null;
+  var kmmDefaultEfforts = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+  function kmmEl(id) { return kmmOverlayEl && kmmOverlayEl.querySelector('#' + id); }
+  function kmmStrings(values) {
+    return Array.isArray(values) ? values.filter(function(v, i) { return typeof v === 'string' && values.indexOf(v) === i; }) : [];
+  }
+  function kmmOrderedEfforts(values) {
+    return kmmStrings(values).sort(function(a, b) {
+      var ai = kmmDefaultEfforts.indexOf(a), bi = kmmDefaultEfforts.indexOf(b);
+      return (ai < 0 ? kmmDefaultEfforts.length : ai) - (bi < 0 ? kmmDefaultEfforts.length : bi);
+    });
+  }
+  function kmmNormalizeAlias(alias, provider, previousProvider) {
+    var value = String(alias || '').trim(), prefix = String(provider || '').trim() + '/';
+    if (!value || !provider) return value;
+    if (previousProvider && previousProvider !== provider && value.indexOf(previousProvider + '/') === 0) {
+      value = value.slice(previousProvider.length + 1);
+    }
+    return value.indexOf(prefix) === 0 ? value : prefix + value;
+  }
+  function kmmManagerWritable() { return !!(kmmManagerOnline && kmmManagerData && kmmManagerData.editable); }
+  function kmmSafeMessage(message) {
+    var text = typeof message === 'string' ? message : '';
+    var key = kmmDraft && kmmDraft.kind === 'provider' && kmmDraft.value.api_key;
+    return key ? text.split(key).join('[密钥已隐藏]') : text;
+  }
+  function kmmFetchManager() {
+    if (kmmManagerRequest) return kmmManagerRequest;
+    kmmManagerRequest = kapiFetch(API_BASE + '/api/model-manager', { cache: 'no-store' })
+      .then(function(r) { if (!r.ok) throw new Error('unavailable'); return r.json(); })
+      .then(function(d) {
+        if (!d || typeof d.version !== 'string' || typeof d.editable !== 'boolean' || !Array.isArray(d.providers)
+            || !Array.isArray(d.models) || !Array.isArray(d.provider_types) || !Array.isArray(d.effort_levels)) throw new Error('invalid');
+        kmmManagerData = {
+          version: d.version, editable: d.editable, message: kmmSafeMessage(d.message), default_model: String(d.default_model || ''),
+          providers: d.providers.map(function(p) {
+            return { name: String(p.name || ''), type: String(p.type || ''), base_url: String(p.base_url || ''), has_api_key: !!p.has_api_key, managed: !!p.managed };
+          }),
+          models: d.models.map(function(m) {
+            return { alias: String(m.alias || ''), provider: String(m.provider || ''), model: String(m.model || ''), display_name: String(m.display_name || ''),
+              max_context_size: m.max_context_size, capabilities: kmmStrings(m.capabilities), support_efforts: kmmStrings(m.support_efforts),
+              default_effort: typeof m.default_effort === 'string' ? m.default_effort : null, managed: !!m.managed,
+              delete_protected: !!m.delete_protected, delete_reason: typeof m.delete_reason === 'string' ? m.delete_reason : '' };
+          }),
+          provider_types: kmmStrings(d.provider_types), effort_levels: kmmStrings(d.effort_levels)
+        };
+        kmmManagerOnline = true;
+        kmmManagerMessage = d.editable ? kmmManagerData.message : (kmmManagerData.message || '配置解析器不可用，当前只读，不能保存。');
+        return kmmManagerData;
+      }).catch(function() {
+        kmmManagerOnline = false;
+        kmmManagerMessage = '模型管理服务离线或接口不可用，当前只读，不能保存。请启动或更新后台服务后刷新。';
+        return null;
+      }).then(function(d) {
+        kmmManagerRequest = null;
+        if (kmmBatch && !kmmDraft) kmmRenderBatchRows();
+        kmmRenderManagerUI();
+        if (!kmmDraft && !kmmBatch) { kmmRenderModalCards(); kmmRenderProviders(); }
+        return d;
+      });
+    return kmmManagerRequest;
+  }
+  function kmmRefreshAll() {
+    var manager = Promise.resolve(kmmManagerRequest).then(function() { return kmmFetchManager(); });
+    var modes = kmdFetch(true).then(function() {
+      if (!kmdData || !kmdOverlayEl || !kmdOverlayEl.classList.contains('visible')) return;
+      kmdOverlayEl.querySelectorAll('select[data-f="main"], select[data-f="sub"]').forEach(function(select) {
+        select.innerHTML = kmdOptions(select.value, select.getAttribute('data-f') === 'sub');
+      });
+    });
+    return Promise.all([fetchModels(), manager, modes]);
+  }
+  function kmmRenderManagerUI() {
+    if (!kmmOverlayEl) return;
+    var editing = !!kmmDraft, batching = !!kmmBatch;
+    var busy = !!kmmDeleting || !!(kmmDraft && kmmDraft.saving) || !!(kmmBatch && (kmmBatch.saving || kmmBatch.reloading)) || kmmEditorReloading;
+    kmmEl('kmm-list-toolbar').hidden = editing || batching;
+    kmmEl('kmm-modal-cards').hidden = editing || batching || kmmManagerTab !== 'models';
+    kmmEl('kmm-provider-cards').hidden = editing || batching || kmmManagerTab !== 'providers';
+    kmmEl('kmm-editor').hidden = !editing;
+    if (batching) kmmRenderBatch();
+    if (kmmEl('kmm-batch')) kmmEl('kmm-batch').hidden = !batching || editing;
+    kmmEl('kmm-modal-close-btn').disabled = busy;
+    kmmEl('kmm-modal-refresh').disabled = busy;
+    ['models', 'providers'].forEach(function(tab) {
+      var btn = kmmEl('kmm-tab-' + tab);
+      btn.classList.toggle('on', kmmManagerTab === tab);
+      btn.setAttribute('aria-selected', String(kmmManagerTab === tab));
+      btn.disabled = busy;
+    });
+    var add = kmmEl('kmm-manager-add');
+    add.textContent = kmmManagerTab === 'providers' ? '新增供应商' : '新增模型';
+    add.disabled = busy || !kmmManagerWritable();
+    kmmEl('kmm-modal-auto-all').hidden = kmmManagerTab !== 'models';
+    kmmEl('kmm-modal-auto-all').disabled = busy || !apiAlive || !kmmManagerWritable();
+    kmmEl('kmm-modal-filter').placeholder = kmmManagerTab === 'providers' ? '搜索供应商、类型…' : '搜索模型、渠道…';
+    var status = kmmEl('kmm-manager-status');
+    status.textContent = kmmDeleting ? '正在删除模型，请勿重复提交、编辑或关闭。' : kmmManagerMessage;
+    status.hidden = !status.textContent;
+    var badge = kmmEl('kmm-modal-default-badge');
+    if (badge && kmmManagerData) {
+      var def = kmmManagerData.default_model;
+      var model = kmmManagerData.models.find(function(m) { return m.alias === def; });
+      badge.textContent = '默认：' + ((model && model.display_name) || def || '--');
+    }
+    if (editing) kmmUpdateEditorState();
+  }
+  function kmmDraftChanged() { return !!(kmmDraft && JSON.stringify(kmmDraft.value) !== kmmDraft.initial); }
+  function kmmClearEditor() {
+    if (kmmDraft && kmmDraft.kind === 'provider') kmmDraft.value.api_key = '';
+    var editor = kmmEl('kmm-editor');
+    if (editor) {
+      var key = editor.querySelector('#kmm-provider-api-key');
+      if (key) key.value = '';
+      editor.innerHTML = '';
+    }
+    kmmDraft = null;
+  }
+  function kmmDiscardEditor() {
+    if (!kmmDraft) return true;
+    if (kmmDraft.saving || kmmEditorReloading) return false;
+    if (kmmDraftChanged() && !confirm('有未保存的详情修改，确定丢弃详情草稿吗？取消不会写入配置。')) return false;
+    kmmClearEditor();
+    return true;
+  }
+  function kmmDiscardAll() {
+    if (kmmDeleting || (kmmDraft && kmmDraft.saving) || (kmmBatch && (kmmBatch.saving || kmmBatch.reloading)) || kmmEditorReloading) return false;
+    if ((kmmDraftChanged() || kmmBatchChanged()) && !confirm('有未保存的修改，确定丢弃全部草稿吗？取消或关闭不会写入配置。')) return false;
+    kmmClearEditor(); kmmClearBatch();
+    return true;
+  }
+  function kmmSwitchTab(tab) {
+    if (!kmmDiscardAll()) return;
+    kmmManagerTab = tab;
+    kmmRenderManagerUI(); kmmRenderModalCards(); kmmRenderProviders();
+  }
+  function kmmModelValue(item, provider, id, displayName) {
+    return { alias: item ? item.alias : kmmNormalizeAlias(id, provider), provider: item ? item.provider : provider, model: item ? item.model : id || '',
+      display_name: item ? item.display_name : kmmNormalizeAlias(displayName || id, provider), max_context_size: String(item ? item.max_context_size : 1000000),
+      capabilities: item ? item.capabilities.slice() : ['image_in', 'thinking', 'tool_use'],
+      support_efforts: item ? kmmOrderedEfforts(item.support_efforts) : kmmDefaultEfforts.slice(), default_effort: item ? item.default_effort : 'high' };
+  }
+  function kmmModelPayload(value, original) {
+    return { alias: original === null ? kmmNormalizeAlias(value.alias, value.provider) : original, provider: value.provider, model: value.model,
+      display_name: value.display_name.trim(), max_context_size: Number(value.max_context_size), capabilities: value.capabilities.slice(),
+      support_efforts: kmmOrderedEfforts(value.support_efforts), default_effort: value.default_effort };
+  }
+  function kmmModelError(value) {
+    if (!value.alias.trim() || !value.provider || !value.model.trim()) return '请输入模型 alias、供应商和上游模型 ID。';
+    if (!Number.isSafeInteger(Number(value.max_context_size)) || Number(value.max_context_size) <= 0) return '上下文必须是大于 0 的整数。';
+    if (value.default_effort !== null && value.support_efforts.indexOf(value.default_effort) < 0) return '默认思考强度必须在所选档位列表中。';
+    return '';
+  }
+  function kmmBatchOperations(b) {
+    var upserts = [], added = 0, changed = 0;
+    b.rows.forEach(function(row) {
+      if (!row.original && !row.selected) return;
+      var model = kmmModelPayload(row.value, row.original ? row.original.alias : null);
+      if (!row.original || JSON.stringify(model) !== JSON.stringify(kmmModelPayload(row.original, row.original.alias))) {
+        upserts.push({ original_alias: row.original ? row.original.alias : null, model: model });
+        if (row.original) changed++; else added++;
+      }
+    });
+    return { upserts: upserts, removes: [], added: added, changed: changed };
+  }
+  function kmmBatchChanged() {
+    return !!(kmmBatch && kmmBatch.rows.some(function(row) { return row.selected !== !!row.original || JSON.stringify(row.value) !== row.initial; }));
+  }
+  function kmmClearBatch() {
+    kmmBatch = null;
+    var el = kmmEl('kmm-batch');
+    if (el) { el.innerHTML = ''; el._kmmBatch = null; el.hidden = true; }
+  }
+  var kmmBatchCategories = ['全部', 'GPT', 'Claude', 'Gemini', 'Qwen', 'GLM', 'Deepseek', 'Kimi', '其他'];
+  function kmmBatchCategoryMatches(model, category) {
+    if (category === '全部') return true;
+    var id = model.toLowerCase();
+    if (category === '其他') return !kmmBatchCategories.slice(1, -1).some(function(name) { return id.indexOf(name.toLowerCase()) >= 0; });
+    return id.indexOf(category.toLowerCase()) >= 0;
+  }
+  function kmmCreateBatch(provider) {
+    var data = kmmManagerData;
+    kmmBatch = { version: data.version, provider: provider, providers: data.providers.map(function(p) { return p.name; }),
+      aliases: data.models.map(function(m) { return m.alias; }), rows: [], query: '', category: '全部', loading: false, saving: false, reloading: false,
+      conflict: false, error: '', message: '尚未探测；下方保留本地已有模型。点击「探测模型列表」才请求供应商。', catalogLoaded: false };
+    data.models.filter(function(m) { return m.provider === provider; }).forEach(function(m) {
+      var value = kmmModelValue(m);
+      kmmBatch.rows.push({ original: m, value: value, initial: JSON.stringify(value), selected: true, catalog: false });
+    });
+  }
+  function kmmOpenBatch() {
+    if (!kmmManagerWritable() || !kmmDiscardAll()) return;
+    if (!kmmManagerData.providers.length) {
+      kmmManagerTab = 'providers'; kmmRenderManagerUI(); kmmRenderProviders();
+      kmmToast('请先新增供应商，再新增模型'); return;
+    }
+    kmmCreateBatch(kmmManagerData.providers[0].name);
+    kmmManagerTab = 'models'; kmmRenderManagerUI(); kmmRenderBatchRows();
+  }
+  function kmmUniqueAlias(b, id) {
+    var taken = b.aliases.concat(b.rows.map(function(row) {
+      return row.original ? row.original.alias : kmmNormalizeAlias(row.value.alias, b.provider);
+    }));
+    var root = kmmNormalizeAlias(id, b.provider), alias = root, n = 2;
+    while (taken.indexOf(alias) >= 0) alias = root + '-' + n++;
+    return alias;
+  }
+  function kmmModelDeleteReason(m) {
+    if (!m) return '模型管理配置中没有此模型，请刷新后重试。';
+    var current = kmmManagerData && kmmManagerData.models.find(function(x) { return x.alias === m.alias; });
+    if (m.managed || (current && current.managed)) return '官方托管模型由系统自动管理，不能删除。';
+    if ((kmmManagerData && kmmManagerData.default_model === m.alias)) return '当前默认模型不能删除，请先更换默认模型。';
+    if ((current && current.delete_protected) || m.delete_protected) return (current && current.delete_reason) || m.delete_reason || '该模型被配置引用，请先解除引用。';
+    return '';
+  }
+  async function kmmDeleteModel(alias) {
+    if (kmmDeleting || kmmDraft || kmmBatch || kmmEditorReloading || !kmmManagerWritable()) return;
+    var operation = { alias: alias };
+    kmmDeleting = operation;
+    kmmRenderManagerUI(); kmmRenderModalCards();
+    try {
+      await Promise.resolve(kmmManagerRequest);
+      var snapshot = await kmmFetchManager();
+      if (kmmDeleting !== operation || kmmDraft || kmmBatch || !isModelModalOpen) return;
+      if (!snapshot || !snapshot.editable) { kmmToast(kmmManagerMessage || '当前只读，不能删除。', true); return; }
+      var model = snapshot.models.find(function(m) { return m.alias === alias; });
+      var reason = kmmModelDeleteReason(model);
+      if (reason) { kmmToast(reason, true); return; }
+      if (!confirm('确定直接删除模型 ' + alias + ' 及其本地覆盖配置吗？\n\n确认后立即原子保存，不会提交其它草稿。')) return;
+      var response = await kapiFetch(API_BASE + '/api/model-manager/batch', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ version: snapshot.version, provider: model.provider, upserts: [], removes: [alias] }) });
+      var data = await response.json();
+      if (response.status === 409 || data.code === 'CONFIG_CONFLICT') {
+        kmmToast(kmmSafeMessage(data.message) || '配置已变化，删除未执行；请刷新后重新确认，不会强制覆盖。', true);
+        await kmmFetchManager();
+      } else if (response.ok && data.success === true && typeof data.version === 'string') {
+        kmmToast('模型已删除并原子保存，会话中 /reload 生效');
+        await kmmRefreshAll();
+      } else {
+        kmmToast(kmmSafeMessage(data.message) || '删除失败，配置未保存。', true);
+        if (response.status === 503) { kmmManagerOnline = false; kmmManagerMessage = '配置写入不可用，请刷新后重试。'; }
+      }
+    } catch (e) {
+      kmmToast('删除失败：后台服务未响应或返回异常，请刷新确认配置状态后重试。', true);
+      kmmManagerOnline = false; kmmManagerMessage = '后台服务不可用，不能保存；请刷新后重试。';
+    } finally {
+      if (kmmDeleting === operation) kmmDeleting = null;
+      kmmRenderManagerUI(); kmmRenderModalCards(); kmmRenderProviders();
+    }
+  }
+  function kmmRenderBatch() {
+    var b = kmmBatch;
+    if (!b) return;
+    var el = kmmEl('kmm-batch');
+    if (!el) {
+      el = document.createElement('section'); el.id = 'kmm-batch';
+      kmmEl('kmm-editor').before(el);
+    }
+    if (el._kmmBatch !== b) {
+      el._kmmBatch = b;
+      el.innerHTML = '<div class="kmm-batch-head"><label class="kmm-field">供应商<select id="kmm-batch-provider">'
+        + kmmEditorOptions(b.providers, b.provider) + '</select></label><button type="button" class="kmm-tbtn primary" id="kmm-batch-probe">探测模型列表</button>'
+        + '<button type="button" class="kmm-tbtn" id="kmm-batch-manual">手动添加</button>'
+        + '<input class="kmm-search" id="kmm-batch-search" placeholder="搜索显示名、模型 ID、本地别名…" aria-label="搜索供应商模型"></div>'
+        + '<div class="kmm-batch-filters" role="group" aria-label="模型分类">' + kmmBatchCategories.map(function(category) {
+          return '<button type="button" class="kmm-tbtn' + (b.category === category ? ' on' : '') + '" data-kmm-category="' + esc(category)
+            + '" aria-pressed="' + String(b.category === category) + '">' + esc(category) + '</button>';
+        }).join('') + '</div>'
+        + '<div class="kmm-batch-note">+ / − 选择或取消新增，已添加模型请返回首页删除；详情只修改草稿，能力与档位不验证上游支持。</div>'
+        + '<div class="kmm-batch-note" id="kmm-batch-status" role="status" aria-live="polite"></div>'
+        + '<div class="kmm-batch-list" id="kmm-batch-list"></div><div class="kmm-batch-footer"><span id="kmm-batch-count"></span>'
+        + '<button type="button" class="kmm-tbtn" id="kmm-batch-reload">重新载入</button><button type="button" class="kmm-tbtn" id="kmm-batch-cancel">取消</button>'
+        + '<button type="button" class="kmm-tbtn primary" id="kmm-batch-save">保存更改</button></div>';
+      el.querySelectorAll('[data-kmm-category]').forEach(function(button) {
+        button.onclick = function() {
+          if (kmmBatch !== b || b.saving || b.reloading) return;
+          b.category = button.getAttribute('data-kmm-category');
+          el.querySelectorAll('[data-kmm-category]').forEach(function(choice) {
+            var active = choice.getAttribute('data-kmm-category') === b.category;
+            choice.classList.toggle('on', active); choice.setAttribute('aria-pressed', String(active));
+          });
+          kmmEl('kmm-batch-list').scrollTop = 0;
+          kmmRenderBatchRows(); kmmRenderBatch();
+        };
+      });
+      kmmEl('kmm-batch-provider').onchange = function() {
+        if (kmmBatch !== b || b.saving || b.reloading) return;
+        var provider = this.value;
+        if (kmmBatchChanged() && !confirm('切换供应商会丢弃当前批量草稿，确定继续吗？')) { this.value = b.provider; return; }
+        if (!kmmManagerData.providers.some(function(p) { return p.name === provider; })) {
+          this.value = b.provider; b.error = '供应商配置已变化，请重新载入。'; kmmRenderBatch(); return;
+        }
+        kmmCreateBatch(provider); kmmRenderManagerUI(); kmmRenderBatchRows();
+      };
+      kmmEl('kmm-batch-search').oninput = function() { if (kmmBatch === b) { b.query = this.value; kmmRenderBatchRows(); } };
+      kmmEl('kmm-batch-probe').onclick = kmmProbeCatalog;
+      kmmEl('kmm-batch-manual').onclick = function() { kmmOpenBatchDetail(null); };
+      kmmEl('kmm-batch-save').onclick = kmmSaveBatch;
+      kmmEl('kmm-batch-reload').onclick = kmmReloadBatch;
+      kmmEl('kmm-batch-cancel').onclick = function() {
+        if (!kmmDiscardAll()) return;
+        kmmRenderManagerUI(); kmmRenderModalCards(); kmmRenderProviders();
+      };
+      kmmRenderBatchRows();
+    }
+    var operations = kmmBatchOperations(b), busy = b.saving || b.reloading;
+    kmmEl('kmm-batch-count').textContent = '新增 ' + operations.added + ' / 修改 ' + operations.changed;
+    kmmEl('kmm-batch-status').textContent = b.error || (busy ? (b.saving ? '正在批量保存，请勿重复提交或关闭。' : '正在重新读取配置…')
+      : b.conflict ? '配置冲突，草稿已保留。请重新载入后再编辑；不会强制覆盖。'
+      : !kmmManagerWritable() ? kmmManagerMessage
+      : kmmManagerData.version !== b.version ? '配置已变化，草稿保留原版本；保存可能产生冲突。'
+      : b.loading ? '正在探测供应商模型列表…' : b.message);
+    kmmEl('kmm-batch-provider').disabled = busy;
+    kmmEl('kmm-batch-search').disabled = busy;
+    kmmEl('kmm-batch-probe').disabled = busy || b.loading || b.conflict || !kmmManagerWritable();
+    kmmEl('kmm-batch-probe').textContent = b.loading ? '探测中…' : '探测模型列表';
+    kmmEl('kmm-batch-manual').disabled = busy || b.loading || b.conflict || !kmmManagerWritable();
+    kmmEl('kmm-batch-save').disabled = busy || b.loading || b.conflict || !kmmManagerWritable() || (!operations.upserts.length && !operations.removes.length);
+    kmmEl('kmm-batch-save').textContent = b.saving ? '保存中…' : '保存更改';
+    kmmEl('kmm-batch-reload').disabled = busy;
+    kmmEl('kmm-batch-cancel').disabled = busy;
+    kmmEl('kmm-batch').querySelectorAll('[data-kmm-category]').forEach(function(btn) { btn.disabled = busy; });
+    kmmEl('kmm-batch-list').querySelectorAll('button').forEach(function(btn) {
+      btn.disabled = busy || b.loading || b.conflict || !kmmManagerWritable() || btn.hasAttribute('data-kmm-protected');
+    });
+  }
+  function kmmRenderBatchRows() {
+    var b = kmmBatch, list = kmmEl('kmm-batch-list');
+    if (!b || !list || kmmEl('kmm-batch')._kmmBatch !== b) return;
+    var scrollTop = list.scrollTop, kw = b.query.trim().toLowerCase();
+    list.innerHTML = '';
+    var rows = b.rows.filter(function(row) { return !row.original; }).concat(b.rows.filter(function(row) { return !!row.original; }));
+    rows.forEach(function(row) {
+      var v = row.value;
+      if (!kmmBatchCategoryMatches(v.model, b.category)) return;
+      if (kw && (v.alias + ' ' + v.model + ' ' + v.display_name).toLowerCase().indexOf(kw) < 0) return;
+      var edited = JSON.stringify(v) !== row.initial;
+      var included = !!row.original || row.selected;
+      var div = document.createElement('div');
+      div.className = 'kmm-batch-row' + (((!row.original && row.selected) || edited) ? ' pending' : '');
+      var tag = !row.original ? (row.selected ? '待新增' : '未添加') : edited ? '待修改' : '已添加';
+      div.innerHTML = '<div class="kmm-batch-info"><div class="kmm-batch-title"><span>' + esc(v.display_name || v.model || v.alias) + '</span>'
+        + '<span class="kmm-tag ' + (included ? 'on' : 'ad') + '">' + tag + '</span></div>'
+        + '<div class="kmm-batch-meta">ID：' + esc(v.model) + '<br>别名：' + esc(v.alias) + '</div>'
+        + (row.original && b.catalogLoaded && !row.catalog ? '<div class="kmm-batch-meta">仅本地配置 · 上游本次未返回</div>' : '')
+        + (!row.original && !row.selected && edited ? '<div class="kmm-batch-meta">详情已暂存；点击 + 才会添加</div>' : '') + '</div>'
+        + '<div class="kmm-batch-actions"><button type="button" class="kmm-row-btn' + (included ? ' selected' : '') + '" data-kmm-toggle'
+        + (row.original ? ' data-kmm-protected' : '') + ' aria-label="' + esc((row.original ? '已添加 ' : row.selected ? '取消新增 ' : '添加 ') + v.alias) + '">'
+        + (included ? '−' : '+') + '</button><button type="button" class="kmm-row-btn" data-kmm-detail aria-label="' + esc('编辑 ' + v.alias) + '">'
+        + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l4 4M4 20l4-1L20 7a2.8 2.8 0 0 0-4-4L4 15z"/></svg></button></div>';
+      var toggle = div.querySelector('[data-kmm-toggle]');
+      var disabled = b.saving || b.loading || b.reloading || b.conflict || !kmmManagerWritable();
+      toggle.disabled = disabled || !!row.original;
+      toggle.title = row.original ? '已添加；删除请返回齿轮首页的模型卡片' : row.selected ? '取消新增选择' : '选择新增';
+      toggle.onclick = function() {
+        if (row.original || kmmBatch !== b || b.saving || b.loading || b.reloading || b.conflict || !kmmManagerWritable()) return;
+        row.selected = !row.selected; b.error = ''; kmmRenderBatchRows(); kmmRenderBatch();
+      };
+      var detail = div.querySelector('[data-kmm-detail]');
+      detail.disabled = disabled;
+      detail.title = '编辑详情（只暂存，不单独保存）';
+      detail.onclick = function() { kmmOpenBatchDetail(row); };
+      list.appendChild(div);
+    });
+    if (!list.children.length) {
+      var empty = document.createElement('div'); empty.className = 'kmm-note';
+      empty.textContent = kw || b.category !== '全部' ? '没有匹配的模型' : b.catalogLoaded ? '上游未返回模型，可以手动添加。' : '此供应商尚无本地模型，请手动探测或添加。';
+      list.appendChild(empty);
+    }
+    list.scrollTop = scrollTop;
+  }
+  function kmmProbeCatalog() {
+    var b = kmmBatch;
+    if (!b || b.loading || b.saving || b.reloading || b.conflict || !kmmManagerWritable()) return;
+    b.loading = true; b.error = ''; kmmRenderManagerUI();
+    kapiFetch(API_BASE + '/api/model-manager/catalog', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: b.version, provider: b.provider }) })
+      .then(function(r) { return r.json().then(function(data) { return { status: r.status, ok: r.ok, data: data }; }); })
+      .then(function(result) {
+        if (kmmBatch !== b || !isModelModalOpen) return;
+        var data = result.data || {};
+        if (result.status === 409 || data.code === 'CONFIG_CONFLICT') { b.conflict = true; b.error = kmmSafeMessage(data.message) || '配置已变化，请重新载入；草稿已保留。'; return; }
+        if (!result.ok || data.success !== true) { b.error = kmmSafeMessage(data.message) || '探测失败，可继续手动添加。'; return; }
+        if (data.version !== b.version || data.provider !== b.provider || !Array.isArray(data.models)
+            || data.models.some(function(m) { return !m || typeof m.id !== 'string' || !m.id.trim() || typeof m.display_name !== 'string'; })) {
+          b.error = '探测响应异常，草稿已保留。'; return;
+        }
+        b.rows.forEach(function(row) { row.catalog = false; });
+        var seen = [];
+        data.models.forEach(function(m) {
+          if (seen.indexOf(m.id) >= 0) return;
+          seen.push(m.id);
+          var matching = b.rows.filter(function(row) { return row.value.model === m.id; });
+          if (matching.length) { matching.forEach(function(row) { row.catalog = true; }); return; }
+          var value = kmmModelValue(null, b.provider, m.id, m.display_name);
+          value.alias = kmmUniqueAlias(b, m.id);
+          b.rows.push({ original: null, value: value, initial: JSON.stringify(value), selected: false, catalog: true });
+        });
+        b.catalogLoaded = true; b.message = kmmSafeMessage(data.message) || '探测到 ' + seen.length + ' 个上游模型；已有本地配置与草稿已保留。';
+      }).catch(function() {
+        if (kmmBatch === b && isModelModalOpen) b.error = '探测失败：后台服务未响应或返回异常。草稿已保留，可手动添加。';
+      }).then(function() {
+        if (kmmBatch !== b || !isModelModalOpen) return;
+        b.loading = false; kmmRenderBatchRows(); kmmRenderManagerUI();
+      });
+  }
+  function kmmReloadBatch() {
+    var b = kmmBatch;
+    if (!b || b.saving || b.reloading || !confirm('重新载入将丢弃当前批量草稿和探测列表，确定继续吗？')) return;
+    b.reloading = true; kmmRenderManagerUI();
+    Promise.resolve(kmmManagerRequest).then(function() { return kmmFetchManager(); }).then(function(data) {
+      if (kmmBatch !== b || !isModelModalOpen) return;
+      b.reloading = false;
+      if (!data || !data.providers.length) { b.error = '重新载入失败或没有供应商，草稿已保留。'; kmmRenderManagerUI(); return; }
+      var provider = data.providers.some(function(p) { return p.name === b.provider; }) ? b.provider : data.providers[0].name;
+      kmmCreateBatch(provider); kmmRenderManagerUI(); kmmRenderBatchRows();
+    });
+  }
+  function kmmSaveBatch() {
+    var b = kmmBatch;
+    if (!b || kmmDraft || b.loading || b.saving || b.reloading || b.conflict || !kmmManagerWritable()) return;
+    var operations = kmmBatchOperations(b), error = '', aliases = [];
+    b.rows.forEach(function(row) {
+      if (!row.original && !row.selected) return;
+      if (!row.original || operations.upserts.some(function(op) { return op.original_alias === row.original.alias; })) error = error || kmmModelError(row.value);
+      var alias = row.value.alias.trim();
+      if (aliases.indexOf(alias) >= 0 || (!row.original && b.aliases.indexOf(alias) >= 0)) error = error || '模型别名重名：' + alias;
+      aliases.push(alias);
+    });
+    if (error) { b.error = error; kmmRenderBatch(); return; }
+    if (!operations.upserts.length) return;
+    b.saving = true; b.error = ''; kmmRenderManagerUI();
+    kapiFetch(API_BASE + '/api/model-manager/batch', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: b.version, provider: b.provider, upserts: operations.upserts, removes: operations.removes }) })
+      .then(function(r) { return r.json().then(function(data) { return { status: r.status, ok: r.ok, data: data }; }); })
+      .then(function(result) {
+        if (kmmBatch !== b || !isModelModalOpen) return;
+        var data = result.data || {};
+        if (result.status === 409 || data.code === 'CONFIG_CONFLICT') {
+          b.conflict = true; b.error = kmmSafeMessage(data.message) || '配置已被修改，草稿已保留，请重新载入。';
+        } else if (result.ok && data.success === true && typeof data.version === 'string') {
+          kmmClearBatch(); kmmRenderManagerUI(); kmmToast(kmmSafeMessage(data.message) || '批量配置已保存，会话中 /reload 生效'); kmmRefreshAll();
+        } else {
+          b.error = kmmSafeMessage(data.message) || '批量保存失败，草稿已保留。';
+          if (result.status === 503) { kmmManagerOnline = false; kmmManagerMessage = '配置写入不可用，请确认后台服务正常后重新载入。'; }
+        }
+      }).catch(function() {
+        if (kmmBatch !== b || !isModelModalOpen) return;
+        b.error = '批量保存失败：后台服务未响应或返回异常。草稿已保留，请重新载入确认配置状态。';
+        kmmManagerOnline = false; kmmManagerMessage = '后台服务不可用，不能保存；请刷新后重试。';
+      }).then(function() {
+        if (kmmBatch !== b || !isModelModalOpen) return;
+        b.saving = false; kmmRenderManagerUI();
+      });
+  }
+  function kmmOpenBatchDetail(row) {
+    var b = kmmBatch;
+    if (!b || b.saving || b.loading || b.reloading || b.conflict || !kmmManagerWritable() || !kmmDiscardEditor()) return;
+    var value = row ? JSON.parse(JSON.stringify(row.value)) : kmmModelValue(null, b.provider, '', '');
+    kmmDraft = { kind: 'model', original: row && row.original ? row.original.alias : null, version: b.version,
+      managed: !!(row && row.original && row.original.managed), value: value, initial: JSON.stringify(value), saving: false, conflict: false, error: '',
+      batchRef: b, batchRow: row, batchManual: !row, providers: [b.provider], providerTypes: [],
+      effortLevels: kmmStrings(kmmDefaultEfforts.concat(kmmManagerData.effort_levels)) };
+    kmmRenderEditor(); kmmRenderManagerUI();
+  }
+  function kmmStageBatchDetail(d) {
+    var b = d.batchRef;
+    if (kmmBatch !== b || b.saving || b.reloading) return;
+    var value = JSON.parse(JSON.stringify(d.value));
+    if (d.batchManual && !value.alias.trim() && value.model.trim()) value.alias = kmmUniqueAlias(b, value.model.trim());
+    value.alias = d.original === null ? kmmNormalizeAlias(value.alias, value.provider) : d.original;
+    value.support_efforts = kmmOrderedEfforts(value.support_efforts);
+    if (d.batchManual) value.model = value.model.trim();
+    d.value.alias = value.alias;
+    kmmEl('kmm-editor-alias').value = value.alias;
+    var error = kmmModelError(value);
+    if (b.rows.some(function(row) {
+      return row !== d.batchRow && (row.original ? row.original.alias : kmmNormalizeAlias(row.value.alias, row.value.provider)) === value.alias;
+    }) || (d.original === null && b.aliases.indexOf(value.alias) >= 0)) error = error || '模型别名已存在，请换一个唯一别名。';
+    if (error) { d.error = error; kmmUpdateEditorState(); return; }
+    if (d.batchRow) d.batchRow.value = value;
+    else b.rows.push({ original: null, value: value, initial: JSON.stringify(value), selected: true, catalog: false });
+    kmmClearEditor(); kmmRenderBatchRows(); kmmRenderManagerUI();
+  }
+  function kmmRenderProviders() {
+    var container = kmmEl('kmm-provider-cards');
+    if (!container || kmmDraft || kmmBatch || kmmManagerTab !== 'providers') return;
+    container.innerHTML = '';
+    var kw = kmmEl('kmm-modal-filter').value.trim().toLowerCase();
+    var providers = kmmManagerData ? kmmManagerData.providers : [];
+    providers.forEach(function(p) {
+      if (kw && (p.name + ' ' + p.type + ' ' + p.base_url).toLowerCase().indexOf(kw) < 0) return;
+      var card = document.createElement('div');
+      card.className = 'kmm-card';
+      card.innerHTML = '<div class="kmm-top"><div class="kmm-name kmm-provider-name"><strong>' + esc(p.name) + '</strong>'
+        + (p.managed ? '<span class="kmm-tag def">托管 · 只读</span>' : '') + '</div>'
+        + '<button type="button" class="kmm-link accent" data-kmm-provider-edit>' + (p.managed ? '查看' : '编辑') + '</button></div>'
+        + '<div class="kmm-meta">' + esc(p.type) + ' · ' + esc(p.base_url || '默认地址') + '</div>'
+        + '<div class="kmm-note">API key：' + (p.has_api_key ? '已配置（不展示密钥）' : '未配置') + '</div>';
+      var edit = card.querySelector('[data-kmm-provider-edit]');
+      edit.disabled = !kmmManagerOnline;
+      edit.onclick = function() { kmmOpenEditor('provider', p.name); };
+      container.appendChild(card);
+    });
+    if (!container.children.length) {
+      var empty = document.createElement('div');
+      empty.className = 'kmm-note';
+      empty.textContent = providers.length ? '没有匹配的供应商' : '尚无供应商，请先点击「新增供应商」，再新增模型。';
+      container.appendChild(empty);
+    }
+  }
+  function kmmOpenEditor(kind, original) {
+    if (!kmmManagerOnline || !kmmManagerData || !kmmDiscardAll()) return;
+    if (original === null && !kmmManagerWritable()) return;
+    if (kind === 'model' && original === null && !kmmManagerData.providers.length) {
+      kmmManagerTab = 'providers'; kmmRenderManagerUI(); kmmRenderProviders();
+      kmmToast('请先新增供应商，再新增模型'); return;
+    }
+    var item = original === null ? null : (kind === 'provider' ? kmmManagerData.providers : kmmManagerData.models).find(function(x) {
+      return (kind === 'provider' ? x.name : x.alias) === original;
+    });
+    if (original !== null && !item) { kmmToast('配置已变化，请刷新后重新编辑', true); return; }
+    var value = kind === 'provider'
+      ? { name: item ? item.name : '', type: item ? item.type : (kmmManagerData.provider_types[0] || ''), base_url: item ? item.base_url : '', key_action: 'keep', api_key: '' }
+      : kmmModelValue(item, kmmManagerData.providers.length ? kmmManagerData.providers[0].name : '', '', '');
+    if (kind === 'model') value.set_default = false;
+    kmmDraft = { kind: kind, original: original, version: kmmManagerData.version, managed: !!(item && item.managed), hasKey: !!(item && item.has_api_key),
+      value: value, initial: JSON.stringify(value), saving: false, conflict: false, error: '',
+      providers: kmmManagerData.providers.map(function(p) { return p.name; }), providerTypes: kmmManagerData.provider_types.slice(),
+      effortLevels: kmmStrings(kmmDefaultEfforts.concat(kmmManagerData.effort_levels)) };
+    kmmManagerTab = kind === 'provider' ? 'providers' : 'models';
+    kmmRenderEditor(); kmmRenderManagerUI();
+  }
+  function kmmEditorOptions(values, selected, emptyLabel) {
+    var choices = kmmStrings(values);
+    if (selected && choices.indexOf(selected) < 0) choices.push(selected);
+    return (emptyLabel ? '<option value="">' + esc(emptyLabel) + '</option>' : '') + choices.map(function(v) {
+      return '<option value="' + esc(v) + '"' + (v === selected ? ' selected' : '') + '>' + esc(v) + '</option>';
+    }).join('');
+  }
+  function kmmRenderEditor() {
+    var d = kmmDraft, editor = kmmEl('kmm-editor');
+    if (!d || !editor) return;
+    var v = d.value;
+    var field = function(label, name, type, fixed, id) {
+      return '<label class="kmm-field">' + esc(label) + '<input id="' + (id || 'kmm-editor-' + name.replace(/_/g, '-')) + '" data-kmm-field="' + name
+        + '" type="' + (type || 'text') + '" value="' + esc(v[name]) + '"' + (fixed ? ' disabled' : '')
+        + (type === 'number' ? ' min="1" step="1" required' : '') + '></label>';
+    };
+    var select = function(label, name, values, fixed, emptyLabel, id) {
+      return '<label class="kmm-field">' + esc(label) + '<select id="' + (id || 'kmm-editor-' + name.replace(/_/g, '-')) + '" data-kmm-field="' + name + '"'
+        + (fixed ? ' disabled' : '') + '>' + kmmEditorOptions(values, v[name], emptyLabel) + '</select></label>';
+    };
+    var html = '<h3>' + (d.batchRef ? (d.batchManual ? '手动添加模型' : '模型详情') : (d.original === null ? '新增' : (d.managed && d.kind === 'provider' ? '查看' : '编辑')) + (d.kind === 'provider' ? '供应商' : '模型')) + '</h3>';
+    if (d.kind === 'provider') {
+      html += '<div id="kmm-editor-note">' + (d.managed ? '托管供应商只读，不能更改供应商配置或密钥。' : '编辑时名称固定。密钥仅在本次草稿内存中保存，不会展示已有密钥；保存前不会写入配置。')
+        + ' API key：' + (d.hasKey ? '已配置' : '未配置') + '。</div><div class="kmm-editor-grid">'
+        + field('供应商名称', 'name', 'text', d.original !== null)
+        + select('协议类型', 'type', d.providerTypes, d.managed)
+        + field('Base URL（可留空使用默认地址）', 'base_url', 'text', d.managed)
+        + select('密钥操作', 'key_action', ['keep', 'replace', 'clear'], d.managed, null, 'kmm-provider-key-action')
+        + '<label class="kmm-field" id="kmm-provider-key-field" hidden>新 API key<input id="kmm-provider-api-key" data-kmm-field="api_key" type="password" value="" autocomplete="new-password" spellcheck="false"></label></div>'
+        + '<div class="kmm-note" id="kmm-provider-key-note">keep：保留现有密钥；replace：输入新密钥；clear：明确清除密钥。</div>';
+    } else {
+      var note = d.batchRef ? (d.batchManual ? '手动添加完成后加入批量草稿；别名留空会按上游 ID 自动生成。' : '供应商与上游 ID 固定；已有别名固定，新模型别名可修改。暂存详情不会改变此行的新增选择；删除已有模型请返回齿轮首页。')
+        : d.managed ? '托管模型的 alias、供应商和模型 ID 固定。能力修改通过本地 override 生效。' : '已有 alias 固定；新增模型默认开启识图、思考、工具调用，1M 上下文、五档思考、默认 high。';
+      html += '<div id="kmm-editor-note">' + note + ' 新增别名统一使用「供应商/别名」；自定义别名会保留，上游 ID 不添加前缀。能力、上下文与思考档位仅是本地声明，不验证上游实际支持；保留已有档位子集，默认强度必须在所选档位内。</div><div class="kmm-editor-grid">'
+        + field('模型 alias', 'alias', 'text', d.original !== null)
+        + select('供应商', 'provider', d.providers, d.managed || !!d.batchRef)
+        + field('上游模型 ID', 'model', 'text', d.managed || (!!d.batchRef && !d.batchManual))
+        + field('显示名称（可留空）', 'display_name')
+        + '<div class="kmm-field">' + field('上下文 Token 数（自定义正整数）', 'max_context_size', 'number')
+        + '<div class="kmm-context-presets"><button type="button" class="kmm-tbtn" data-kmm-context="256000">256k · 256000</button>'
+        + '<button type="button" class="kmm-tbtn" data-kmm-context="1000000">1M · 1000000</button></div></div>'
+        + select('默认思考强度', 'default_effort', kmmOrderedEfforts(v.support_efforts), false, '不指定') + '</div>';
+      var caps = kmmStrings(['image_in', 'thinking', 'tool_use'].concat(v.capabilities));
+      var capLabels = { image_in: '识图', thinking: '思考', tool_use: '工具调用' };
+      html += '<div class="kmm-field">能力</div><div class="kmm-editor-checks">' + caps.map(function(cap) {
+        return '<label><input type="checkbox" data-kmm-cap="' + esc(cap) + '"' + (v.capabilities.indexOf(cap) >= 0 ? ' checked' : '') + '>' + esc(capLabels[cap] || cap + '（现有能力）') + '</label>';
+      }).join('') + '</div><div class="kmm-field">支持的思考档位（不选 = 未声明）</div><div class="kmm-editor-checks">'
+        + kmmOrderedEfforts(d.effortLevels.concat(v.support_efforts)).map(function(level) {
+          return '<label><input type="checkbox" data-kmm-effort="' + esc(level) + '"' + (v.support_efforts.indexOf(level) >= 0 ? ' checked' : '') + '>' + esc(level) + '</label>';
+        }).join('') + '</div>';
+      if (!d.batchRef) html += '<label class="kmm-editor-checks"><input id="kmm-editor-set-default" type="checkbox" data-kmm-field="set_default">保存后设为默认模型</label>';
+    }
+    editor.innerHTML = html + '<div id="kmm-editor-status" role="status" aria-live="polite"></div><div id="kmm-editor-error" role="alert"></div>'
+      + '<div class="kmm-editor-actions"><button type="button" class="kmm-tbtn" id="kmm-editor-reload">' + (d.batchRef ? '重置本次详情' : '重新载入（丢弃草稿）') + '</button>'
+      + '<button type="button" class="kmm-tbtn" id="kmm-editor-cancel">' + (d.batchRef ? '取消详情' : '取消') + '</button><button type="submit" class="kmm-tbtn primary" id="kmm-editor-save">保存</button></div>';
+    var suggestAlias = function() {
+      var id = v.model.trim();
+      if (!id) return '';
+      return d.batchManual ? kmmUniqueAlias(d.batchRef, id) : kmmNormalizeAlias(id, v.provider);
+    };
+    if (d.kind === 'model' && d.original === null) d.aliasSuggested = kmmNormalizeAlias(v.model, v.provider);
+    editor.querySelectorAll('[data-kmm-field]').forEach(function(input) {
+      var update = function() {
+        if (!kmmDraft || kmmDraft !== d || d.saving || kmmEditorReloading || input.disabled) return;
+        var name = input.getAttribute('data-kmm-field'), previousProvider = v.provider;
+        var autoAlias = !v.alias || !v.alias.trim() || kmmNormalizeAlias(v.alias, v.provider) === d.aliasSuggested;
+        v[name] = input.type === 'checkbox' ? input.checked : name === 'default_effort' ? (input.value || null) : input.value;
+        if (d.kind === 'model' && d.original === null) {
+          if (name === 'model' && autoAlias) { d.aliasSuggested = suggestAlias(); v.alias = d.aliasSuggested; }
+          if (name === 'provider') {
+            v.alias = kmmNormalizeAlias(v.alias, v.provider, previousProvider);
+            d.aliasSuggested = kmmNormalizeAlias(d.aliasSuggested, v.provider, previousProvider);
+            if (autoAlias) { d.aliasSuggested = suggestAlias(); v.alias = d.aliasSuggested; }
+          }
+          if (name === 'model' || name === 'provider') kmmEl('kmm-editor-alias').value = v.alias;
+        }
+        if (name === 'key_action' && v.key_action !== 'replace') { v.api_key = ''; kmmEl('kmm-provider-api-key').value = ''; }
+        kmmUpdateEditorState();
+      };
+      input.addEventListener('input', update); input.addEventListener('change', update);
+      if (d.kind === 'model' && d.original === null && input.getAttribute('data-kmm-field') === 'alias') {
+        input.addEventListener('blur', function() {
+          if (kmmDraft !== d || d.saving || kmmEditorReloading || input.disabled) return;
+          v.alias = kmmNormalizeAlias(input.value, v.provider);
+          if (!v.alias && v.model.trim()) { d.aliasSuggested = suggestAlias(); v.alias = d.aliasSuggested; }
+          input.value = v.alias; kmmUpdateEditorState();
+        });
+      }
+    });
+    editor.querySelectorAll('[data-kmm-context]').forEach(function(button) {
+      button.onclick = function() {
+        if (kmmDraft !== d || d.saving || kmmEditorReloading || !kmmManagerWritable()) return;
+        v.max_context_size = button.getAttribute('data-kmm-context'); kmmEl('kmm-editor-max-context-size').value = v.max_context_size; kmmUpdateEditorState();
+      };
+    });
+    editor.querySelectorAll('[data-kmm-cap], [data-kmm-effort]').forEach(function(input) {
+      input.onchange = function() {
+        if (kmmDraft !== d || d.saving || kmmEditorReloading || input.disabled) return;
+        var cap = input.hasAttribute('data-kmm-cap');
+        var selector = cap ? '[data-kmm-cap]' : '[data-kmm-effort]';
+        v[cap ? 'capabilities' : 'support_efforts'] = Array.from(editor.querySelectorAll(selector)).filter(function(el) { return el.checked; })
+          .map(function(el) { return el.getAttribute(cap ? 'data-kmm-cap' : 'data-kmm-effort'); });
+        if (!cap) {
+          if (v.support_efforts.indexOf(v.default_effort) < 0) v.default_effort = null;
+          kmmEl('kmm-editor-default-effort').innerHTML = kmmEditorOptions(v.support_efforts, v.default_effort, '不指定');
+        }
+        kmmUpdateEditorState();
+      };
+    });
+    editor.onsubmit = function(e) { e.preventDefault(); kmmSaveEditor(); };
+    kmmEl('kmm-editor-cancel').onclick = function() {
+      if (!kmmDiscardEditor()) return;
+      kmmRenderBatchRows(); kmmRenderManagerUI(); kmmRenderModalCards(); kmmRenderProviders();
+    };
+    kmmEl('kmm-editor-reload').onclick = kmmReloadEditor;
+    kmmUpdateEditorState();
+    var focus = editor.querySelector('input:not(:disabled), select:not(:disabled)');
+    if (focus) focus.focus();
+  }
+  function kmmUpdateEditorState() {
+    var d = kmmDraft;
+    if (!d) return;
+    var readonly = d.kind === 'provider' && d.managed;
+    var busy = d.saving || kmmEditorReloading;
+    var unavailable = !kmmManagerWritable();
+    var conflict = d.conflict || !!(d.batchRef && d.batchRef.conflict);
+    kmmEl('kmm-editor-save').disabled = busy || readonly || unavailable || conflict;
+    kmmEl('kmm-editor-save').textContent = d.saving ? '保存中…' : d.batchRef ? (d.batchManual ? '加入草稿并返回' : '暂存详情并返回') : '保存';
+    kmmEl('kmm-editor-cancel').disabled = busy;
+    kmmEl('kmm-editor-reload').disabled = busy;
+    kmmEl('kmm-modal-close-btn').disabled = busy;
+    kmmEl('kmm-editor-error').textContent = d.error;
+    kmmEl('kmm-editor-status').textContent = busy ? (d.saving ? '正在保存，请勿重复提交或关闭。' : '正在重新读取配置…')
+      : readonly ? '托管供应商只读。' : unavailable ? (kmmManagerMessage || '当前只读，不能保存。')
+      : conflict ? '配置冲突：输入已保留。请返回列表重新载入，不支持强制覆盖。'
+      : kmmManagerData.version !== d.version ? '配置已变化，草稿仍使用打开时的版本；保存可能产生冲突。'
+      : d.batchRef ? '本次详情只暂存到批量草稿；返回后点击「保存更改」才写入配置。' : '草稿仅在内存，点击保存才写入配置。';
+    kmmEl('kmm-editor').querySelectorAll('input, select').forEach(function(input) {
+      var name = input.getAttribute('data-kmm-field');
+      var fixed = readonly || (d.original !== null && (name === 'name' || name === 'alias'))
+        || (d.kind === 'model' && ((d.managed && (name === 'provider' || name === 'model')) || (d.batchRef && (name === 'provider' || (name === 'model' && !d.batchManual)))));
+      input.disabled = busy || fixed || unavailable;
+    });
+    kmmEl('kmm-editor').querySelectorAll('[data-kmm-context]').forEach(function(button) { button.disabled = busy || unavailable; });
+    if (d.kind === 'provider') {
+      kmmEl('kmm-provider-key-field').hidden = d.value.key_action !== 'replace';
+      kmmEl('kmm-provider-api-key').disabled = busy || readonly || unavailable || d.value.key_action !== 'replace';
+      kmmEl('kmm-provider-key-note').textContent = d.value.key_action === 'clear' ? '已选择 clear：保存时会清除当前 API key。'
+        : d.value.key_action === 'replace' ? '仅发送本次输入的新 API key，不展示已有密钥。' : 'keep：保留现有密钥，不发送 API key。';
+    }
+  }
+  function kmmReloadEditor() {
+    var d = kmmDraft;
+    if (!d || d.saving || kmmEditorReloading) return;
+    if (d.batchRef) {
+      if (!confirm('重置本次详情修改？其它批量草稿与选择会保留。')) return;
+      d.value = JSON.parse(d.initial); d.error = ''; kmmRenderEditor(); kmmRenderManagerUI(); return;
+    }
+    if (!confirm('重新载入会丢弃当前草稿（含新密钥），确定继续吗？不会强制覆盖配置。')) return;
+    kmmEditorReloading = true; kmmRenderManagerUI();
+    Promise.resolve(kmmManagerRequest).then(function() { return kmmFetchManager(); }).then(function(data) {
+      kmmEditorReloading = false;
+      if (kmmDraft !== d || !isModelModalOpen) return;
+      if (!data) { d.error = '重新载入失败，草稿已保留。'; kmmRenderManagerUI(); return; }
+      var kind = d.kind, original = d.original;
+      kmmClearEditor(); kmmOpenEditor(kind, original); kmmRenderManagerUI();
+    });
+  }
+  function kmmSaveEditor() {
+    var d = kmmDraft;
+    if (!d || d.saving || kmmEditorReloading || d.conflict || !kmmManagerWritable() || (d.kind === 'provider' && d.managed)) return;
+    if (d.batchRef) { if (!d.batchRef.conflict) kmmStageBatchDetail(d); return; }
+    var v = d.value, body = { version: d.version }, error = '';
+    if (d.kind === 'provider') {
+      if (!v.name.trim() || !v.type) error = '请输入供应商名称并选择协议类型。';
+      else if (v.key_action === 'replace' && !v.api_key.trim()) error = 'replace 必须输入新的 API key。';
+      body.original_name = d.original;
+      body.provider = { name: d.original === null ? v.name.trim() : d.original, type: v.type, base_url: v.base_url.trim(), key_action: v.key_action };
+      if (v.key_action === 'replace') body.provider.api_key = v.api_key;
+    } else {
+      if (d.original === null) {
+        v.alias = kmmNormalizeAlias(v.alias || v.model, v.provider);
+        kmmEl('kmm-editor-alias').value = v.alias;
+      }
+      error = kmmModelError(v);
+      if (d.original === null && kmmManagerData.models.some(function(m) { return m.alias === v.alias; })) {
+        error = error || '模型别名已存在，请换一个唯一别名。';
+      }
+      body.original_alias = d.original;
+      body.model = kmmModelPayload(v, d.original);
+      if (!d.managed) body.model.model = v.model.trim();
+      if (v.set_default) body.set_default = true;
+    }
+    if (error) { d.error = error; kmmUpdateEditorState(); return; }
+    if (d.kind === 'provider' && v.key_action === 'clear' && !confirm('确定保存并清除该供应商的 API key 吗？')) return;
+    d.error = ''; d.saving = true; kmmRenderManagerUI();
+    kapiFetch(API_BASE + '/api/model-manager/' + d.kind, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then(function(r) {
+        return r.json().then(function(data) { return { status: r.status, ok: r.ok, data: data }; });
+      }).then(function(result) {
+        if (kmmDraft !== d) return;
+        var data = result.data || {};
+        if (result.status === 409 || data.code === 'CONFIG_CONFLICT') {
+          d.conflict = true; d.error = kmmSafeMessage(data.message) || '配置已被修改，输入已保留，请重新载入。';
+        } else if (result.ok && data.success === true) {
+          var message = kmmSafeMessage(data.message) || '配置已保存，会话中 /reload 生效';
+          kmmClearEditor(); kmmRenderManagerUI();
+          kmmToast(message); kmmRefreshAll();
+        } else {
+          d.error = kmmSafeMessage(data.message) || '保存失败，输入已保留。';
+          if (result.status === 503) { kmmManagerOnline = false; kmmManagerMessage = '配置写入不可用，请确认解析器和后台服务正常后刷新。'; }
+        }
+      }).catch(function() {
+        if (kmmDraft !== d) return;
+        d.error = '保存失败：后台服务未响应或返回异常，输入已保留。请刷新确认配置状态后再操作。';
+        kmmManagerOnline = false; kmmManagerMessage = '后台服务不可用，不能保存；请刷新后重试。';
+      }).then(function() {
+        if (body.provider) body.provider.api_key = '';
+        if (kmmDraft === d) d.saving = false;
+        kmmRenderManagerUI();
+        if (!kmmDraft) { kmmEl('kmm-modal-close-btn').disabled = false; kmmRenderModalCards(); kmmRenderProviders(); }
+      });
+  }
+  setInterval(function() {
+    if (!document.hidden && isModelModalOpen && !(kmmDraft && kmmDraft.saving)
+        && !(kmmBatch && (kmmBatch.saving || kmmBatch.reloading)) && !kmmEditorReloading) kmmFetchManager();
+  }, 15000);
 
   function kmmToast(msg, isErr) {
     var toast = document.getElementById('kmm-toast');
@@ -2811,7 +3660,7 @@
         kmdBusy = false;
         if (range) { range.disabled = false; kmdSnapTo(range, kmdData.active == null ? i : kmdData.active, null); }
         kmdRender();
-        if (typeof fetchModels === 'function') fetchModels();
+        if (typeof fetchModels === 'function') kmmRefreshAll();
       });
   }
 
@@ -3151,13 +4000,12 @@
     kuLayerShow(overlay, 'visible');
     isModelModalOpen = true;
     // 卡片渲染走空闲回调，overlay 先淡入
-    kuScheduleIdle(function() { kmmRenderModalCards(); });
-    fetchModels();
-    if (!apiAlive) {
-      kmmToast('⚠️ 后台服务离线：当前为缓存数据只读展示', true);
-    }
+    kmmRenderManagerUI();
+    kuScheduleIdle(function() { kmmRenderModalCards(); kmmRenderProviders(); });
+    kmmRefreshAll();
   }
   function closeModelModal() {
+    if (!kmmDiscardAll()) return;
     if (kmmOverlayEl) kuLayerHide(kmmOverlayEl, 'visible');
     isModelModalOpen = false;
   }
@@ -3173,11 +4021,9 @@
       })
       .catch(function() {
         apiAlive = false;
-        if (window.__KIMI_DATA__ && window.__KIMI_DATA__.models) {
-          modelsData = window.__KIMI_DATA__.models;
-          if (isModelModalOpen) kmmRenderModalCards();
-        }
-      });
+        if (window.__KIMI_DATA__ && window.__KIMI_DATA__.models) modelsData = window.__KIMI_DATA__.models;
+        if (isModelModalOpen) kmmRenderModalCards();
+      }).then(function() { if (isModelModalOpen) kmmRenderManagerUI(); });
   }
 
   function kmmRenderModalCards() {
@@ -3185,12 +4031,12 @@
     var $o = function(id) { return kmmOverlayEl.querySelector('#' + id); };
     var badge = $o('kmm-modal-default-badge');
     if (badge) {
-      var def = modelsData.default_model || '';
-      var defM = (modelsData.models || []).find(function(m) { return m.alias === def; });
-      badge.innerHTML = '默认：<b>' + esc((defM && defM.display_name) || def || '--') + '</b>';
+      var def = kmmManagerData ? kmmManagerData.default_model : modelsData.default_model || '';
+      var defM = (kmmManagerData ? kmmManagerData.models : modelsData.models || []).find(function(m) { return m.alias === def; });
+      badge.textContent = '默认：' + ((defM && defM.display_name) || def || '--');
     }
     var container = $o('kmm-modal-cards');
-    if (!container) return;
+    if (!container || kmmDraft || kmmBatch || kmmManagerTab !== 'models') return;
     var filterEl = $o('kmm-modal-filter');
     var kw = filterEl ? filterEl.value.trim().toLowerCase() : '';
     container.innerHTML = '';
@@ -3217,6 +4063,7 @@
         var bt = document.createElement('button');
         bt.className = 'kmm-link accent';
         bt.textContent = label;
+        bt.disabled = !apiAlive || !kmmManagerWritable();
         bt.onclick = fn;
         sum.appendChild(bt);
       };
@@ -3251,45 +4098,48 @@
       var selTitle = (m.efforts_source === 'config' ? '档位来自本机配置' : '档位为默认兜底（config.toml 未声明 support_efforts）');
       var issues = m.effort_issues || [];
       var alwaysOn = !!m.always_thinking;
-      var a = JSON.stringify(m.alias);
       var warnHtml = issues.filter(function(it) { return it.level !== 'info' && !it.dismissed; }).map(function(it) {
         var c = it.level === 'error' ? 'var(--color-danger,#f85149)' : 'var(--color-warning,#d29922)';
         var btns = '';
         if (it.code) {
-          if (it.fix) btns += "<button class=\"kmm-link accent\" onclick='window.__KMM_ISSUE(" + a + ", \"" + it.code + "\", \"fix\")'>" + esc(it.fix) + '</button>';
-          btns += "<button class=\"kmm-link\" onclick='window.__KMM_ISSUE(" + a + ", \"" + it.code + "\", \"ignore\")'>忽略</button>";
+          if (it.fix) btns += '<button type="button" class="kmm-link accent" data-kmm-action="issue" data-code="' + esc(it.code) + '" data-issue-action="fix">' + esc(it.fix) + '</button>';
+          btns += '<button type="button" class="kmm-link" data-kmm-action="issue" data-code="' + esc(it.code) + '" data-issue-action="ignore">忽略</button>';
         }
         return '<div class="kmm-warn" style="color:' + c + ';display:flex;align-items:center;gap:6px;flex-wrap:wrap;">'
           + '<span style="flex:1;min-width:200px;">' + (it.level === 'error' ? '✖ ' : '⚠ ') + esc(it.msg) + '</span>' + btns + '</div>';
       }).join('');
       var chip = function(cap, label, on, locked, tip) {
         return '<label class="kmm-chip' + (on ? ' on' : '') + (locked ? ' lock' : '') + '"' + (tip ? ' title="' + esc(tip) + '"' : '') + '>'
-          + '<input type="checkbox" ' + (on ? 'checked ' : '') + (locked ? 'disabled ' : '')
-          + "onchange='window.__KMM_TOGGLE(" + a + ", \"" + cap + "\", this.checked)'>" + label + '</label>';
+          + '<input type="checkbox" data-kmm-capability="' + esc(cap) + '" ' + (on ? 'checked ' : '') + (locked ? 'disabled ' : '') + '>' + label + '</label>';
       };
       var segHtml;
       if (efforts) {
         segHtml = '<div class="kmm-seg" title="' + esc(selTitle) + '">'
           + efforts.map(function(lvl) {
               var on = m.default_effort === lvl;
-              return '<button class="' + (on ? 'on' : '') + '" ' + (on ? '' : "onclick='window.__KMM_EFFORT(" + a + ", \"" + lvl + "\")'") + '>' + lvl + '</button>';
+              return '<button type="button" class="' + (on ? 'on' : '') + '" data-kmm-action="effort" data-effort="' + esc(lvl) + '"' + (on ? ' disabled' : '') + '>' + esc(lvl) + '</button>';
             }).join('')
           + '</div>';
       } else {
         segHtml = '<span class="kmm-note">该模型未开启思考</span>';
       }
+      var editableModel = kmmManagerData && kmmManagerData.models.find(function(x) { return x.alias === m.alias; });
+      var deleteReason = kmmModelDeleteReason(editableModel);
       card.innerHTML =
         '<div class="kmm-top">'
-        + '<div class="kmm-name"><strong>' + esc(m.display_name || m.alias) + '</strong>'
+        + '<div class="kmm-name"><strong title="' + esc(m.display_name || m.alias) + '">' + esc(m.alias) + '</strong>'
         + (isCur ? '<span class="kmm-tag cur">使用中</span>' : '')
         + (m.is_default ? '<span class="kmm-tag def">默认</span>' : '')
         + (alwaysOn ? '<span class="kmm-tag on" title="always_thinking=true：思考常开，不可关闭">思考常开</span>' : '')
         + (!alwaysOn && m.adaptive_thinking ? '<span class="kmm-tag ad" title="adaptive_thinking=true：自适应思考">自适应</span>' : '')
         + '</div>'
         + '<div class="kmm-acts">'
-        + '<button class="kmm-link" title="' + (m.pricing ? '自定义计价中' : '未设置，按默认单价估算') + "\" onclick='window.__KMM_PRICE(" + a + ")'>"
+        + (editableModel ? '<button type="button" class="kmm-link accent" data-kmm-action="edit">编辑</button>' : '')
+        + '<button type="button" class="kmm-link" data-kmm-action="price" title="' + (m.pricing ? '自定义计价中' : '未设置，按默认单价估算') + '">'
         + (m.pricing ? (m.pricing.mode === 'per_call' ? '按次计价' : '按量计价') : '设置价格') + '</button>'
-        + (!m.is_default ? "<button class=\"kmm-link accent\" onclick='window.__KMM_SET_DEFAULT(" + a + ")'>设为默认</button>" : '')
+        + (!m.is_default ? '<button type="button" class="kmm-link accent" data-kmm-action="default">设为默认</button>' : '')
+        + '<button type="button" class="kmm-link danger" data-kmm-action="delete" title="' + esc(deleteReason || '删除模型及其本地覆盖配置，确认后立即保存') + '"'
+        + (deleteReason ? ' disabled' : '') + '>' + (kmmDeleting && kmmDeleting.alias === m.alias ? '删除中…' : '删除') + '</button>'
         + '</div></div>'
         + '<div class="kmm-meta">' + esc(m.provider) + ' · ' + esc(m.model) + ' · ' + ctxK + 'k 上下文</div>'
         + '<div class="kmm-ctl">'
@@ -3302,6 +4152,25 @@
         + (effOutOfList ? '<span class="kmm-warn" style="margin:0;color:var(--color-warning,#d29922);">⚠ 当前 ' + esc(m.default_effort) + ' 不在列表</span>' : '')
         + '</div></div>'
         + warnHtml;
+      card.querySelectorAll('[data-kmm-action]').forEach(function(btn) {
+        var action = btn.getAttribute('data-kmm-action');
+        if (action === 'edit') btn.disabled = !!kmmDeleting || !kmmManagerOnline;
+        else if (action === 'price') btn.disabled = !!kmmDeleting;
+        else btn.disabled = btn.disabled || !!kmmDeleting || !apiAlive || !kmmManagerWritable();
+        btn.onclick = function() {
+          if (kmmDeleting) return;
+          if (action === 'edit') kmmOpenEditor('model', m.alias);
+          else if (action === 'delete') kmmDeleteModel(m.alias);
+          else if (action === 'price') window.__KMM_PRICE(m.alias);
+          else if (action === 'default') window.__KMM_SET_DEFAULT(m.alias);
+          else if (action === 'effort') window.__KMM_EFFORT(m.alias, btn.getAttribute('data-effort'));
+          else if (action === 'issue') window.__KMM_ISSUE(m.alias, btn.getAttribute('data-code'), btn.getAttribute('data-issue-action'));
+        };
+      });
+      card.querySelectorAll('[data-kmm-capability]').forEach(function(input) {
+        input.disabled = input.disabled || !!kmmDeleting || !apiAlive || !kmmManagerWritable();
+        input.onchange = function() { window.__KMM_TOGGLE(m.alias, input.getAttribute('data-kmm-capability'), input.checked); };
+      });
       container.appendChild(card);
     });
     if (shown === 0) {
@@ -3312,7 +4181,7 @@
     }
   }
 
-  // 全局操作回调（供弹窗内联 onclick/onchange 调用）
+  // 全局操作回调（供模型卡片 DOM 事件调用）
   window.__KMM_SET_DEFAULT = async function(alias) {
     try {
       const res = await kapiFetch(`${API_BASE}/api/set-default`, {
@@ -3323,7 +4192,7 @@
       const data = await res.json();
       if (data.success) {
         kmmToast(`已设 ${alias} 为默认模型`);
-        fetchModels();
+        kmmRefreshAll();
       } else kmmToast(data.message, true);
     } catch (e) { kmmToast('操作失败: 后台服务未响应', true); }
   };
@@ -3338,13 +4207,13 @@
       const data = await res.json();
       if (data.success) {
         kmmToast(`已${enabled ? '开启' : '关闭'} ${capability}`);
-        fetchModels();
+        kmmRefreshAll();
       } else kmmToast(data.message, true);
     } catch (e) { kmmToast('保存失败: 后台服务未响应', true); }
   };
 
   window.__KMM_ISSUE = async function(alias, code, action) {
-    if (action === 'fix_all' && !confirm('将自动修复可确定的问题（协议拼写、缺失的思考标签、默认档不在列表等）。修改前会备份并校验 config.toml，继续吗？')) return;
+    if (action === 'fix_all' && !confirm('将自动修复可确定的问题（协议拼写、缺失的思考标签、默认档不在列表等）。确认后直接保存 config.toml，不生成备份，继续吗？')) return;
     if (action === 'fix' && code === 'no_support_efforts' && !confirm('将为该模型写入 support_efforts = low / medium / high / xhigh / max。\n如果上游并不支持其中某些档位，选到它会失败。继续吗？')) return;
     try {
       const res = await kapiFetch(`${API_BASE}/api/issue-action`, {
@@ -3354,7 +4223,7 @@
       });
       const data = await res.json();
       kmmToast(data.message, !data.success);
-      if (data.success) fetchModels();
+      if (data.success) kmmRefreshAll();
     } catch (e) { kmmToast('操作失败: 后台服务未响应', true); }
   };
 
@@ -3368,7 +4237,7 @@
       const data = await res.json();
       if (data.success) {
         kmmToast(data.note ? `已设 ${defaultEffort}。${data.note}` : `思考强度已设为 ${defaultEffort}`);
-        fetchModels();
+        kmmRefreshAll();
       } else kmmToast(data.message, true);
     } catch (e) { kmmToast('更新失败: 后台服务未响应', true); }
   };
@@ -3467,7 +4336,7 @@
       if (data.success) {
         kmmToast(reset ? '已恢复默认计价' : '价格已保存');
         kuLayerHide(kprOverlayEl, 'visible');
-        fetchModels();
+        kmmRefreshAll();
       } else kmmToast(data.message || '保存失败', true);
     }).catch(function() { kmmToast('保存失败: 后台服务未响应', true); });
   }
