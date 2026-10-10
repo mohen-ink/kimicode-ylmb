@@ -64,6 +64,10 @@ REMOTE_ASSETS = (
 REMOTE_STYLE_ASSETS = ('kimi-remote-widget-live.css',)
 PRICING_PATH = os.path.join(KIMI_HOME, 'usage-dashboard', 'pricing.json')
 DISMISS_PATH = os.path.join(KIMI_HOME, 'usage-dashboard', 'dismissed-issues.json')
+UNINSTALL_MARKER = os.path.join(KIMI_HOME, 'usage-dashboard', 'plugin-uninstall.json')
+UNINSTALL_LOCK = threading.Lock()
+UNINSTALL_BEGIN = threading.Event()
+_UNINSTALL_EXIT = threading.Event()
 
 # 自更新源：GitHub 仓库（改源只需改 UPDATE_REPO）
 UPDATE_REPO = 'ziyiclouds-blip/kimicode-ylmb'
@@ -345,8 +349,22 @@ DIST_ASSETS = ''
 INDEX_HTML = ''
 
 
+def uninstall_requested():
+    """卸载保护标记存在即视为已卸载（阻止心跳/注入复活）。"""
+    try:
+        os.lstat(UNINSTALL_MARKER)
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
+
+
 def refresh_dist_paths():
     global DIST_DIR, DIST_ASSETS, INDEX_HTML
+    if uninstall_requested():
+        DIST_DIR = DIST_ASSETS = INDEX_HTML = ''
+        return
     DIST_DIR = get_dist_dir()
     DIST_ASSETS = os.path.join(DIST_DIR, 'assets') if DIST_DIR else ''
     INDEX_HTML = os.path.join(DIST_DIR, 'index.html') if DIST_DIR else ''
@@ -2891,6 +2909,19 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             req = {}
         try:
+            if path == '/api/plugin/uninstall':
+                if set(req) != {'confirm'} or req.get('confirm') is not True:
+                    return self._json({'success': False, 'message': '卸载确认参数不正确'}, 400)
+                payload, status = uninstall_plugin()
+                try:
+                    self._json(payload, status)
+                    self.wfile.flush()
+                finally:
+                    if payload.get('success'):
+                        _UNINSTALL_EXIT.set()
+                        threading.Timer(0.3, _force_exit_after_uninstall).start()
+                return
+
             if path == '/api/model-manager/catalog':
                 payload, status = get_model_manager_catalog(req)
                 return self._json(payload, status)
@@ -3145,6 +3176,8 @@ def spawn_daemon():
     flags = 0
     if os.name == 'nt':
         flags = getattr(subprocess, 'DETACHED_PROCESS', 0x00000008) | getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+    if uninstall_requested() or UNINSTALL_BEGIN.is_set():
+        return False
     try:
         subprocess.Popen([py, os.path.join(SCRIPT_DIR, 'service.py')],
                          cwd=PLUGIN_ROOT, creationflags=flags,
@@ -3302,6 +3335,8 @@ def restart_service():
 
 def tick():
     """hook 入口：服务不在就拉起；服务在就触发一次采集刷新。"""
+    if uninstall_requested():
+        return 0
     if port_is_ours():
         try:
             _urlopen('http://127.0.0.1:%d/api/reload' % PORT, timeout=3).read()
@@ -3385,7 +3420,7 @@ def run_server():
         return
 
     n = 0
-    while True:
+    while not _UNINSTALL_EXIT.is_set():
         try:
             sync_widget_asset()
             ensure_injection()
@@ -3395,7 +3430,47 @@ def run_server():
                 save_state()
         except Exception as e:
             log('loop error: %r' % e)
-        time.sleep(2)
+        _UNINSTALL_EXIT.wait(2)
+    if _UNINSTALL_EXIT.is_set():
+        _force_exit_after_uninstall()
+
+
+def _force_exit_after_uninstall():
+    os._exit(0)
+
+
+def uninstall_plugin():
+    """写卸载保护标记、弹出 uninstall.cmd 清理窗口，随后本服务自行退出。"""
+    if not UNINSTALL_LOCK.acquire(timeout=1.0):
+        return {'success': False, 'message': '另一个卸载操作进行中，请稍后重试'}, 409
+    try:
+        script = os.path.join(SCRIPT_DIR, 'uninstall.cmd')
+        if not os.path.isfile(script):
+            raise ValueError('uninstall.cmd missing')
+        UNINSTALL_BEGIN.set()
+        os.makedirs(os.path.dirname(UNINSTALL_MARKER), exist_ok=True)
+        with open(UNINSTALL_MARKER, 'w', encoding='utf-8') as f:
+            json.dump({'plugin': 'kimi-code-usage',
+                       'requested_at': datetime.now().isoformat()}, f)
+        # 新控制台窗口跑卸载脚本：杀进程、清注入、删 usage-dashboard 与插件目录
+        flags = getattr(subprocess, 'CREATE_NEW_CONSOLE', 0x00000010)
+        subprocess.Popen('cmd.exe /c ""%s""' % script, shell=False,
+                         cwd=os.environ.get('TEMP', PLUGIN_ROOT),
+                         creationflags=flags, close_fds=True)
+        _mobile_begin_shutdown()   # detach；worker 由卸载脚本按命令行核实后结束
+        return {'success': True,
+                'message': '卸载清理窗口已打开，完成后本服务退出；请按窗口提示操作。'}, 202
+    except Exception as e:
+        log('uninstall launch failed: %r' % e)
+        try:
+            if os.path.lexists(UNINSTALL_MARKER):
+                os.remove(UNINSTALL_MARKER)
+        except Exception:
+            pass
+        UNINSTALL_BEGIN.clear()
+        return {'success': False, 'message': '无法启动卸载脚本：%s' % str(e)[:200]}, 500
+    finally:
+        UNINSTALL_LOCK.release()
 
 
 if __name__ == '__main__':

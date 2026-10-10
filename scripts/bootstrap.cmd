@@ -13,7 +13,7 @@ setlocal
 set "ROOT=%~dp0.."
 if defined KIMI_PLUGIN_ROOT set "ROOT=%KIMI_PLUGIN_ROOT%"
 set "SVC=%ROOT%\scripts\service.py"
-set "LOG=%ROOT%\scripts\service.log"
+set "LOG=%ROOT%\scripts\service.log" & set "UNINSTALL_MARKER=%USERPROFILE%\.kimi-code\usage-dashboard\plugin-uninstall.json" & if exist "%UNINSTALL_MARKER%" exit /b 0
 
 rem --- locate Python: py launcher > PATH > common install dirs ---
 set "PYEXE="
@@ -32,6 +32,6 @@ exit /b 0
 :nopython
 rem --- No Python found: log it, then try to inject a static placeholder so the
 rem     sidebar at least shows an "install Python" hint instead of staying blank.
-echo [%date% %time%] Python not found on PATH; service.py --tick skipped >>"%LOG%"
+echo [%date% %time%] Python not found on PATH; service.py --tick skipped >>"%LOG%" & if exist "%UNINSTALL_MARKER%" exit /b 0
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\scripts\need-python.ps1" >>"%LOG%" 2>&1
 exit /b 0

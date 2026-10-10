@@ -5,6 +5,8 @@
 $ErrorActionPreference = 'SilentlyContinue'
 $root = Split-Path -Parent $PSScriptRoot          # plugin root
 $cfg  = Join-Path $PSScriptRoot 'desktop_path.txt'
+$marker = Join-Path $env:USERPROFILE '.kimi-code\usage-dashboard\plugin-uninstall.json'
+try { if (Test-Path $marker) { exit 0 } } catch { exit 0 }
 
 function Find-Dist {
     if (Test-Path $cfg) {

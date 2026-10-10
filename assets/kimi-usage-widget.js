@@ -88,6 +88,7 @@
   let kupTheme = 'dark';
   let kupChecking = false;
   let kupUpdating = false;
+  let kupUninstalling = false;
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -755,6 +756,9 @@
       transition: all 0.15s;
     }
     .kup-btn:hover { border-color: var(--color-accent, #1a88ff); color: var(--color-accent, #1a88ff); }
+    #kup-uninstall-btn { border-color: color-mix(in srgb, var(--color-danger, #f85149) 45%, transparent); color: var(--color-danger, #f85149); }
+    #kup-uninstall-btn:hover { border-color: var(--color-danger, #f85149); color: var(--color-danger, #f85149); }
+    .kup-btn:disabled { opacity: .5; cursor: wait; }
     .kup-close {
       border: none;
       background: transparent;
@@ -2376,6 +2380,7 @@
             </div>
             <div class="kup-head-tools">
               <button class="kup-btn" id="kup-update-btn">更新</button>
+              <button class="kup-btn" id="kup-uninstall-btn">卸载</button>
               <button class="kup-btn" id="kup-mute-btn"></button>
               <button class="kup-btn" id="kup-theme-btn">切换主题</button>
               <button class="kup-btn kup-btn-primary" id="kup-refresh-btn">刷新</button>
@@ -2480,6 +2485,7 @@
         probeService();
       };
       modal.querySelector('#kup-update-btn').onclick = kupUpdateClick;
+      modal.querySelector('#kup-uninstall-btn').onclick = kupUninstallClick;
       modal.querySelector('#kup-mute-btn').onclick = kupToggleMute;
       kupMuteRender();
       modal.querySelectorAll('#kup-wave-tabs .kup-tab').forEach(function(t) {
@@ -2650,6 +2656,36 @@
         kupUpdateBadge();
         kmmToast('检查更新失败：后台服务未响应', true);
       });
+  }
+
+  function kupUninstallClick() {
+    if (kupUninstalling) return;
+    if (!confirm('确定卸载 Kimi Code 用量面板？\n\n会打开一个命令行窗口：结束所有插件进程、清理侧边栏注入、删除用量数据目录和插件目录。重启 Kimi Code 后侧栏卡片消失。')) return;
+    kupUninstalling = true;
+    var remote = window.KimiRemoteWidget;
+    if (remote && typeof remote.close === 'function') remote.close();
+    var button = document.getElementById('kup-uninstall-btn');
+    if (button) { button.disabled = true; button.textContent = '卸载中…'; }
+    kapiFetch(API_BASE + '/api/plugin/uninstall', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: true }),
+      cache: 'no-store'
+    }).then(function(r) {
+      return r.json().then(function(d) {
+        if (!r.ok || !d || d.success !== true) {
+          throw new Error((d && d.message) || '卸载脚本启动失败。');
+        }
+        return d;
+      });
+    }).then(function(d) {
+      alert((d && d.message ? d.message : '卸载清理窗口已打开。')
+        + '\n\n请在新打开的窗口中查看进度；结束后重启 Kimi Code。');
+    }).catch(function(e) {
+      kupUninstalling = false;
+      if (button) { button.disabled = false; button.textContent = '卸载'; }
+      alert((e && e.message ? e.message : '卸载失败。') + '\n\n也可以手动运行插件目录下 scripts\\uninstall.cmd。');
+    });
   }
 
   /* ================================================================

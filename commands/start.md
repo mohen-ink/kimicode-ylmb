@@ -5,6 +5,8 @@ description: 启动/自愈 Kimi Code 用量面板后台服务（采集+注入+39
 
 请帮助用户拉起 **Kimi Code 用量面板** 后台服务。
 
+若 `~/.kimi-code/usage-dashboard/plugin-uninstall.json` 存在，说明插件已卸载：不要运行任何启动入口，也不要删除标记复活服务。向用户说明即可；用户想重新启用时，删掉该标记后按正常流程安装/启动。
+
 执行步骤（用 Bash 工具）：
 
 1. 运行插件入口脚本（等价于 hook 触发，幂等）：

@@ -149,6 +149,19 @@ python "%USERPROFILE%\.kimi-code\plugins\managed\kimi-code-usage\scripts\service
 
 **源码安装必须重启服务**：代码在 daemon 启动时装入内存，`/plugins reload`、`/new` 与 hook 心跳不会替换旧进程代码；手机桥运行在独立 worker 进程中，daemon 重启本身不中断已开启的手机连接（同版本 worker 被重连接管），但桥/worker 代码变更须先「停止」手机连接让旧 worker 退出再开启。重启只允许停止执行当前这份 `service.py` 确切绝对路径的 Python 服务；不要从另一份源码副本重启安装目录的服务，否则所有权检查会拒绝。它不应结束主 Kimi app 或其他进程。重启后用 `curl --noproxy '*' -s http://127.0.0.1:39281/api/status` 确认服务版本与 `pid`；若安装的是带本地预览标记的形态，再用 `/api/update/check` 确认 `blocked: true`、`reason: "local_preview"`（发布源码 `3.3.3` 无此标记）。显式「停止」手机连接会撤销隧道与全部已配会话（外网隧道地址作废），需重新开启并让手机重新扫码配对。
 
+## 卸载
+
+点击侧栏卡片标题或「面板」，在面板右上角「更新」旁点击「卸载」。确认后会打开一个命令行窗口显示进度（脚本为 `scripts/uninstall.cmd`，窗口输出为英文），它依次完成：
+
+1. 写入卸载保护标记（`~/.kimi-code/usage-dashboard/plugin-uninstall.json`），阻止会话心跳重新拉起服务；
+2. 按命令行核实并结束全部插件进程：用量 daemon、手机 worker、`usage-dashboard` 下的 cloudflared 连接器；
+3. 清除 `desktop-dist/index.html` 中的注入标签，并删除插件放进 `assets/` 的脚本与样式文件；
+4. 删除 `~/.kimi-code/usage-dashboard` 状态目录（用量历史、模式/中继配置、下载的连接器组件）和插件目录本体。
+
+卸载窗口结束后重启 Kimi Code，侧栏卡片即消失。卸载不依赖官方插件移除流程，也不需要运行中的服务——`uninstall.cmd` 可随时手动双击运行；它通过复制自身到 `%TEMP%` 执行，所以能够删除插件目录自身。
+
+重新启用：删除上述标记文件后按正常方式安装/启动插件即可。
+
 ## 数据与接口
 
 | 位置 | 内容 |
