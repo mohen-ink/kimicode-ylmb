@@ -69,6 +69,14 @@ MAX_HTTP_BODY = 32 * 1024 * 1024
 MAX_WS_MESSAGE = 48 * 1024 * 1024
 HEADER_MAX = 32 * 1024
 RECV_POLL = 0.5              # socket 轮询步长（让 stop 能及时生效）
+# 帧内「无进展」停顿上限：帧一旦开始解析（已消费任意字节），超过此时长
+# 没有任何新字节到达即判连接不可用并拆掉整条隧道——绝不带着半帧缓冲继续
+# 复用。旧实现把 RECV_POLL(0.5s) 当作「整帧截止」，大帧跨过 0.5s 就中途
+# 返回 None，而残留的半帧 payload 被下一次调用当成新帧头解析，帧边界错位，
+# 上层 JSON.parse 遂报「Unterminated string in JSON」。
+# 与 mobile_bridge.WS_FRAME_DEADLINE 同义，但按「无进展」而非「整帧总时长」
+# 计（每收到一块字节即续期），避免大帧在慢链路上被误杀。
+FRAME_STALL = 30.0
 # 发帧超时与读轮询分开：socket 上的超时是【收发共用】的，直接沿用 RECV_POLL
 # 会让超过 0.5s 才发完的帧（3.5MB SPA 主包这类）抛 socket.timeout，send_frame
 # 随即把整条隧道判死 → 手机加载大资源时隧道反复拆建 → 白屏。大帧在公网上
@@ -87,6 +95,14 @@ class RelayAuthError(Exception):
     这是确定性配置错误，重连无意义：区别于超时/断连等瞬时故障，
     触发后应立即 _fail 让桥报「密钥错误」，不进退避重连循环
     （否则用户只能看到「一直正在开启中」直到 RECONNECT_GIVEUP）。"""
+
+
+class FrameError(Exception):
+    """帧已开始却读不完整（停顿/截断/协议违例）：帧边界已被污染。
+
+    此时绝不能继续复用该连接的残留缓冲——那会把上半帧的 payload 字节
+    当成下一帧的帧头，帧边界彻底错位，上层 JSON.parse 遂报
+    「Unterminated string in JSON」。调用方必须丢弃整条连接。"""
 
 
 # ---------------- WebSocket 帧（RFC6455，客户端侧必须掩码） ----------------
@@ -156,9 +172,20 @@ class _WSock:
     def send_json(self, msg):
         return self.send_frame(1, json.dumps(msg, ensure_ascii=False).encode('utf-8'))
 
-    def _recv_n(self, n, deadline):
+    def _recv_n(self, n, stall=None):
+        """读满 n 字节；按「无进展停顿」计时（每收到新字节即续期）。
+
+        返回 bytes；失败返回 None——失败时一并置 alive=False（连接不可复用）。
+        注意：失败时【不清空 rbuf】，由调用方 read_frame 抛 FrameError 让
+        上层丢弃整条连接；绝不让残留半帧字节被当成下一帧的帧头。"""
+        if stall is None:
+            stall = FRAME_STALL           # 每次调用读模块常量，保持可调/可测
+        last = time.monotonic()
         while len(self.rbuf) < n:
-            if not self.alive or time.monotonic() > deadline:
+            if not self.alive:
+                return None
+            if time.monotonic() - last > stall:
+                self.alive = False
                 return None
             try:
                 # 读与写共用一个 socket 超时；发送路径会临时调大它，这里每次
@@ -166,53 +193,84 @@ class _WSock:
                 self._set_timeout(RECV_POLL)
                 chunk = self.sock.recv(min(65536, n - len(self.rbuf)))
             except socket.timeout:
-                continue
+                continue                       # 无进展，等 stall 判死
             except Exception:
+                self.alive = False
                 return None
             if not chunk:
+                self.alive = False
                 return None
             self.rbuf += chunk
+            last = time.monotonic()            # 有进展：续期
         out = bytes(self.rbuf[:n])
         del self.rbuf[:n]
         return out
 
     def read_frame(self, timeout):
-        """读一帧；返回 (fin, opcode, payload) 或 None（断开/违例/超时）。"""
-        deadline = time.monotonic() + timeout
-        head = self._recv_n(2, deadline)
+        """读一帧。
+
+        成功 -> (fin, opcode, payload)
+        帧【尚未开始】且空闲超时 -> None（未消费任何字节，调用方可继续轮询）
+        帧【已开始】却读不完整 / 协议违例 -> FrameError（必须丢弃该连接）
+
+        timeout 仅约束「帧间空闲等待」（轮询唤醒，让 stop 能及时生效）；
+        帧一旦开始解析即改用 FRAME_STALL（无进展停顿上限），故大帧在慢链路
+        上不会被 0.5s 轮询步长误杀，半帧缓冲也绝不会被复用。"""
+        # 1) 帧间空闲等待：只等第一个字节
+        if not self.rbuf:
+            deadline = time.monotonic() + timeout
+            while not self.rbuf:
+                if not self.alive:
+                    return None
+                if time.monotonic() > deadline:
+                    return None                  # 干净的空闲超时
+                try:
+                    self._set_timeout(RECV_POLL)
+                    chunk = self.sock.recv(65536)
+                except socket.timeout:
+                    continue
+                except Exception:
+                    self.alive = False
+                    return None
+                if not chunk:
+                    self.alive = False
+                    return None
+                self.rbuf += chunk
+        # 2) 帧已开始：此后任何不完整都意味着帧边界被污染，丢弃连接
+        head = self._recv_n(2)
         if head is None:
-            return None
+            raise FrameError('帧头不完整')
         b0, b1 = head[0], head[1]
         fin = bool(b0 & 0x80)
         opcode = b0 & 0x0F
         masked = bool(b1 & 0x80)
         if b0 & 0x70 or opcode not in (0, 1, 2, 8, 9, 10):
-            return None
+            raise FrameError('帧头非法 opcode/保留位')
         ln = b1 & 0x7F
         if opcode >= 8 and (not fin or ln > 125):
-            return None
+            raise FrameError('控制帧非法')
         if ln == 126:
-            ext = self._recv_n(2, deadline)
+            ext = self._recv_n(2)
             if ext is None:
-                return None
+                raise FrameError('扩展长度不完整')
             ln = struct.unpack('>H', ext)[0]
         elif ln == 127:
-            ext = self._recv_n(8, deadline)
+            ext = self._recv_n(8)
             if ext is None:
-                return None
+                raise FrameError('扩展长度不完整')
             ln = struct.unpack('>Q', ext)[0]
             if ln < 65536:
-                return None
+                raise FrameError('非最短长度编码')
         if ln > MAX_WS_MESSAGE:
-            return None
+            raise FrameError('帧超长')
         mask = None
         if masked:
-            mask = self._recv_n(4, deadline)
+            mask = self._recv_n(4)
             if mask is None:
-                return None
-        payload = self._recv_n(ln, deadline) if ln else b''
+                raise FrameError('掩码键不完整')
+        payload = self._recv_n(ln) if ln else b''
         if payload is None:
-            return None
+            raise FrameError('payload 不完整')
         if mask is not None:
             payload = bytes(v ^ mask[i % 4] for i, v in enumerate(payload))
         return fin, opcode, payload
@@ -367,13 +425,15 @@ def _pump_ws_to_tunnel(bridge_sock, tun_ws, cid, initial_rest):
     ws.rbuf = bytearray(initial_rest or b'')
     try:
         while tun_ws.alive and ws.alive:
-            frame = ws.read_frame(RECV_POLL)
+            try:
+                frame = ws.read_frame(RECV_POLL)
+            except FrameError:
+                # 帧边界已污染：整条桥连接作废，绝不带着半帧缓冲继续读
+                break
             if frame is None:
                 if not ws.alive or not tun_ws.alive:
                     break
-                # read 超时：只要连接活着就继续（RECV_POLL 是轮询步长）
-                if not tun_ws.alive:
-                    break
+                # 帧间空闲超时：只要连接活着就继续（RECV_POLL 是轮询步长）
                 continue
             fin, opcode, payload = frame
             if opcode == 9:      # 桥 ping → 回 pong（本模块是桥的客户端，帧仍掩码）
@@ -617,7 +677,10 @@ class RelayClient:
         deadline = time.monotonic() + REGISTER_TIMEOUT
         origin = ''
         while time.monotonic() < deadline:
-            frame = ws.read_frame(RECV_POLL)
+            try:
+                frame = ws.read_frame(RECV_POLL)
+            except FrameError:
+                raise OSError('register frame broken')
             if frame is None:
                 if not ws.alive:
                     raise OSError('register read failed')
@@ -661,7 +724,11 @@ class RelayClient:
                 if not ws.send_frame(9, b''):
                     break
                 last_ping = time.monotonic()
-            frame = ws.read_frame(RECV_POLL)
+            try:
+                frame = ws.read_frame(RECV_POLL)
+            except FrameError:
+                # 隧道帧边界污染：断掉本连接，交外层退避重连（新连接新缓冲）
+                break
             if frame is None:
                 if not ws.alive:
                     break
