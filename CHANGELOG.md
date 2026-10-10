@@ -4,6 +4,11 @@
 
 ## 未发布
 
+### 卸载
+- 侧栏面板右上角「更新」旁新增「卸载」按钮。一次确认后打开独立命令行窗口（`scripts/uninstall.cmd`，输出为英文）执行清理：写入 `~/.kimi-code/usage-dashboard/plugin-uninstall.json` 保护标记阻止心跳复活 → 按命令行核实并结束全部插件进程（daemon / 手机 worker / cloudflared 连接器）→ 正则清除 `desktop-dist/index.html` 注入标签并删除注入资产 → 删除 `~/.kimi-code/usage-dashboard` 状态目录与插件目录本体。脚本通过复制自身到 `%TEMP%` 执行，可删除插件目录自身。
+- 卸载不依赖官方插件移除流程，也不需要运行中的服务：`uninstall.cmd` 可随时手动双击运行。`bootstrap.cmd` 与 `need-python.ps1` 在标记存在时直接退出，保证 SessionStart/Heartbeat 不会重新拉起服务或注入。重新启用：删除标记文件后正常安装/启动即可。
+- 新增 `POST /api/plugin/uninstall`（需 `confirm: true`）；daemon 收到请求后弹出清理窗口、detach 手机 worker 并自行退出。
+
 ### 模型与供应商管理
 - 模型列表新增全部/GPT/Claude/Gemini/Qwen/GLM/Deepseek/Kimi/其他筛选，按上游 ID 大小写不敏感匹配；已添加模型放在列表末尾。探测与手动添加自动生成的别名统一使用供应商前缀，上游 ID 和已有别名不改写。
 - 删除按钮位于齿轮打开后的「模型」首页卡片，确认后立即删除并原子保存；新增模型的探测列表不删除已有模型。
