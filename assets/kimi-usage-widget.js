@@ -1214,6 +1214,62 @@
     .kpr-cancel { background: var(--color-surface-sunken, #eef0f2); border: none; color: var(--color-text-secondary, #64748b); }
     .kpr-save { background: var(--color-accent, #1a88ff); border: none; color: #fff; }
     .kpr-reset { background: none; border: none; color: var(--color-text-faint, #94a3b8); margin-right: auto; font-weight: 500; }
+    #ksync-overlay {
+      position: fixed; inset: 0; z-index: 100003;
+      background: rgba(0,0,0,.45); backdrop-filter: blur(3px);
+      display: none; align-items: center; justify-content: center;
+      font-family: system-ui, -apple-system, sans-serif;
+      opacity: 0; transition: opacity 0.17s ease;
+    }
+    #ksync-overlay.visible { display: flex; }
+    #ksync-overlay.ku-anim-in { opacity: 1; }
+    #ksync-overlay.ku-anim-in #ksync-modal {
+      transform: none; opacity: 1;
+      transition: transform 0.18s cubic-bezier(0.25, 0.6, 0.3, 1) 0.02s, opacity 0.15s ease 0.02s;
+    }
+    #ksync-modal {
+      width: 680px; max-height: 88vh; display: flex; flex-direction: column;
+      transform: translateY(10px) scale(0.98); opacity: 0;
+      transition: transform 0.14s ease-in, opacity 0.12s ease-in;
+      background: var(--color-surface-raised, #ffffff);
+      color: var(--color-text, #1f2329);
+      border-radius: 14px; box-shadow: 0 24px 64px rgba(0,0,0,.35);
+      padding: 22px 24px 18px;
+    }
+    #ksync-modal .ksync-kicker { font-size: 11px; letter-spacing: .12em; color: var(--color-text-faint, #94a3b8); font-weight: 600; }
+    #ksync-modal h3 { margin: 4px 0 0; font-size: 18px; font-weight: 700; }
+    .ksync-meta { margin-top: 6px; font-size: 12px; color: var(--color-text-secondary, #64748b); }
+    .ksync-rate { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 12.5px; font-weight: 600; }
+    .ksync-rate input {
+      width: 90px; padding: 6px 10px; font-size: 13px; border-radius: 7px;
+      border: 1px solid color-mix(in srgb, var(--color-text, #000) 16%, transparent);
+      background: var(--color-surface-sunken, #f5f6f7); color: var(--color-text, #1f2329); outline: none;
+    }
+    .ksync-rate button {
+      padding: 6px 14px; border-radius: 7px; font-size: 12.5px; font-weight: 600; cursor: pointer;
+      background: var(--color-surface-sunken, #eef0f2); border: none; color: var(--color-text-secondary, #64748b);
+    }
+    .ksync-rate button:disabled { opacity: .55; cursor: default; }
+    .ksync-list {
+      margin-top: 12px; overflow-y: auto; min-height: 120px; flex: 1;
+      border: 1px solid color-mix(in srgb, var(--color-text, #000) 10%, transparent); border-radius: 10px;
+    }
+    .ksync-row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid color-mix(in srgb, var(--color-text, #000) 6%, transparent); font-size: 12.5px; }
+    .ksync-row:last-child { border-bottom: none; }
+    .ksync-row.unmatched { opacity: .55; }
+    .ksync-row input[type="checkbox"] { width: 15px; height: 15px; flex: none; cursor: pointer; }
+    .ksync-row .ksync-alias { font-weight: 600; min-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ksync-row .ksync-match { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-text-secondary, #64748b); }
+    .ksync-row .ksync-cost { flex: none; font-variant-numeric: tabular-nums; color: var(--color-text-secondary, #64748b); }
+    .ksync-row .ksync-badge { flex: none; font-size: 10.5px; padding: 2px 7px; border-radius: 999px; background: color-mix(in srgb, #16a34a 12%, transparent); color: #16a34a; font-weight: 600; }
+    .ksync-row .ksync-badge.fuzzy { background: color-mix(in srgb, #d97706 12%, transparent); color: #d97706; }
+    .ksync-row .ksync-badge.none { background: color-mix(in srgb, var(--color-text, #000) 8%, transparent); color: var(--color-text-faint, #94a3b8); }
+    .ksync-empty { padding: 28px 16px; text-align: center; font-size: 12.5px; color: var(--color-text-faint, #94a3b8); }
+    .ksync-foot { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; padding-top: 14px; border-top: 1px solid color-mix(in srgb, var(--color-text, #000) 8%, transparent); }
+    .ksync-foot button { padding: 9px 22px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; }
+    .ksync-cancel { background: var(--color-surface-sunken, #eef0f2); border: none; color: var(--color-text-secondary, #64748b); }
+    .ksync-apply { background: var(--color-accent, #1a88ff); border: none; color: #fff; }
+    .ksync-apply:disabled { opacity: .55; cursor: default; }
     body.kud-has-update #kup-update-btn, body.kud-has-update #ku-panel-btn, body.kud-has-update #ku-min-panel-btn { position: relative; }
     body.kud-has-update #kup-update-btn::after, body.kud-has-update #ku-panel-btn::after, body.kud-has-update #ku-min-panel-btn::after {
       content: ''; position: absolute; top: -3px; right: -3px; width: 8px; height: 8px;
@@ -2713,6 +2769,7 @@
           <button class="kmm-tbtn" id="kmm-modal-refresh" title="重新读取 config.toml，不丢弃编辑草稿">刷新</button>
           <button class="kmm-tbtn primary" id="kmm-manager-add">新增模型</button>
           <button class="kmm-tbtn" id="kmm-modal-auto-all" title="为所有模型补全识图 / 思考 / 工具调用能力标签">一键补全能力</button>
+          <button class="kmm-tbtn" id="kmm-sync-prices" title="从 models.dev 拉取公开价格目录，自动匹配并写入按量计价">从 models.dev 同步价格</button>
         </div>
         <div id="kmm-manager-status" role="status" aria-live="polite"></div>
         <div class="kmm-modal-body" id="kmm-modal-cards"></div>
@@ -2753,6 +2810,7 @@
         } else kmmToast(data.message, true);
       } catch (e) { kmmToast('执行失败: 后台服务未响应', true); }
     };
+    $o('kmm-sync-prices').onclick = function() { ksyncOpen(); };
     return overlay;
   }
 
@@ -2765,6 +2823,7 @@
   var kmmBatch = null;
   var kmmEditorReloading = false;
   var kmmDeleting = null;
+  var kmmSyncBusy = false;
   var kmmDefaultEfforts = ['low', 'medium', 'high', 'xhigh', 'max'];
 
   function kmmEl(id) { return kmmOverlayEl && kmmOverlayEl.querySelector('#' + id); }
@@ -2860,6 +2919,9 @@
     add.disabled = busy || !kmmManagerWritable();
     kmmEl('kmm-modal-auto-all').hidden = kmmManagerTab !== 'models';
     kmmEl('kmm-modal-auto-all').disabled = busy || !apiAlive || !kmmManagerWritable();
+    var syncBtn = kmmEl('kmm-sync-prices');
+    syncBtn.hidden = kmmManagerTab !== 'models';
+    syncBtn.disabled = busy || !apiAlive || kmmSyncBusy;
     kmmEl('kmm-modal-filter').placeholder = kmmManagerTab === 'providers' ? '搜索供应商、类型…' : '搜索模型、渠道…';
     var status = kmmEl('kmm-manager-status');
     status.textContent = kmmDeleting ? '正在删除模型，请勿重复提交、编辑或关闭。' : kmmManagerMessage;
@@ -4375,6 +4437,141 @@
         kmmRefreshAll();
       } else kmmToast(data.message || '保存失败', true);
     }).catch(function() { kmmToast('保存失败: 后台服务未响应', true); });
+  }
+
+  /* ================================================================
+   * models.dev 价格同步弹窗（ksync- 前缀）
+   * ================================================================ */
+  var ksyncOverlayEl = null;
+  var ksyncRows = [];
+
+  function ksyncEnsureOverlay() {
+    if (ksyncOverlayEl) return ksyncOverlayEl;
+    var o = document.createElement('div');
+    o.id = 'ksync-overlay';
+    o.innerHTML = `
+      <div id="ksync-modal">
+        <div class="ksync-kicker">MODELS.DEV PRICING</div>
+        <h3>从 models.dev 同步价格</h3>
+        <div class="ksync-meta" id="ksync-meta">正在拉取 models.dev 目录并匹配本机模型…</div>
+        <div class="ksync-rate">
+          <span>汇率 USD→CNY</span>
+          <input id="ksync-rate" type="number" min="0.01" step="any" value="7.1">
+          <button id="ksync-rematch">重新匹配</button>
+          <span class="ksync-hint" style="font-weight:400;color:var(--color-text-faint,#94a3b8);">改汇率后点「重新匹配」重算价格</span>
+        </div>
+        <div class="ksync-list" id="ksync-list"></div>
+        <div class="ksync-foot">
+          <button class="ksync-cancel" id="ksync-cancel">取消</button>
+          <button class="ksync-apply" id="ksync-apply" disabled>写入选中价格</button>
+        </div>
+      </div>`;
+    document.body.appendChild(o);
+    ksyncOverlayEl = o;
+    o.querySelector('#ksync-cancel').onclick = function() { kuLayerHide(o, 'visible'); };
+    o.onclick = function(e) { if (e.target === o) kuLayerHide(o, 'visible'); };
+    o.addEventListener('keydown', function(e) { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); kuLayerHide(o, 'visible'); } });
+    o.querySelector('#ksync-rematch').onclick = function() {
+      var rate = parseFloat(o.querySelector('#ksync-rate').value);
+      if (!(rate > 0)) { kmmToast('汇率需大于 0', true); return; }
+      ksyncLoad(rate);
+    };
+    o.querySelector('#ksync-apply').onclick = ksyncApply;
+    return o;
+  }
+
+  function ksyncRenderList() {
+    var o = ksyncOverlayEl;
+    var list = o.querySelector('#ksync-list');
+    if (!ksyncRows.length) {
+      list.innerHTML = '<div class="ksync-empty">没有可匹配的模型（先在 config.toml 中配置模型）</div>';
+      o.querySelector('#ksync-apply').disabled = true;
+      return;
+    }
+    list.innerHTML = ksyncRows.map(function(r, i) {
+      var badge = r.matched_id
+        ? '<span class="ksync-badge' + (r.exact ? '' : ' fuzzy') + '">' + (r.exact ? '精确' : '模糊 ' + Math.round(r.score * 100) + '%') + '</span>'
+        : '<span class="ksync-badge none">未匹配</span>';
+      var match = r.matched_id ? (r.provider + ' / ' + r.matched_id) : '目录中没有相似模型';
+      var cost = r.cost ? ('¥' + r.cost.input + ' / ¥' + r.cost.output + ' / ¥' + r.cost.cache_hit) : '—';
+      var row = '<label class="ksync-row' + (r.matched_id ? '' : ' unmatched') + '">'
+        + '<input type="checkbox" data-i="' + i + '"' + (r.selected ? ' checked' : '') + (r.matched_id ? '' : ' disabled') + '>'
+        + '<span class="ksync-alias" title="' + r.alias.replace(/"/g, '&quot;') + '">' + r.alias + '</span>'
+        + badge
+        + '<span class="ksync-match" title="' + match.replace(/"/g, '&quot;') + '">' + match + '</span>'
+        + '<span class="ksync-cost" title="输入 / 输出 / 缓存命中（¥ per 1M）">' + cost + '</span>'
+        + '</label>';
+      return row;
+    }).join('');
+    list.querySelectorAll('input[type="checkbox"]').forEach(function(cb) {
+      cb.onchange = function() {
+        ksyncRows[parseInt(cb.getAttribute('data-i'), 10)].selected = cb.checked;
+        ksyncUpdateApply();
+      };
+    });
+    ksyncUpdateApply();
+  }
+
+  function ksyncUpdateApply() {
+    var n = ksyncRows.filter(function(r) { return r.selected && r.matched_id; }).length;
+    var apply = ksyncOverlayEl.querySelector('#ksync-apply');
+    apply.disabled = n === 0;
+    apply.textContent = n ? '写入选中价格（' + n + '）' : '写入选中价格';
+  }
+
+  function ksyncLoad(rate) {
+    var o = ksyncOverlayEl;
+    var apply = o.querySelector('#ksync-apply');
+    apply.disabled = true;
+    o.querySelector('#ksync-rematch').disabled = true;
+    o.querySelector('#ksync-list').innerHTML = '<div class="ksync-empty">正在' + (rate ? '按汇率 ' + rate + ' 重新匹配' : '拉取 models.dev 目录并匹配本机模型') + '…</div>';
+    kapiFetch(`${API_BASE}/api/models-dev/match`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(rate ? { rate: rate } : {})
+    }).then(function(r) { return r.json(); }).then(function(data) {
+      o.querySelector('#ksync-rematch').disabled = false;
+      if (!data.success) { o.querySelector('#ksync-list').innerHTML = '<div class="ksync-empty">' + (data.message || '匹配失败') + '</div>'; return; }
+      ksyncRows = (data.rows || []).map(function(r) { r.selected = !!r.matched_id; return r; });
+      o.querySelector('#ksync-meta').textContent = '目录含 ' + data.providers + ' 个供应商 / ' + data.models + ' 个带价模型，本机 ' + ksyncRows.length + ' 个模型，'
+        + ksyncRows.filter(function(r) { return r.matched_id; }).length + ' 个匹配成功'
+        + (data.from_cache ? '（目录来自缓存）' : '');
+      ksyncRenderList();
+    }).catch(function() {
+      o.querySelector('#ksync-rematch').disabled = false;
+      o.querySelector('#ksync-list').innerHTML = '<div class="ksync-empty">拉取失败: 后台服务未响应</div>';
+    });
+  }
+
+  function ksyncOpen() {
+    if (kmmDraft || kmmBatch) { kmmToast('请先保存或取消编辑中的草稿'); return; }
+    if (!apiAlive) { kmmToast('后台服务离线，无法同步', true); return; }
+    ksyncEnsureOverlay();
+    ksyncRows = [];
+    ksyncOverlayEl.querySelector('#ksync-rate').value = 7.1;
+    kuLayerShow(ksyncOverlayEl, 'visible');
+    ksyncLoad(0);
+  }
+
+  function ksyncApply() {
+    var o = ksyncOverlayEl;
+    var rows = ksyncRows.filter(function(r) { return r.selected && r.matched_id; })
+      .map(function(r) { return { alias: r.alias, selected: true, cost: r.cost }; });
+    if (!rows.length) return;
+    var apply = o.querySelector('#ksync-apply');
+    apply.disabled = true;
+    kapiFetch(`${API_BASE}/api/models-dev/apply`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rows: rows })
+    }).then(function(r) { return r.json(); }).then(function(data) {
+      apply.disabled = false;
+      if (data.success) {
+        kmmToast(data.message || '价格已写入');
+        kuLayerHide(o, 'visible');
+        kmmRefreshAll();
+      } else kmmToast(data.message || '写入失败', true);
+    }).catch(function() { apply.disabled = false; kmmToast('写入失败: 后台服务未响应', true); });
   }
 
   /* ================================================================

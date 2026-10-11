@@ -160,6 +160,7 @@ import scanner  # noqa: E402
 import relay_config  # noqa: E402
 import model_manager  # noqa: E402
 import model_catalog  # noqa: E402
+import models_dev  # noqa: E402
 
 CONFIG_LOCK = threading.RLock()
 CONFIG_CONFLICT = '配置已被其他操作更改，请刷新后重试'
@@ -3001,6 +3002,33 @@ class Handler(BaseHTTPRequestHandler):
                 save_pricing(alias, entry)
                 collect_once()
                 return self._json({'success': True, 'message': '%s 按量计价已保存' % alias})
+
+            if path == '/api/models-dev/match':
+                try:
+                    rate = float(req.get('rate')) if req.get('rate') is not None else None
+                except (TypeError, ValueError):
+                    return self._json({'success': False, 'message': 'rate 必须是数字'}, 400)
+                try:
+                    result = models_dev.models_dev_match(get_models_data()['models'], rate)
+                except Exception as error:
+                    return self._json({'success': False,
+                                       'message': '拉取 models.dev 目录失败: %s' % error}, 502)
+                return self._json({'success': True, **result})
+
+            if path == '/api/models-dev/apply':
+                rows = req.get('rows')
+                if not isinstance(rows, list) or not rows:
+                    return self._json({'success': False, 'message': 'rows 需为非空数组'}, 400)
+                try:
+                    delta, changed = models_dev.models_dev_apply(rows, load_pricing())
+                    if delta:
+                        models_dev.models_dev_save(delta, save_pricing)
+                        collect_once()
+                except Exception as error:
+                    return self._json({'success': False, 'message': '写入失败: %s' % error}, 500)
+                return self._json({'success': True, 'changed': changed,
+                                   'message': ('已写入 %d 个模型价格' % len(changed)) if changed
+                                              else '没有可写入的模型（按次计价的已跳过）'})
 
             if path == '/api/issue-action':
                 action = req.get('action', '')
