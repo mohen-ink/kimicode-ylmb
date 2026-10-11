@@ -545,7 +545,7 @@ _NEEDPY_INJECT_RE = re.compile(r'\s*<script src="/assets/kimi-usage-needpy\.js[^
 # 远程控制可选资产的托管注入标签（点名清理，不碰任何其他 script 标签）：
 # 源文件被移除/未发布时旧标签必须一并摘掉，避免 404 脚本残留
 _REMOTE_INJECT_RE = re.compile(
-    r'\s*<script src="/assets/(?:vendor/qrcodegen|kimi-remote-(?:qr|api|widget)|kimi-mobile-api)\.js[^"]*"></script>\s*')
+    r'\s*<script src="/assets/(?:vendor/qrcodegen|kimi-remote-(?:qr|api|widget)|kimi-mobile-api|kimi-model-tabs)\.js[^"]*"></script>\s*')
 
 
 def strip_legacy_injections():
@@ -566,6 +566,13 @@ def _widget_tag():
     用文件内容 digest 而非 mtime：同一秒内改内容版本号也会变，防同秒旧缓存。"""
     return '<script src="/assets/kimi-usage-widget.js?v=%s"></script>' % (
         _file_digest(WIDGET_SRC) or '0')
+
+
+def _model_tabs_tag():
+    """模型选择增强（provider 标签条）注入标签，版本号规则同 _widget_tag。"""
+    src = os.path.join(ASSETS_SRC, 'kimi-model-tabs.js')
+    return '<script src="/assets/kimi-model-tabs.js?v=%s"></script>' % (
+        _file_digest(src) or '0')
 
 
 def _remote_tags():
@@ -596,7 +603,7 @@ def ensure_injection():
                   _REMOTE_INJECT_RE.sub('\n',
                   _LEGACY_ROOT_INJECT_RE.sub('\n', _INJECT_RE.sub('\n', html))))
         data_tag = '<script src="/assets/kimi-usage-data.js"></script>'
-        tags = [data_tag] + _remote_tags() + [_widget_tag()]
+        tags = [data_tag] + _remote_tags() + [_model_tabs_tag(), _widget_tag()]
         block = ''.join('  %s\n' % t for t in tags)
         if '</body>' in new_html:
             new_html = new_html.replace('</body>', block + '  </body>')
@@ -621,7 +628,7 @@ def sync_widget_asset():
             shutil.copy2(WIDGET_SRC, dest)
     except Exception:
         pass
-    for rel in REMOTE_ASSETS + REMOTE_STYLE_ASSETS:
+    for rel in REMOTE_ASSETS + REMOTE_STYLE_ASSETS + ('kimi-model-tabs.js',):
         src = os.path.join(ASSETS_SRC, rel.replace('/', os.sep))
         if not os.path.exists(src):
             continue                # 可选资产未发布：跳过，不影响既有功能
