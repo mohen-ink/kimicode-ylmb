@@ -2,6 +2,21 @@
 
 > 格式说明：每个版本以 `## vX.Y.Z · 发布日期` 开头；`###` 为分组标题，`-` 为条目。面板里的「发现新版本」弹窗会读取最新版本这一节。
 
+## v3.4.5 · 2026-10-12
+
+### 新增：发送框模型菜单接管 + 供应商标签条
+- 新增 `assets/kimi-model-tabs.js`：接管发送框 `.model-pill` 点击，用页面内自绘面板替换官方 overlay 小菜单，顶部增加供应商标签条（无「全部」，初始定位当前模型的供应商），其余布局/样式/图标逐条移植官方产物（ui-menu-item、ui-seg--xs、ri-star、kimi-check）。
+- 行为全部走官方运行时：切模型走 Pinia kimi.sessions 乐观更新 + `api.updateSession` 持久化 + 失败回滚 + 默认模型联动；思考档位走 kimi.mode store；收藏走官方 toggleStarModel（localStorage 持久化不变）。
+- 安全阀：Pinia/api/store 结构任一不满足时静默放行原生菜单。
+- `service.py`：同步资产到 desktop-dist、注入标签（内容摘要版本号）、纳入自愈看护与 widget_digest 指纹。
+
+### 新增：codex 风格思考滑条
+- 发送框模型菜单的思考强度行改用官方滑轨（es slider 移植），占满行宽，视觉对齐 codex 风格。
+
+### 修复：模型菜单定位对齐官方
+- 菜单定位只在打开时做一次：记录 pill 快照（底边贴 pill 顶边、右对齐 pill 右缘），此后换档重建只重画内容，不再重新测量/重算位置。
+- 页面滚动直接关闭面板（对齐官方 scroll → close 行为）。
+
 ## v3.4.4 · 2026-10-12
 
 ### 新增：从 models.dev 一键同步官方模型价格
