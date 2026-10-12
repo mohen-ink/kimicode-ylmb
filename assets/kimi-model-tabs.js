@@ -181,6 +181,162 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /* 思考档位滑轨（es- 交互逻辑移植自官方滑轨 demo，档位动态适配模型）      */
+  /* ------------------------------------------------------------------ */
+
+  function buildEffortSlider(rt, model, choices, onChange) {
+    var count = choices.length;
+    var index = Math.max(0, choices.indexOf(currentEffort(rt, model)));
+    if (index < 0) index = 0;
+    var dragging = false, hovered = -1;
+
+    var rail = document.createElement('div');
+    rail.className = 'kmt-rail';
+    rail.setAttribute('role', 'slider');
+    rail.setAttribute('tabindex', '0');
+    rail.setAttribute('aria-valuemin', '0');
+    rail.setAttribute('aria-valuemax', String(count - 1));
+    rail.setAttribute('aria-label', '思考档位');
+    rail.innerHTML =
+      '<div class="es-fill"></div>' +
+      '<div class="es-sparks"><canvas class="es-particles"></canvas></div>' +
+      '<div class="es-knob"></div>' +
+      '<canvas class="es-burst" width="96" height="96"></canvas>';
+
+    // 档位圆点
+    for (var i = 0; i < count; i++) {
+      var dot = document.createElement('i');
+      dot.className = 'es-dot';
+      dot.style.setProperty('--es-tick', String(i / (count - 1)));
+      rail.insertBefore(dot, rail.querySelector('.es-sparks'));
+    }
+    var dots = rail.querySelectorAll('.es-dot');
+
+    function ultra() { return index === count - 1 && effortLabel(choices[count - 1]).toLowerCase() === 'max'; }
+    function render() {
+      rail.classList.toggle('ultra', ultra());
+      rail.style.setProperty('--es-pos', String(index / (count - 1)));
+      rail.setAttribute('aria-valuenow', String(index));
+    }
+    function renderDots() {
+      dots.forEach(function (dot, i) {
+        dot.className = 'es-dot'
+          + (i <= index ? ' passed' : '') + (i < index ? ' covered' : '') + (hovered === i ? ' hovered' : '');
+      });
+    }
+    function nearest(e) {
+      var box = rail.getBoundingClientRect();
+      return Math.round(Math.max(0, Math.min(1, (e.clientX - box.left - 12) / (box.width - 24))) * (count - 1));
+    }
+    function apply(i) {
+      var before = index;
+      index = Math.max(0, Math.min(count - 1, i));
+      if (index === count - 1 && before !== count - 1) armBurst();
+      else if (index !== count - 1) { burstTimers.forEach(clearTimeout); motion.burst = 0; }
+      setEffort(rt, model, choices[index]);
+      render(); renderDots();
+    }
+    rail.addEventListener('pointerdown', function (e) {
+      rail.setPointerCapture(e.pointerId);
+      dragging = true; hovered = -1;
+      apply(nearest(e));
+    });
+    rail.addEventListener('pointermove', function (e) {
+      if (dragging) apply(nearest(e));
+      else {
+        var i = nearest(e), box = rail.getBoundingClientRect();
+        var tickX = box.left + 12 + i / (count - 1) * (box.width - 24);
+        setHovered(Math.abs(e.clientX - tickX) < 10 && i !== index ? i : -1);
+      }
+    });
+    rail.addEventListener('pointerup', function () {
+      if (dragging) { dragging = false; onChange(); }
+    });
+    rail.addEventListener('pointercancel', cancelDrag);
+    rail.addEventListener('lostpointercapture', cancelDrag);
+    rail.addEventListener('pointerleave', function () { setHovered(-1); });
+    function cancelDrag() {
+      if (!dragging) return;
+      dragging = false;
+      motion.burst = 0;
+      render(); renderDots(); onChange();
+    }
+    rail.addEventListener('keydown', function (e) {
+      var next = index;
+      if (e.key === 'ArrowRight' || e.key === 'ArrowUp') next++;
+      else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') next--;
+      else if (e.key === 'Home') next = 0;
+      else if (e.key === 'End') next = count - 1;
+      else return;
+      e.preventDefault();
+      apply(Math.max(0, Math.min(count - 1, next)));
+      onChange();
+    });
+    function setHovered(i) { if (i !== hovered) { hovered = i; renderDots(); } }
+
+    // Ultra 进入：延迟 220ms 记录 burst 时间戳（demo 原样）
+    var burstTimers = [];
+    var motion = { speed: 0, from: 0, target: 0, changedAt: 0, burst: 0 };
+    function armBurst() {
+      burstTimers.forEach(clearTimeout);
+      burstTimers.push(setTimeout(function () { motion.burst = performance.now(); }, 220));
+    }
+
+    // 粒子循环：单例 rAF，面板关闭时自然停画（rail 脱离 DOM 后 clearRect 无害）
+    var particleSeeds = [[17,15],[20,12],[28,18],[48,21],[69,23],[95,15],[112,20],
+      [134,15],[138,24],[150,9],[165,20],[177,10],[190,22],[198,26],[217,15],
+      [237,18],[254,12],[275,24],[290,14],[315,20]];
+    var sparks = rail.querySelector('.es-particles');
+    var burst = rail.querySelector('.es-burst');
+    var ctx = sparks.getContext('2d'), bctx = burst.getContext('2d');
+    sparks.width = 720; sparks.height = 44;
+    var last = 0;
+    function draw(time) {
+      if (!rail.isConnected) { return; }               // 面板重建后旧循环自动退出
+      var delta = last ? Math.min(time - last, 50) / 1000 : 0;
+      last = time;
+      var isUltra = rail.classList.contains('ultra');
+      var target = isUltra ? 1 : 0;
+      if (target !== motion.target) { motion.from = motion.speed; motion.target = target; motion.changedAt = time; }
+      var p = Math.min(1, Math.max(0, (time - motion.changedAt) / (motion.target ? 600 : 750)));
+      motion.speed = motion.from + (motion.target - motion.from) * p * p * (3 - 2 * p);
+      var width = rail.offsetWidth || 180;
+      if (isUltra) rail.__travel = (rail.__travel || 0) + delta * motion.speed;
+
+      ctx.clearRect(0, 0, sparks.width, sparks.height);
+      bctx.clearRect(0, 0, 96, 96);
+      var t = time / 1000, speed = isUltra ? motion.speed : 0;
+      particleSeeds.forEach(function (seed, i) {
+        var px = seed[0], py = seed[1];
+        var phase = i * 2.39;
+        var offset = isUltra ? (rail.__travel || 0) * (145 + i % 6 * 17) : 0;
+        var x = ((px / 346 * width - offset + Math.sin(t * 9 + phase) * .7 * (1 - speed)) % width + width) % width;
+        var y = (py + Math.cos(t * 10 + phase) * .55 * (1 - speed) + Math.sin(t * 1.3 + phase) * .8 * speed) * 22 / 36;
+        var idle = .55 + .3 * (.5 + .5 * Math.sin(t * 1.1 + phase));
+        var moving = .3 + .45 * (.5 + .5 * Math.sin(t * 2.4 + phase));
+        var radius = (i % 7 === 0 ? 2.1 : i % 4 === 0 ? 1.55 : 1.1) * 22 / 36;
+        ctx.beginPath(); ctx.arc(x * 2, y * 2, radius * 2, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255,255,255,' + (idle + (moving - idle) * speed) + ')'; ctx.fill();
+      });
+      if (motion.burst && time - motion.burst < 520) {
+        var age = (time - motion.burst) / 1000;
+        for (var j = 0; j < 22; j++) {
+          var angle = j * 2.399 + .18;
+          var bx = 48 + Math.cos(angle) * (28 + (32 + j % 5 * 8) * age * 2);
+          var by = 48 + Math.sin(angle) * (28 + (32 + j % 4 * 7) * age * 2);
+          bctx.beginPath(); bctx.arc(bx, by, (j % 6 === 0 ? 2.3 : 1.35) * 2 * (1 - age), 0, Math.PI * 2);
+          bctx.fillStyle = 'rgba(165,107,233,' + (.7 * (1 - age / .52)) + ')'; bctx.fill();
+        }
+      }
+      requestAnimationFrame(draw);
+    }
+    requestAnimationFrame(draw);
+
+    render(); renderDots();
+    return rail;
+  }
+
+  /* ------------------------------------------------------------------ */
   /* 面板 UI                                                             */
   /* ------------------------------------------------------------------ */
 
@@ -225,7 +381,7 @@
     '.kmt-star.kmt-on{color:var(--color-warning,#a9610a)}',
     '.kmt-star:hover{color:var(--color-text,#fff)}',
     /* 思考行：overlay-menu-choices + ui-seg--xs 原样 */
-    '.kmt-think{display:flex;align-items:center;flex-wrap:wrap;gap:var(--space-2,8px) 1rem;padding:var(--space-1,4px) var(--menu-item-padding-inline,9px)}',
+    '.kmt-think{display:flex;align-items:center;gap:var(--space-3,12px);padding:var(--space-2,8px) var(--menu-item-padding-inline,9px)}',
     '.kmt-think-label{display:inline-flex;align-items:center;gap:var(--space-2,8px);font-size:var(--text-sm,13px);',
     'font-weight:var(--weight-option-label,475);line-height:var(--leading-tight,1.25)}',
     '.kmt-chips{position:relative;display:inline-flex;gap:2px;padding:2px;background:var(--color-surface-sunken,#121212);',
@@ -236,11 +392,31 @@
     '.kmt-chip:hover{color:var(--color-text,#fff)}',
     '.kmt-chip.kmt-active{color:var(--color-text,#fff);background:var(--color-surface-raised,#2c2c2c);box-shadow:var(--shadow-sm,0 1px 2px rgba(0,0,0,.22))}',
     '.kmt-chip:focus-visible{outline:none;box-shadow:var(--p-focus-ring,0 0 0 2px rgba(23,131,255,.5))}',
+    /* 分隔线：ui-menu-sep 原样 */
+    '.kmt-sep{height:1px;margin:4px 0;background:var(--color-line,rgba(255,255,255,.1));flex:none}',
+    /* 思考滑轨：es- 前缀样式来自官方 client.js 提取的滑轨 demo，参数未改动。
+       尺寸适配菜单：轨道宽 180px 高 22px，knob 24px，left/width 公式里 30→24、15→12 同步换算 */
+    '.kmt-rail{position:relative;flex:1;height:22px;border-radius:14px;background:var(--color-hover,rgba(255,255,255,.12));touch-action:none;cursor:pointer;outline:none}',
+    '.kmt-rail:focus-visible{outline:2px solid var(--color-accent,#1783ff);outline-offset:2px}',
+    '.kmt-rail .es-fill,.kmt-rail .es-sparks{position:absolute;inset:0 auto 0 0;width:calc((100% - 24px)*var(--es-pos,0) + 12px);border-radius:11px 0 0 11px;overflow:hidden;pointer-events:none;transition:width .18s cubic-bezier(.2,.8,.2,1)}',
+    '.kmt-rail .es-fill{background:var(--color-accent,#1783ff)}',
+    '.kmt-rail.ultra .es-fill{background:linear-gradient(95deg,#3065de 0%,#7757ee 32%,#b052f1 53%,#7d42e7 76%,#5631d0 100%);background-size:155% 100%;animation:es-colorflow 3.8s ease-in-out infinite alternate}',
+    '.kmt-rail.ultra .es-fill:before{content:"";position:absolute;inset:-10px -40px;background:linear-gradient(100deg,transparent 18%,#ffffff08 35%,#ffffff30 48%,#ffffff06 66%,transparent 84%);animation:es-shimmer 4.5s ease-in-out infinite alternate}',
+    '@keyframes es-colorflow{from{background-position:0 0}to{background-position:100% 0}}',
+    '@keyframes es-shimmer{from{transform:translateX(-45%)}to{transform:translateX(45%)}}',
+    '.kmt-rail .es-dot{position:absolute;top:9px;left:calc((100% - 24px)*var(--es-tick) + 12px);width:4px;height:4px;margin-left:-2px;border-radius:50%;background:var(--color-text-faint,#9a9aa2);pointer-events:none;transition:opacity .18s ease .22s,transform .14s ease}',
+    '.kmt-rail .es-dot.passed{background:#ffffff65}',
+    '.kmt-rail .es-dot.hovered{transform:scale(1.75)}',
+    '.kmt-rail.ultra .es-dot{opacity:0;transition-delay:0s}',
+    '.kmt-rail .es-sparks{opacity:0;transition:width .18s cubic-bezier(.2,.8,.2,1),opacity .25s ease}',
+    '.kmt-rail.ultra .es-sparks{opacity:1}',
+    '.kmt-rail .es-particles{display:block;width:100%;height:22px}',
+    '.kmt-rail .es-knob{position:absolute;left:calc((100% - 24px)*var(--es-pos,0));top:-1px;width:24px;height:24px;border-radius:50%;',
+    'background:var(--color-surface-raised,#232327);box-shadow:var(--shadow-sm,0 4px 12px #00000090);border:.5px solid var(--color-line,#ffffff26);pointer-events:none;transition:left .18s cubic-bezier(.2,.8,.2,1)}',
+    '.kmt-rail .es-burst{position:absolute;right:-14px;top:-13px;width:40px;height:40px;pointer-events:none;z-index:4}',
     /* 提示语：overlay-menu-copy 原样 */
     '.kmt-foot{padding:var(--space-2,8px) var(--menu-item-padding-inline,9px);color:var(--color-text-muted,#999);',
-    'font-size:var(--text-sm,13px);line-height:var(--leading-normal,1.5);white-space:normal}',
-    /* 分隔线：ui-menu-sep 原样 */
-    '.kmt-sep{height:1px;margin:4px 0;background:var(--color-line,rgba(255,255,255,.1));flex:none}'
+    'font-size:var(--text-sm,13px);line-height:var(--leading-normal,1.5);white-space:normal}'
   ].join('');
 
   function ensurePanel() {
@@ -345,7 +521,7 @@
       list.appendChild(row);
     });
 
-    // body：思考档位行（官方 overlay-menu-choices 结构）+ 分隔线 + 缓存提示
+    // body：思考档位行（滑轨）+ 分隔线 + 缓存提示
     var body = panel.querySelector('.kmt-body');
     body.textContent = '';
     var sep1 = document.createElement('div');
@@ -354,28 +530,14 @@
     var refModel = curModel || (shown[0] || null);
     var choices = refModel ? effortChoices(refModel) : [];
     if (refModel && choices.length > 1 && thinkingMode(refModel) !== 'unsupported') {
-      // 官方结构：.overlay-menu-choices > span.choice-label + .ui-seg.ui-seg--xs > button.ui-seg__item
       var think = document.createElement('div');
       think.className = 'kmt-think';
       var lb = document.createElement('span');
       lb.className = 'kmt-think-label';
       lb.textContent = '思考';
       think.appendChild(lb);
-      var seg = document.createElement('span');
-      seg.className = 'kmt-chips';
-      var curEff = currentEffort(rt, refModel);
-      choices.forEach(function (v) {
-        var c = document.createElement('button');
-        c.type = 'button';
-        c.className = 'kmt-chip' + (curEff === v ? ' kmt-active' : '');
-        c.textContent = effortLabel(v);
-        c.addEventListener('click', function () {
-          setEffort(rt, refModel, v);
-          renderPanel(rt, anchor);
-        });
-        seg.appendChild(c);
-      });
-      think.appendChild(seg);
+      var slider = buildEffortSlider(rt, refModel, choices, function () { renderPanel(rt, anchor); });
+      think.appendChild(slider);
       body.appendChild(think);
     } else if (refModel) {
       var note1 = document.createElement('div');
@@ -394,22 +556,26 @@
     foot.textContent = CACHE_NOTE;
     body.appendChild(foot);
 
-    // 定位：底边贴住锚点顶边（bottom 锚定，高度变化不动底边）
     panel.classList.add('kmt-open');
-    var r = anchor.getBoundingClientRect();
-    panel.style.top = 'auto';
-    panel.style.bottom = Math.max(8, window.innerHeight - r.top + 6) + 'px';
-    var left = r.right - panel.offsetWidth;
-    panel.style.left = Math.max(8, left) + 'px';
+    // 官方语义：锚点是打开时的快照，刷新（换档重建）只重画内容，
+    // 绝不重新测量/重算位置。定位只在 openPanel 里做一次。
   }
 
+  // 官方行为对齐：位置 = 打开时对 pill 的快照（底边贴 pill 顶边、右对齐 pill
+  // 右缘），此后换档/重建都不动；页面滚动则直接关闭（官方 y(): scroll → R()）。
   function openPanel(rt, anchor) {
     var panel = ensurePanel();
     panel.__state.tab = null;   // 每次打开重置到当前模型的供应商
     renderPanel(rt, anchor);
+    panel.classList.add('kmt-open');
+    var r = anchor.getBoundingClientRect();
+    panel.__anchor = { top: r.top, right: r.right, innerH: window.innerHeight, innerW: window.innerWidth };
+    panel.style.top = 'auto';
+    panel.style.bottom = Math.max(8, window.innerHeight - r.top + 6) + 'px';
+    panel.style.left = Math.max(8, r.right - panel.offsetWidth) + 'px';
   }
 
-  // 外点 / 失焦 / 缩放关闭
+  // 外点 / 失焦 / 缩放关闭；页面滚动关闭（对齐官方 y(): scroll → R()）
   document.addEventListener('mousedown', function (e) {
     if (!panelOpen()) return;
     if (e.target.closest && e.target.closest('.kmt-panel')) return;
@@ -417,6 +583,7 @@
   }, true);
   window.addEventListener('blur', closePanel);
   window.addEventListener('resize', closePanel);
+  window.addEventListener('scroll', closePanel, true);
 
   /* ------------------------------------------------------------------ */
   /* 入口劫持                                                            */
