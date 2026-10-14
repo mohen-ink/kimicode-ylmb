@@ -12,7 +12,7 @@
 2. 在输入框粘贴本仓库地址：
 
    ```text
-   https://github.com/ziyiclouds-blip/kimicode-ylmb
+   https://github.com/mohen-ink/kimicode-ylmb
    ```
 
 3. 确认后等待安装完成，侧栏即出现「Kimi Code 用量」卡片。

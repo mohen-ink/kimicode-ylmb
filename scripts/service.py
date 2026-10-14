@@ -70,7 +70,7 @@ UNINSTALL_BEGIN = threading.Event()
 _UNINSTALL_EXIT = threading.Event()
 
 # 自更新源：GitHub 仓库（改源只需改 UPDATE_REPO）
-UPDATE_REPO = 'ziyiclouds-blip/kimicode-ylmb'
+UPDATE_REPO = 'mohen-ink/kimicode-ylmb'
 UPDATE_BRANCH = 'main'
 # 走 api.github.com 读清单：raw.* 按分支缓存较久，刚发布时容易拿到旧版本号
 UPDATE_MANIFEST_URL = ('https://api.github.com/repos/%s/contents/kimi.plugin.json?ref=%s'
