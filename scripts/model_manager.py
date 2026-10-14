@@ -236,7 +236,7 @@ def _validate_updates(model, updates):
     if not isinstance(updates, dict) or not updates or set(updates) - set(MODEL_FIELDS):
         raise ConfigError('不支持的模型更新字段')
     for key, value in updates.items():
-        if key == 'default_effort' and value is None:
+        if key in ('default_effort', 'display_name') and value is None:
             continue
         kind = MODEL_FIELDS[key]
         if kind is int:
@@ -290,7 +290,7 @@ def _update_model_data(data, alias, updates):
             overrides[key] = value
         else:
             top[key] = value
-        if key == 'default_effort' and value is None:
+        if key in ('default_effort', 'display_name') and value is None:
             if key in model:
                 top[key] = None
             if key in model.get('overrides', {}):
@@ -323,9 +323,11 @@ def _upsert_model_data(data, original_alias, item, set_default=False):
         if alias not in models:
             raise ConfigError('原模型不存在')
     changes = copy.deepcopy({key: item[key] for key in MODEL_FIELDS if key in item})
-    for key in ('provider', 'model', 'display_name', 'max_context_size', 'support_efforts', 'default_effort'):
+    for key in ('provider', 'model', 'max_context_size', 'support_efforts', 'default_effort'):
         if key not in changes:
             raise ConfigError('缺少模型字段：' + key)
+    if not changes.get('display_name'):
+        changes['display_name'] = None
     changes.setdefault('capabilities', [])
     if changes['default_effort'] is not None and not changes['support_efforts']:
         raise ConfigError('默认思考强度必须在非空的支持档位列表中')
@@ -420,7 +422,7 @@ def batch_models(content, provider, upserts, removes, references=None):
     removed = _array(removes, 'removes')
     protected = deletion_reasons(data, references)
     touched, items = set(removed), []
-    required = {'alias', 'provider', 'model', 'display_name', 'max_context_size',
+    required = {'alias', 'provider', 'model', 'max_context_size',
                 'capabilities', 'support_efforts', 'default_effort'}
     for alias in removed:
         old = models.get(alias)
@@ -434,7 +436,7 @@ def batch_models(content, provider, upserts, removes, references=None):
         if not isinstance(operation, dict) or set(operation) != {'original_alias', 'model'}:
             raise ConfigError('批量模型操作参数不被允许')
         item = operation['model']
-        if not isinstance(item, dict) or set(item) != required:
+        if not isinstance(item, dict) or set(item) - (required | {'display_name'}) or not required <= set(item):
             raise ConfigError('批量模型字段不被允许或缺少必填字段')
         item = copy.deepcopy(item)
         alias = _string(item['alias'], 'alias', True)
@@ -559,7 +561,9 @@ def snapshot(content, references=None):
                 raise ConfigError('模型必须是表')
             for key in ('provider', 'model'):
                 _string(model.get(key, ''), key)
-            _string(effective(model, 'display_name') or alias, 'display_name')
+            display_name = effective(model, 'display_name')
+            if display_name is not None:
+                _string(display_name, 'display_name')
             for key in ('capabilities', 'support_efforts'):
                 _array(effective(model, key) or [], key)
             context = effective(model, 'max_context_size')
@@ -570,7 +574,7 @@ def snapshot(content, references=None):
                 _string(default, 'default_effort')
             result['models'].append({'alias': alias, 'provider': model.get('provider', ''),
                                      'model': model.get('model', ''),
-                                     'display_name': effective(model, 'display_name') or alias,
+                                     'display_name': effective(model, 'display_name') or '',
                                      'max_context_size': effective(model, 'max_context_size') or 250000,
                                      'capabilities': effective(model, 'capabilities') or [],
                                      'support_efforts': effective(model, 'support_efforts') or [],

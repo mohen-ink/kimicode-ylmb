@@ -2971,7 +2971,6 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/add-model':
                 item = {key: req[key] for key in ('alias', 'provider', 'model', 'display_name',
                         'max_context_size', 'capabilities', 'support_efforts', 'default_effort') if key in req}
-                item.setdefault('display_name', item.get('alias', ''))
                 item.setdefault('max_context_size', 1000000)
                 item.setdefault('capabilities', ['image_in', 'thinking', 'tool_use'])
                 item.setdefault('support_efforts', list(model_manager.EFFORT_LEVELS))

@@ -118,7 +118,8 @@
   function currentModelId(rt) {
     var sid = rt.sessionsStore.activeSessionId;
     var sess = sid && rt.sessionsStore.sessions.find(function (x) { return x.id === sid; });
-    var raw = sess && sess.model !== '' ? sess.model : rt.modelsStore.draftModel;
+    var config = sess && (sess.agent_config || sess.agentConfig);
+    var raw = (sess && sess.model) || (config && config.model) || rt.modelsStore.draftModel;
     return raw || null;
   }
 
@@ -492,9 +493,10 @@
     shown.forEach(function (m) {
       var row = document.createElement('div');
       // 官方 ui-menu-item 选中态 = is-active（hover 同底色）
-      row.className = 'kmt-row' + (m.id === curId ? ' is-active' : '');
+      var selected = m.id === curId || m.model === curId || m.alias === curId;
+      row.className = 'kmt-row' + (selected ? ' is-active' : '');
       row.setAttribute('role', 'option');
-      row.setAttribute('aria-selected', m.id === curId ? 'true' : 'false');
+      row.setAttribute('aria-selected', selected ? 'true' : 'false');
       var star = document.createElement('button');
       star.type = 'button';
       star.className = 'kmt-star' + (starred.has(m.id) ? ' kmt-on' : '');
@@ -511,7 +513,7 @@
       name.className = 'kmt-name';
       name.textContent = m.displayName || m.model || m.id;
       row.appendChild(name);
-      if (m.id === curId) {
+      if (selected) {
         var chk = document.createElement('span');
         chk.className = 'kmt-check';
         chk.innerHTML = SVG_CHECK;

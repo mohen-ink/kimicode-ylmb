@@ -2965,14 +2965,17 @@
   }
   function kmmModelValue(item, provider, id, displayName) {
     return { alias: item ? item.alias : kmmNormalizeAlias(id, provider), provider: item ? item.provider : provider, model: item ? item.model : id || '',
-      display_name: item ? item.display_name : kmmNormalizeAlias(displayName || id, provider), max_context_size: String(item ? item.max_context_size : 1000000),
+      display_name: item ? item.display_name : '', max_context_size: String(item ? item.max_context_size : 1000000),
       capabilities: item ? item.capabilities.slice() : ['image_in', 'thinking', 'tool_use'],
       support_efforts: item ? kmmOrderedEfforts(item.support_efforts) : kmmDefaultEfforts.slice(), default_effort: item ? item.default_effort : 'high' };
   }
   function kmmModelPayload(value, original) {
-    return { alias: original === null ? kmmNormalizeAlias(value.alias, value.provider) : original, provider: value.provider, model: value.model,
-      display_name: value.display_name.trim(), max_context_size: Number(value.max_context_size), capabilities: value.capabilities.slice(),
+    var payload = { alias: original === null ? kmmNormalizeAlias(value.alias, value.provider) : original, provider: value.provider, model: value.model,
+      max_context_size: Number(value.max_context_size), capabilities: value.capabilities.slice(),
       support_efforts: kmmOrderedEfforts(value.support_efforts), default_effort: value.default_effort };
+    if (value.display_name.trim()) payload.display_name = value.display_name.trim();
+    else if (original !== null) payload.display_name = null;
+    return payload;
   }
   function kmmModelError(value) {
     if (!value.alias.trim() || !value.provider || !value.model.trim()) return '请输入模型 alias、供应商和上游模型 ID。';
