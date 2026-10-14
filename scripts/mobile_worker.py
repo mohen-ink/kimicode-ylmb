@@ -5,7 +5,8 @@ Kimi Code 用量面板 · 手机桥独立 worker 进程与 daemon 侧客户端�
 worker（run_worker）在独立 detached 子进程中持有 MobileBridgeManager 与
 ConnectorRuntime：usage daemon 退出/重启只 begin_shutdown（detach，不 stop），
 桥会话、隧道与 owner 复核在 worker 内存中原样存活；新 daemon 经同版本记录
-重连接管。显式 stop / owner 失联按 bridge 既有 fail-closed 语义吊销并退出。
+重连接管。显式 stop 吊销并退出；LAN/relay 的 owner 失联等待重新绑定，
+internet 则停止连接且不自动恢复。设备会话由 mobile_auth 持久化。
 
 worker 控制 HTTP 仅绑 127.0.0.1 随机端口，全部端点要求 X-Kimi-Mobile-Worker
 IPC secret（secret 仅存 ACL 受限的 ipc.secret 文件，绝不进 argv/env/日志/记录）。
@@ -35,7 +36,7 @@ start 在 worker 未就绪时把该阶段的固定码（WORKER_*，白名单内�
 错误码透出；无阶段诊断的失败仍回退 TUNNEL_START_FAILED，未知阶段一律回退，
 绝不外泄 stderr/路径/secret。
 
-协议 protocol=1，版本 version=3.3.6。本模块只依赖 Python>=3.8 标准库。
+协议 protocol=1，构建标识见 WORKER_VERSION。本模块只依赖 Python>=3.8 标准库。
 """
 import ctypes
 import http.client
@@ -59,7 +60,7 @@ from mobile_bridge import (
     _TRUSTED_APP_ORIGIN, local_lan_addresses)
 
 WORKER_PROTOCOL = 1
-WORKER_VERSION = '3.4.0'
+WORKER_VERSION = 'password-login-1'
 WORKER_HEADER = 'X-Kimi-Mobile-Worker'
 WORKER_MAX_BODY = 8192
 SECRET_BYTES = 32
@@ -1434,8 +1435,7 @@ def run_worker(port=0, state_dir=None, kimi_home=None, idle_timeout=None,
                     off = mgr._state == 'off'
                     failed_owner = (off and mgr._tunnel.get('error_code')
                                     == 'OWNER_LOST')
-                # owner 失联已被桥吊销（会话全清，不可恢复）：worker 无存在
-                # 意义，fail-closed 退出；显式 stop（tunnel off）不影响。
+                # 只有 internet 模式在 owner 失联后停止入口并退出 worker。
                 if failed_owner:
                     initiate_shutdown('OWNER_LOST')
                     return

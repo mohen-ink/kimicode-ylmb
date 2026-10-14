@@ -7,13 +7,13 @@ Origin；手机面不暴露控制面。LAN 显式绑定所选本机 RFC1918 IPv4
 只适合可信局域网。internet 显式同意 Cloudflare 中继后只绑定 127.0.0.1，
 ConnectorRuntime 确认 Quick Tunnel 就绪且 owner 复核通过后才发布 HTTPS 配对链接。
 
-配对码只在 URL fragment，限时且一次性；会话 Cookie 为 HttpOnly/Strict，
+密码链接使用 URL fragment；未设密码时配对码限时一次性。会话持久化七天，Cookie 为 HttpOnly/Strict，
 internet 额外设置 Secure。HTTP 精确 method+route allowlist 与 WS 上行消息
 allowlist 保持机器级接口不可达。真实 server.token 仅在进程内存向已核实的
 owner 注入；HTTP 响应与 WS 完整帧/重组消息均过滤凭据，不向手机发送。
 
 每次启动、listener、handler、会话、授权快照、socket 与 WS 配额均绑定同代；
-stop 立即吊销并关闭全部连接，owner 失联与隧道失败均 fail-closed。
+stop 注销全部设备；LAN/relay 在 owner 失联时停止转发并等待重新绑定，internet 停止入口。
 shutdown 永久关闭管理器及 connector。本模块只依赖 Python>=3.8 标准库。
 """
 import base64
@@ -35,6 +35,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit, unquote, quote
 
 _NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
+import mobile_auth
 
 try:
     import mobile_usage as _mobile_usage
@@ -145,7 +147,7 @@ class _HeaderDeadlineReader(object):
 LAN_PREFERRED_PORT = 39282
 LAN_PORT_SCAN_MAX = 100          # 39282 起最多向上扫 100 个端口
 PAIR_TTL_SECONDS = 600           # 配对 token 10 分钟
-SESSION_TTL_SECONDS = 86400      # 会话 idle TTL 24h（滑动，兼容别名）
+SESSION_TTL_SECONDS = 604800     # 兼容别名；设备登录七天绝对有效期
 SESSION_MAX_AGE_SECONDS = 604800 # 会话绝对寿命 7d（Cookie Max-Age 也按此签发）
 MAX_DEVICES = 8
 CONTROL_MAX_BODY = 8192
@@ -771,7 +773,7 @@ def _project_connector_diagnostics(diag):
 
 # ---------------- 管理器 ----------------
 class MobileBridgeManager(object):
-    """本机控制面与 LAN/internet 手机代理的生命周期管理。状态仅内存持有。"""
+    """手机代理生命周期；密码、设备会话和中继地址跨 worker 重启保留。"""
 
     def __init__(self, kimi_home):
         self.kimi_home = kimi_home
@@ -816,6 +818,28 @@ class MobileBridgeManager(object):
         self._relay = None
         self._relay_tunnel_id = ''
         self._relay_host = ''
+        self._password = mobile_auth.load_password(kimi_home)
+        self._password_stamp = mobile_auth.password_stamp(kimi_home)
+        self._saved_sessions = mobile_auth.load_sessions(kimi_home)
+
+    def _sync_password_locked(self):
+        stamp = mobile_auth.password_stamp(self.kimi_home)
+        if stamp != self._password_stamp:
+            self._password_stamp = stamp
+            self._password = mobile_auth.load_password(self.kimi_home)
+            self._sessions.clear()
+            self._saved_sessions.clear()
+            self._pair_tokens.clear()
+            self._save_sessions_locked()
+            if self._state == 'on':
+                self._issue_pair_token_locked()
+
+    def _save_sessions_locked(self):
+        records = {sid: {'created': s['created'], 'expires': s['expires'],
+                         'pwv': mobile_auth.password_version(self._password)}
+                   for sid, s in self._sessions.items()}
+        if not mobile_auth.save_sessions(self.kimi_home, records):
+            raise MobileBridgeError('登录会话保存失败')
 
     # ---------- 连接/WS 限额 ----------
     def try_acquire_conn(self):
@@ -915,6 +939,7 @@ class MobileBridgeManager(object):
         addrs = local_lan_addresses() if include_lan else None
         connector, diagnostics = self._connector_status()
         with self._lock:
+            self._sync_password_locked()
             now = time.time()
             live = [s for s in self._sessions.values() if s['expires'] > now]
             st = {
@@ -932,9 +957,12 @@ class MobileBridgeManager(object):
             best = max(self._pair_tokens.values(), default=0.0)
             if self._state == 'on' and self._mode in ('internet', 'relay') and self._tunnel['state'] == 'ready':
                 st['public_origin'] = self._public_origin
-            if self._state == 'on' and best > now:
+            st['password_set'] = bool(self._password)
+            if self._state == 'on' and (self._password or best > now):
                 st['url'] = self._pair_url_locked()
-                st['expires_at'] = int(best)
+                st['pair_state'] = 'available'
+                if not self._password:
+                    st['expires_at'] = int(best)
             elif self._pair_state == 'available':
                 st['pair_state'] = 'expired'
             return st
@@ -983,6 +1011,8 @@ class MobileBridgeManager(object):
                     raise MobileBridgeError('请先停止再重新开启')
                 generation = None
             else:
+                self._sync_password_locked()
+                self._saved_sessions = mobile_auth.load_sessions(self.kimi_home)
                 self._generation += 1
                 generation = self._generation
                 self._state = 'starting'
@@ -1071,6 +1101,7 @@ class MobileBridgeManager(object):
                         relay_host=cfg['host'], relay_port=cfg['tunnel_port'],
                         public_port=cfg['public_port'],
                         token=cfg['token'] or None)
+                    self._relay.tunnel_id = mobile_auth.load_relay_tid(self.kimi_home)
                     self._relay_host = cfg['host']
                     self._relay.start(
                         bound_port, lambda origin: self._tunnel_ready(generation, origin),
@@ -1117,6 +1148,9 @@ class MobileBridgeManager(object):
                         self._tunnel_failed(generation, 'TUNNEL_START_FAILED')
                     return
                 self._relay_tunnel_id = tid
+                if not mobile_auth.save_relay_tid(self.kimi_home, tid):
+                    self._tunnel_failed(generation, 'TUNNEL_START_FAILED')
+                    return
             if self._state == 'starting':
                 # 首次 ready：转 on
                 self._public_origin = origin
@@ -1134,6 +1168,11 @@ class MobileBridgeManager(object):
         self._stop_generation(generation, code)
 
     def stop(self):
+        with self._lock:
+            self._saved_sessions.clear()
+            self._sessions.clear()
+            if not mobile_auth.clear_sessions(self.kimi_home):
+                raise MobileBridgeError('登录会话清除失败')
         return self._stop_generation(None)
 
     def begin_shutdown(self):
@@ -1142,7 +1181,7 @@ class MobileBridgeManager(object):
 
     def shutdown(self):
         self.begin_shutdown()
-        self.stop()
+        self._stop_generation(None)
         with self._connector_lock:
             if self._connector is not None:
                 self._connector.shutdown()
@@ -1251,8 +1290,49 @@ class MobileBridgeManager(object):
                 misses += 1
                 if misses < OWNER_LOST_GRACE:
                     continue
-                self._stop_generation(generation, 'OWNER_LOST')
-                return
+                if self._mode == 'internet':
+                    self._stop_generation(generation, 'OWNER_LOST')
+                    return
+                with self._lock:
+                    socks = list(self._open_sockets)
+                    self._server_token = None
+                for sock in socks:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                        sock.close()
+                    except OSError:
+                        pass
+                for inst in sorted(_load_instances(self.kimi_home),
+                                   key=lambda i: i['started_at'], reverse=True):
+                    host, port, pid = inst['host'], inst['port'], inst['pid']
+                    if (not _is_loopback_ip(host) or not _pid_alive(pid)
+                            or not _pid_is_desktop(pid) or not inst['server_id']):
+                        continue
+                    creation = _pid_creation_ticks(pid)
+                    if (not creation or _tcp_listener_pid(host, port) != pid
+                            or not _owner_responds(host, port)):
+                        continue
+                    try:
+                        token = _ensure_server_token(self.kimi_home)
+                    except MobileBridgeError:
+                        continue
+                    with self._lock:
+                        if not self.generation_valid(generation, starting=True):
+                            return
+                        self._owner_host, self._owner_port = host, port
+                        self._owner_pid = pid
+                        self._owner_server_id = inst['server_id']
+                        self._owner_creation_ticks = creation
+                        self._owner_origin = 'http://%s:%d' % (host, port)
+                        self._server_token = token
+                    break
+                continue
+            with self._lock:
+                if self._server_token is None:
+                    try:
+                        self._server_token = _ensure_server_token(self.kimi_home)
+                    except MobileBridgeError:
+                        continue
             misses = 0
 
     def _bind(self, address):
@@ -1271,7 +1351,7 @@ class MobileBridgeManager(object):
         for tok, exp in self._pair_tokens.items():
             if exp > now and (best is None or exp > self._pair_tokens[best]):
                 best = tok
-        if best is None:
+        if best is None and not self._password:
             return None
         if self._mode == 'relay':
             # relay：_public_origin 只存 http://<vps>:<port>（Host/Origin 校验用），
@@ -1281,7 +1361,9 @@ class MobileBridgeManager(object):
             origin = self._public_origin
         else:
             origin = 'http://%s:%d' % (self._address, self._port)
-        return origin + '/mobile/pair#pair=' + best
+        fragment = ('#pw=' + quote(self._password, safe='') if self._password
+                    else '#pair=' + best)
+        return origin + '/mobile/pair' + fragment
 
     def _issue_pair_token_locked(self):
         now = time.time()
@@ -1289,6 +1371,12 @@ class MobileBridgeManager(object):
             del self._pair_tokens[t]
         self._pair_tokens[secrets.token_urlsafe(24)] = now + PAIR_TTL_SECONDS
         self._pair_state = 'available'
+        pwv = mobile_auth.password_version(self._password)
+        for sid, rec in self._saved_sessions.items():
+            if (rec['pwv'] == pwv and rec['expires'] > now
+                    and rec['created'] <= now < rec['created'] + SESSION_MAX_AGE_SECONDS):
+                self._sessions[sid] = dict(rec, generation=self._generation, last_seen=now)
+        self._saved_sessions.clear()
 
     def _exchange_rate_ok(self, ip):
         with self._lock:                         # 可被持锁/未持锁路径调用（RLock）
@@ -1321,29 +1409,41 @@ class MobileBridgeManager(object):
                              key=lambda k: self._exchange_fails[k]['first'])
                 del self._exchange_fails[oldest]
 
-    def exchange_pair_token(self, ip, token, generation=None):
+    def exchange_pair_token(self, ip, token, generation=None, password=None):
         with self._lock:
+            self._sync_password_locked()
             if generation is None:
                 generation = self._generation
             if not self.generation_valid(generation) or not self._exchange_rate_ok(ip):
                 return None
-            if not isinstance(token, str) or len(token) > 200 or not _TOKEN_SAFE_RE.fullmatch(token):
-                self._exchange_failed(ip)
-                return None
             now = time.time()
-            exp = self._pair_tokens.get(token)
-            if exp is None or exp <= now:
+            if self._password:
+                valid = (isinstance(password, str)
+                         and secrets.compare_digest(password.encode('utf-8'),
+                                                    self._password.encode('utf-8')))
+            else:
+                valid = (isinstance(token, str) and len(token) <= 200
+                         and _TOKEN_SAFE_RE.fullmatch(token)
+                         and self._pair_tokens.get(token, 0) > now)
+            if not valid:
                 self._exchange_failed(ip)
                 return None
             live = {s: v for s, v in self._sessions.items() if v['expires'] > now}
             if len(live) >= MAX_DEVICES:
-                raise MobileBridgeError('已达最大配对设备数，请先停止后重开')
+                raise MobileBridgeError('已达最大登录设备数，请先停止后重开')
             self._sessions = live
             sid = secrets.token_urlsafe(32)
-            self._sessions[sid] = {'created': now, 'expires': now + SESSION_TTL_SECONDS,
+            self._sessions[sid] = {'created': now, 'expires': now + SESSION_MAX_AGE_SECONDS,
                                    'last_seen': now, 'generation': generation}
-            del self._pair_tokens[token]
-            self._pair_state = 'used'
+            try:
+                self._save_sessions_locked()
+            except Exception:
+                self._sessions.pop(sid, None)
+                raise
+            if not self._password:
+                del self._pair_tokens[token]
+                self._pair_state = 'used'
+            self._exchange_fails.pop(ip, None)
             return sid
 
     def session_valid(self, sid, generation=None):
@@ -1361,6 +1461,7 @@ class MobileBridgeManager(object):
         fail-closed：generation 缺失/不符、created/expires 缺失或非有限数值
         （bool/NaN/inf/字符串）一律清除并拒；expires 超 idle 或 created 超
         绝对寿命同样清除，绝不复活、绝不默认上限。"""
+        self._sync_password_locked()
         session = self._sessions.get(sid)
         if session is None:
             return False
@@ -1380,8 +1481,7 @@ class MobileBridgeManager(object):
         return True
 
     def session_touch(self, sid, generation=None):
-        """真实已认证活动才调用：先验证（同 session_valid 语义，过期不复活），
-        再滑动 expires=min(now+idle, created+absolute) 并更新 last_seen。"""
+        """真实已认证活动更新 last_seen；七天绝对有效期不续期。"""
         if not isinstance(sid, str) or len(sid) > 200 or not _TOKEN_SAFE_RE.fullmatch(sid):
             return False
         with self._lock:
@@ -1393,18 +1493,15 @@ class MobileBridgeManager(object):
                 return False
             session = self._sessions[sid]
             now = time.time()
-            # created 已经过 _session_live_locked 严格校验（有限数值），
-            # 绝对上限无条件约束，绝不默认
-            session['expires'] = min(now + SESSION_TTL_SECONDS,
-                                     session['created'] + SESSION_MAX_AGE_SECONDS)
             session['last_seen'] = now
             return True
 
     def rotate_pair(self, generation=None):
-        """轮换配对 token：当前 generation 且 owner 有效；旧未用 token 全部
-        作废，签发一个新的 10 分钟一次性 token。SID/generation/public_origin/
-        sockets 不动；owner 失联 fail-closed（整代停止，与看门狗同义）。"""
+        """密码模式刷新原链接；未设密码时换发十分钟一次性 token。"""
         with self._lock:
+            self._sync_password_locked()
+            if self._password:
+                return self._password
             if generation is None:
                 generation = self._generation
         if not self._owner_still_mine(generation):
@@ -1444,7 +1541,7 @@ class MobileBridgeManager(object):
 
     def upstream_snapshot(self, generation):
         with self._lock:
-            if not self.generation_valid(generation):
+            if not self.generation_valid(generation) or self._server_token is None:
                 return None
             snapshot = (self._owner_host, self._owner_port, self._server_token)
         if not self._owner_still_mine(generation):
@@ -2133,14 +2230,15 @@ class _LanHandler(BaseHTTPRequestHandler):
         try:
             data = json.loads(body.decode('utf-8'))
             token = data.get('token') if isinstance(data, dict) else None
+            password = data.get('password') if isinstance(data, dict) else None
         except Exception:
-            token = None
+            token, password = None, None
         try:
-            sid = self.mgr.exchange_pair_token(ip, token, self._generation)
+            sid = self.mgr.exchange_pair_token(ip, token, self._generation, password)
         except MobileBridgeError as e:
             return self._err(400, str(e))
         if not sid or not self.mgr.session_valid(sid, self._generation):
-            return self._err(403, '配对码无效或已过期')
+            return self._err(403, '密码错误，或配对码无效/已过期')
         payload = json.dumps(
             {'ok': True,
              'redirect': '/?kimi_onboarded=1#token=' + PLACEHOLDER_CREDENTIAL},
@@ -3083,15 +3181,29 @@ var m=document.getElementById('msg');
 function fail(t){m.textContent=t;m.className='err';}
 try{
   var h=location.hash||'';
-  var tok=new URLSearchParams(h.slice(1)).get('pair');
-  if(!tok){fail('配对码缺失，请重新扫码或使用完整链接。');return;}
-  history.replaceState(null,'',location.pathname);   // 立即抹除 fragment 中的配对码
+  var params=new URLSearchParams(h.slice(1));
+  var tok=params.get('pair');
+  var password=params.get('pw');
+  history.replaceState(null,'',location.pathname);
+  var form=document.createElement('form');
+  var input=document.createElement('input');
+  input.type='password';input.autocomplete='current-password';
+  input.setAttribute('aria-label','登录密码');
+  var button=document.createElement('button');
+  button.type='submit';button.textContent='登录';
+  form.appendChild(input);form.appendChild(button);m.after(form);
+  form.onsubmit=function(e){e.preventDefault();login(input.value);};
+  if(!tok&&password===null){
+    m.textContent='请输入电脑端设置的登录密码';input.focus();
+  }else{login(password);}
+  function login(password){
+  m.textContent='正在登录…';m.className='';
   // 站点根：本页路径是 <root>/mobile/pair（relay 下 root=/t/<id>，否则 root=''）。
   // fetch/跳转一律基于 root 拼同源绝对路径，保证经中继前缀打开时不丢隧道归属。
   var root=location.pathname.slice(0,-'/mobile/pair'.length);
   fetch(root+'/mobile/pair/exchange',{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({token:tok})}).then(function(r){
+    body:JSON.stringify({token:tok,password:password})}).then(function(r){
     return r.json().then(function(d){return {s:r.status,d:d};});
   }).then(function(r){
     if(r.s===200&&r.d&&r.d.redirect){m.textContent='配对成功，正在进入…';m.className='ok';
@@ -3100,8 +3212,9 @@ try{
       var rd=r.d.redirect;
       if(root&&rd.charAt(0)==='/')rd=root+rd;
       location.replace(rd);return;}
-    fail((r.d&&r.d.error)||'配对失败，请重新扫码。');
+    fail((r.d&&r.d.error)||'登录失败，请检查密码。');
   }).catch(function(){fail('网络错误，请确认手机网络及电脑服务仍在运行。');});
+  }
 }catch(e){fail('浏览器不兼容，请换用系统浏览器。');}
 })();
 </script></body></html>"""

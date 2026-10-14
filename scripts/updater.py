@@ -46,6 +46,7 @@ LOCAL_ONLY_KEEP = frozenset((
     'scripts/mobile_worker.py',
     'scripts/mobile_credentials.py',
     'scripts/mobile_security.py',
+    'scripts/mobile_auth.py',
     # relay_config 被 service.py 顶层 import——若包不含手机运行时（"partial" 为空、
     # 完整性闸门放行）就会被同步删除，导致用量服务直接起不来，故必须保护。
     'scripts/relay_config.py',
@@ -75,6 +76,7 @@ MOBILE_RUNTIME_GROUP = frozenset((
     'scripts/mobile_worker.py',
     'scripts/mobile_credentials.py',
     'scripts/mobile_security.py',
+    'scripts/mobile_auth.py',
     'scripts/relay_config.py',
     'scripts/relay_server.py',
     'assets/kimi-mobile-api.js',

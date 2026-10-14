@@ -158,6 +158,9 @@ def save_pricing(alias, entry):
 sys.path.insert(0, SCRIPT_DIR)
 import scanner  # noqa: E402
 import relay_config  # noqa: E402
+import mobile_auth  # noqa: E402
+
+_MOBILE_RESTORE_LOCK = threading.RLock()
 import model_manager  # noqa: E402
 import model_catalog  # noqa: E402
 import models_dev  # noqa: E402
@@ -2425,6 +2428,31 @@ def _mobile_begin_shutdown():
         return mgr
 
 
+def _mobile_restore_loop():
+    while not _MOBILE_CLOSING.wait(5):
+        try:
+            with _MOBILE_RESTORE_LOCK:
+                intent = mobile_auth.load_resume(KIMI_HOME)
+                if not intent:
+                    continue
+                mgr = _mobile_manager()
+                if mgr is None:
+                    continue
+                st = mgr.status()
+                if st.get('state') != 'off' or mgr._old_worker_handle() is not None:
+                    continue
+                from mobile_bridge import _load_instances, _pid_alive, _pid_is_desktop
+                instances = sorted(_load_instances(KIMI_HOME),
+                                   key=lambda i: i['started_at'], reverse=True)
+                for inst in instances:
+                    if _pid_alive(inst['pid']) and _pid_is_desktop(inst['pid']):
+                        owner = 'http://%s:%d' % (inst['host'], inst['port'])
+                        mgr.start(owner, intent['address'] or None, intent['mode'])
+                        break
+        except Exception:
+            pass
+
+
 def _mobile_fail_closed(handler):
     """worker 客户端不可用/异常时对 /api/mobile* 的统一拒答：
     无 Access-Control-Allow-Origin 等放行头，不泄露内部细节。"""
@@ -2596,7 +2624,21 @@ def _mobile_dispatch(handler):
     try:
         # relay 配置是 daemon 本地文件（usage-dashboard/relay.json），
         # 不经 worker 代理；GET 永不回显 token 明文，POST 只写不落回执。
-        if method == 'GET' and path == _MOBILE_PREFIX + '/relay/config':
+        if method == 'GET' and path == _MOBILE_PREFIX + '/password':
+            _mobile_send(handler, 200,
+                         {'password_set': bool(mobile_auth.load_password(KIMI_HOME))}, origin)
+        elif method == 'POST' and path == _MOBILE_PREFIX + '/password':
+            body = _mobile_read_body(handler)
+            if set(body) != {'password'} or not isinstance(body['password'], str):
+                raise ValueError('请提供登录密码')
+            with _MOBILE_RESTORE_LOCK:
+                if mgr._old_worker_handle() is not None:
+                    raise ValueError('请先停止旧版本手机连接，再设置密码')
+                if not mobile_auth.save_password(KIMI_HOME, body['password']):
+                    raise ValueError('密码保存失败或超过 128 个字符')
+                mgr.status()
+            _mobile_send(handler, 200, {'password_set': bool(body['password'])}, origin)
+        elif method == 'GET' and path == _MOBILE_PREFIX + '/relay/config':
             _mobile_send(handler, 200,
                          {'relay': relay_config.redacted(relay_config.load(KIMI_HOME))},
                          origin)
@@ -2637,14 +2679,26 @@ def _mobile_dispatch(handler):
                 allowed = {'owner_origin', 'mode', 'address'}
             if set(body) - allowed:
                 raise ValueError('请求参数不被允许')
-            _mobile_send(handler, 200, mgr.start(
-                body.get('owner_origin'), body.get('address'), mode,
-                body.get('relay_consent', False), body.get('consent_version')),
-                origin)
+            with _MOBILE_RESTORE_LOCK:
+                st = mgr.start(body.get('owner_origin'), body.get('address'), mode,
+                               body.get('relay_consent', False), body.get('consent_version'))
+                if mode in ('lan', 'relay'):
+                    if not mobile_auth.save_resume(KIMI_HOME, mode, body.get('address', '')):
+                        mgr.stop()
+                        raise ValueError('自动恢复设置保存失败')
+                elif not mobile_auth.clear_resume(KIMI_HOME):
+                    raise ValueError('自动恢复设置清除失败')
+            _mobile_send(handler, 200, st, origin)
         elif method == 'POST' and path == _MOBILE_PREFIX + '/stop':
             if _mobile_read_body(handler):
                 raise ValueError('请求参数不被允许')
-            _mobile_send(handler, 200, mgr.stop(), origin)
+            with _MOBILE_RESTORE_LOCK:
+                if not mobile_auth.clear_resume(KIMI_HOME):
+                    raise ValueError('自动恢复设置清除失败')
+                st = mgr.stop()
+                if not mobile_auth.clear_sessions(KIMI_HOME):
+                    raise ValueError('登录会话清除失败')
+            _mobile_send(handler, 200, st, origin)
         elif method == 'POST' and path == _MOBILE_PREFIX + '/pair/rotate':
             if _mobile_read_body(handler):
                 raise ValueError('请求参数不被允许')
@@ -3467,6 +3521,7 @@ def run_server():
     if httpd:
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         log('service listening on 127.0.0.1:%d' % PORT)
+        threading.Thread(target=_mobile_restore_loop, daemon=True).start()
     else:
         # 没绑到端口还继续跑只会攒脏 state（无法提供 API）——退出交给下次 tick 重拉
         save_state()

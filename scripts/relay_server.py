@@ -294,10 +294,12 @@ async def relay_register(reader, writer, token):
     except Exception:
         return
 
-    # tid 粘滞：worker 掉线重连时带 X-Relay-Resume=<旧 tid>，若该 tid 仍存活
-    # 或在墓碑表未过期则复用，保证手机端已配对的 /t/<tid>/ URL 不失效。
+    # tid 粘滞：worker 掉线重连或本机重启后带 X-Relay-Resume=<旧 tid> 注册，
+    # 只要该 tid 当前没有在线隧道就复用（不再要求仍在墓碑表内；调用方已通过
+    # 共享 token 校验），保证手机端保存的 /t/<tid>/ 地址在本机重启后依然有效。
+    # 该 tid 仍在线时不抢占，签发新 tid。
     resume = hmap.get('x-relay-resume') or ''
-    if resume and _recent_valid(resume) and resume not in TUNNELS:
+    if _tok_ok(resume, 4, 32) and resume not in TUNNELS:
         tid = resume
     else:
         tid = secrets.token_urlsafe(8)

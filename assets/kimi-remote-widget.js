@@ -150,13 +150,11 @@
   var LAN_NOTICE = '我了解内网模式使用明文 HTTP，同一网络内的其他设备可能窃听或篡改流量；仅在自己控制的可信 Wi-Fi 下使用。';
   var NOTE_LAN = '内网模式：不经过 Cloudflare，也无需下载任何组件。手机与电脑必须连接同一个可信 Wi-Fi，用系统浏览器扫描二维码或打开链接。' +
     '桥只绑定你选择的那块内网网卡（RFC1918 私有地址），不会监听其他网卡；端口从 39282 起自动选取空闲端口。' +
-    '流量是明文 HTTP，不是加密连接；链接/二维码含一次性会话控制授权，请勿分享；手机端可通过 Agent 执行命令、操作电脑文件。' +
-    '配对二维码约 10 分钟有效、仅可使用一次；连接租约闲置约 24 小时、累计最长 7 天后自动失效。' +
-    '首次开启时 Windows 防火墙可能弹出放行提示，需允许“专用网络”；若手机仍打不开，请检查防火墙或路由器的客户端隔离设置。' +
-    '重启本机服务（守护进程）不会中断已建立的连接；退出桌面端或在此停止连接会撤销全部配对并断开设备。关闭本窗口不会停止连接。';
+    '流量是明文 HTTP；设置密码后二维码携带长期密码，手机也可手动输入。未设置密码时沿用十分钟一次性配对。' +
+    '登录会话有效期七天。关闭并重开 Kimi 后自动恢复；点击停止会注销设备并取消自动恢复。' +
+    '局域网 IP 或端口变化时须使用新地址。首次开启可能需要允许 Windows 专用网络防火墙。关闭本窗口不会停止连接。';
   var NOTE_INTERNET = '外网模式：手机无需同 WiFi，用系统浏览器扫描二维码或打开链接。' +
-    '链接/二维码含一次性会话控制授权，请勿分享；手机端可通过 Agent 执行命令、操作电脑文件。' +
-    '配对二维码约 10 分钟有效、仅可使用一次；连接租约闲置约 24 小时、累计最长 7 天后自动失效。' +
+    '设置密码后二维码带密码，未设密码时使用十分钟一次性配对。设备登录有效期七天。' +
     '重启本机服务（守护进程）不会中断已建立的连接；退出桌面端或在此停止连接会撤销全部配对并断开设备。' +
     '外网通道进程异常退出后，旧链接立即不可用，请停止后重新开启以获取新链接。' +
     '组件仅在明确同意并点击安装后下载，中转仅在本次明确同意并点击开启后启动。' +
@@ -387,6 +385,18 @@
     consentRow(internet, 'kur-relay-consent', RELAY_NOTICE);
     b.appendChild(internet);
 
+    var passwordField = mkField('手机登录密码', 'kur-password', 'password', '任意密码，不限强度');
+    var passwordSave = doc.createElement('button');
+    passwordSave.id = 'kur-password-save';
+    passwordSave.type = 'button';
+    passwordSave.className = 'kur-btn-mini';
+    passwordSave.textContent = '设置 / 修改密码';
+    passwordField.appendChild(passwordSave);
+    var passwordHint = doc.createElement('span');
+    passwordHint.textContent = '最多 128 字符，不限强度。二维码带密码；不带密码的链接可手动登录。修改会注销设备，留空保存恢复一次性二维码。';
+    passwordField.appendChild(passwordHint);
+    b.appendChild(passwordField);
+
     var qr = doc.createElement('div');
     qr.className = 'kur-qr';
     qr.id = 'kur-qr';
@@ -403,7 +413,7 @@
     linkwrap.setAttribute('aria-hidden', 'true');
     var pairHint = doc.createElement('span');
     pairHint.className = 'kur-pairhint';
-    pairHint.textContent = '链接含一次性控制授权，请勿分享';
+    pairHint.textContent = '链接含登录凭据，请勿分享；密码二维码可重复使用';
     linkwrap.appendChild(pairHint);
     var link = doc.createElement('textarea');
     link.className = 'kur-link';
@@ -417,7 +427,7 @@
     rotate.id = 'kur-rotate';
     rotate.className = 'kur-btn-mini';
     rotate.type = 'button';
-    rotate.textContent = '生成新二维码';
+    rotate.textContent = '刷新二维码';
     rotate.disabled = true;
     var copy = doc.createElement('button');
     copy.id = 'kur-copy';
@@ -524,6 +534,7 @@
     var ids = ['#kur-x', '#kur-mode-lan', '#kur-mode-internet', '#kur-mode-relay', '#kur-legacy-stop',
                '#kur-lan-addr', '#kur-lan-consent', '#kur-download-consent', '#kur-install', '#kur-relay-consent',
                '#kur-relay-host', '#kur-relay-tport', '#kur-relay-pport', '#kur-relay-token', '#kur-relay-save',
+               '#kur-password', '#kur-password-save',
                '#kur-link', '#kur-rotate', '#kur-copy', '#kur-enable', '#kur-disable', '#kur-note-toggle'];
     var out = [];
     for (var i = 0; i < ids.length; i++) {
@@ -651,6 +662,7 @@
     if (off) off.classList.toggle('kur-hidden', !showStop);
     var rotate = $('#kur-rotate');
     if (rotate) {
+      rotate.textContent = lanStatus && lanStatus.password_set ? '刷新二维码' : '生成新二维码';
       rotate.disabled = !canRotate(true);
       rotate.setAttribute('aria-disabled', rotate.disabled || !!inflight ? 'true' : 'false');
     }
@@ -805,7 +817,7 @@
     if (note) {
       var noteText = mode === 'lan' ? NOTE_LAN
         : (mode === 'internet' ? NOTE_INTERNET
-           : '经私人中继服务器（VPS）中转，worker 主动建立加密隧道出口；明文 HTTP，仅用于可信私人测试。');
+           : '经私人中继服务器明文 HTTP/WS 中转；密码二维码可重复使用，登录七天有效。重开 Kimi 自动恢复，停止取消恢复。');
       if (note.textContent !== noteText) note.textContent = noteText;
     }
     renderLanAddrs();
@@ -1287,8 +1299,7 @@
     runPost(function() { return mobileApi.installConnector(true); }, false, false, 'install');
   }
 
-  // 更换配对码：仅重发一次性配对码，不重建通道、不断开已连设备；POST 锁内只允许一次
-  // 失败时旧链接原样保留（旧 token 未变），错误文案保留到重试/新动作
+  // 密码模式只刷新原二维码；未设密码时换发一次性码，不断开已连设备。
   function rotatePair() {
     if (!isOpen || !canRotate()) return;
     runPost(function() { return mobileApi.rotatePair(); }, false, false, 'rotate');
@@ -1383,6 +1394,19 @@
       bind('#kur-rotate', rotatePair);
       bind('#kur-legacy-stop', stopOfficial);
       bind('#kur-relay-save', saveRelayConfig);
+      bind('#kur-password-save', function() {
+        if (!mobileApi || inflight) return;
+        var input = $('#kur-password');
+        var button = $('#kur-password-save');
+        button.disabled = true;
+        mobileApi.setPassword(input.value).then(function() {
+          input.value = '';
+          showMsg('密码已保存，已登录设备已注销。空密码恢复一次性二维码。', false, 'local');
+          pollOnce();
+        }).catch(function(e) {
+          showMsg(e.message || '密码保存失败', true, 'local');
+        }).then(function() { button.disabled = false; });
+      });
       bind('#kur-note-toggle', toggleNote);
       ['lan', 'internet', 'relay'].forEach(function(m) {
         bind('#kur-mode-' + m, function() { selectMode(m); });

@@ -283,8 +283,16 @@
     if (typeof text !== 'string' || text === '' || text !== text.trim()) return reject();
     var u;
     try { u = new URL(text); } catch (e) { return reject(); }
+    var passwordLink = u.hash.slice(0, 4) === '#pw=';
+    if (passwordLink) {
+      try {
+        var password = decodeURIComponent(u.hash.slice(4));
+        if (!password || password.length > 256) return reject();
+      } catch (e) { return reject(); }
+    }
     if (u.username || u.password || u.search
-        || u.hash.slice(0, 6) !== '#pair=' || !PAIR_TOKEN_RE.test(u.hash.slice(6))) return reject();
+        || (!passwordLink && (u.hash.slice(0, 6) !== '#pair='
+          || !PAIR_TOKEN_RE.test(u.hash.slice(6))))) return reject();
     if (isObj(status) && status.mode === 'internet') {
       if (u.pathname !== PAIR_PATH) return reject();
       if (status.enabled !== true || status.state !== 'on' || !isObj(status.tunnel)
@@ -436,15 +444,16 @@
     }
     if (d.url !== undefined) {
       if (typeof d.url !== 'string' || !d.url || !d.enabled || d.state !== 'on'
-          || d.expires_at === undefined
+          || (d.expires_at === undefined && d.password_set !== true)
           || ((d.mode === 'internet' || d.mode === 'relay') && (d.tunnel.state !== 'ready' || !status.public_origin))
           || (d.pair_state !== undefined && d.pair_state !== 'available')) badStatus();
       var ms = d.expires_at > 1e12 ? d.expires_at : d.expires_at * 1000;
       var checked;
       try { checked = validateRemoteURL(d.url, status); } catch (e) { badStatus(); }
-      if (ms > Date.now()) {
+      if (d.password_set === true || ms > Date.now()) {
         status.url = checked;
-        status.expires_at = d.expires_at;
+        status.password_set = d.password_set === true;
+        if (d.expires_at !== undefined) status.expires_at = d.expires_at;
       } else {
         status.pair_state = 'expired';
       }
@@ -573,6 +582,17 @@
           body.address = address;
         }
         return call(fetchImpl, startTimeoutMs, 'POST', START_PATH, body, '开启手机连接');
+      },
+      setPassword: function(password) {
+        var headers = { 'Content-Type': 'application/json' };
+        headers[CONTROL_HEADER] = '1';
+        return doFetch(fetchImpl, CONTROL_BASE + '/api/mobile/password', {
+          method: 'POST', headers: headers, cache: 'no-store',
+          body: JSON.stringify({password: password})
+        }, postTimeoutMs, '保存登录密码').then(function(out) {
+          if (out.http !== 200) throw apiErr('密码保存失败（最多 128 个字符）', 'MOBILE_HTTP');
+          return JSON.parse(out.body);
+        });
       },
       rotatePair: function() {
         return call(fetchImpl, postTimeoutMs, 'POST', PAIR_ROTATE_PATH, {}, '更换配对码');
