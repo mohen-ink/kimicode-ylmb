@@ -1880,14 +1880,14 @@ def _snapshot_config(content):
             'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 
-def apply_mode(index):
+def apply_mode(index, session_id=None):
     ok, result = _apply_mode_config(index)
     if not ok:
         return False, result
     mode, old = result
     n = len(mode['subagents'])
     desc = '单干（已禁用 Agent/AgentSwarm）' if not n else '%d 个挂件' % n
-    live = _apply_session_live(mode, old)
+    live = _apply_session_live(mode, old, session_id)
     extra = ('；%s' % live) if live else '，会话内 /reload 生效'
     return True, '已切到「%s」：主 %s · %s%s' % (mode['name'], mode['main'], desc, extra)
 
@@ -1942,12 +1942,9 @@ def _apply_mode_config(index):
     return True, (mode, old)
 
 
-# ---------------- 模式滑杆：活动会话即时同步 ----------------
-# apply 成功后尝试让当前会话/发送框立刻换档（不依赖 /reload）：
-#   1) POST {server}/api/v1/sessions/{active}/profile  把活动会话的 agent_config.model
-#      改成主模型（发送框模型下拉随之切换；新建会话走 default_model 已改）
-#   2) POST {server}/api/v1/config  提交 secondary_model，daemon 侧子代理池立即换血
-# 失败一律降级：config.toml 已写好，/reload 后完全一致，只在上报文案里提示。
+# ---------------- 模式滑杆：运行中会话与全局配置即时同步 ----------------
+# 已明确选中的会话和当前运行中的会话通过 profile 同步主模型；休眠会话不强制唤醒。
+# daemon 配置同步默认模型与子代理池，校验偏差时提示 /reload。
 def _server_endpoint():
     """从 ~/.kimi-code/server/instances/*.json 找在跑的桌面端 daemon（heartbeat 最新）。"""
     inst = os.path.join(KIMI_HOME, 'server', 'instances')
@@ -2009,40 +2006,68 @@ def _thinking_for_model(model_item, prefer):
     can_think = 'thinking' in caps or 'always_thinking' in caps or bool(se)
     if not can_think or prefer == 'off':
         return 'off'
-    if prefer == 'on' or prefer == '':
-        if se:
-            return model_item.get('default_effort') or se[len(se) // 2]
-        return 'on'
-    return prefer if prefer in se else (model_item.get('default_effort') or (se[len(se) // 2] if se else 'on'))
+    fallback = model_item.get('default_effort')
+    if se:
+        fallback = fallback if fallback in se else se[len(se) // 2]
+    else:
+        fallback = 'on'
+    if prefer in ('on', ''):
+        return fallback
+    return prefer if prefer in se else fallback
 
 
-def _apply_session_live(mode, old_data):
-    """尽力把档位落到运行中的会话：会话模型 + daemon secondary_model。返回提示文本。"""
+_MODE_SESSION_RE = re.compile(r'^session_[A-Za-z0-9_-]{8,100}$')
+
+
+def _mode_child_session(item):
+    metadata = item.get('metadata') if isinstance(item, dict) else None
+    return (isinstance(metadata, dict) and metadata.get('child_session_kind') == 'child'
+            and bool(metadata.get('parent_session_id')))
+
+
+def _live_session_targets(base, token, session_id=None):
+    data = _api_data(_api_json('GET', base + '/api/v1/sessions?page_size=100', token) or {})
+    targets = []
+    for item in data.get('items') or []:
+        if not isinstance(item, dict) or _mode_child_session(item):
+            continue
+        sid = item.get('id')
+        config = item.get('agent_config') or {}
+        model = config.get('model') if isinstance(config, dict) else None
+        if isinstance(sid, str) and _MODE_SESSION_RE.fullmatch(sid) and model:
+            targets.append({'id': sid, 'model': model})
+    if (isinstance(session_id, str) and _MODE_SESSION_RE.fullmatch(session_id)
+            and all(item['id'] != session_id for item in targets)):
+        detail = _api_data(_api_json('GET', base + '/api/v1/sessions/' + session_id, token) or {})
+        if detail.get('id') == session_id and not _mode_child_session(detail):
+            targets.insert(0, {'id': session_id, 'model':
+                               (detail.get('agent_config') or {}).get('model') or ''})
+    return targets
+
+
+def _apply_session_live(mode, old_data, session_id=None):
+    """将档位下发到原生配置及所有运行中的会话；指定会话可显式唤醒。"""
     base = _server_endpoint()
     token = _server_token()
     if not base or not token:
         return '后台服务未找到，配置已落盘（/reload 生效）'
     notes = []
-
     want_sec = mode['subagents']
     cur = _api_data(_api_json('GET', base + '/api/v1/config', token) or {})
     sec = cur.get('secondary_model')
     if isinstance(sec, dict):
-        # 只推 daemon 认识的键（model/defaultModel/defaultEffort/models 会被忽略并污染）
-        sub = {}
+        sub = {'models': {s: s for s in want_sec}}
         if want_sec:
             sub['defaultModel'] = want_sec[0]
-            sub['models'] = {s: s for s in want_sec}
             if mode.get('effort'):
                 sub['defaultEffort'] = mode['effort']
-        else:
-            sub['models'] = {}
-        r = _api_json('POST', base + '/api/v1/config', token, {'secondary_model': sub})
+        r = _api_json('POST', base + '/api/v1/config', token,
+                      {'default_model': mode['main'], 'secondary_model': sub})
         if r is None:
-            notes.append('子代理池未能即时下发（/reload 后生效）')
+            notes.append('运行时配置未能即时下发（/reload 后生效）')
         else:
-            # 校验写回了
-            ok = _api_data(_api_json('GET', base + '/api/v1/config', token) or {}).get('secondary_model') or {}
+            current = _api_data(_api_json('GET', base + '/api/v1/config', token) or {})
+            ok = current.get('secondary_model') or {}
             live = ok.get('models') or {}
             miss = [s for s in want_sec if s not in live]
             extra = [k for k in live if k not in want_sec]
@@ -2053,19 +2078,20 @@ def _apply_session_live(mode, old_data):
     else:
         notes.append('config 接口异常，子代理池 /reload 后生效')
 
-    sess = _api_data(_api_json('GET', base + '/api/v1/sessions?page_size=1&sort=updated_desc', token) or {})
-    items = sess.get('items') or []
-    if not items:
-        notes.append('无活动会话，发送框将在新会话自动应用')
+    targets = _live_session_targets(base, token, session_id)
+    if targets:
+        results = [_session_set_model(base, token, item['id'], mode) for item in targets]
+        good = sum(1 for ok, _ in results if ok)
+        notes.append('已同步 %d/%d 个会话模型' % (good, len(targets)))
+        if good != len(targets):
+            notes.append('部分会话未即时切换，请在该会话重新选择档位')
     else:
-        sid = items[0].get('id')
-        ok, note = _session_set_model(base, token, sid, mode)
-        notes.append(note)
+        notes.append('无运行中的会话，新会话将按当前档位启动')
     return '；'.join(notes)
 
 
 def _session_set_model(base, token, sid, mode):
-    """把活动会话的 agent_config.model 改成 mode['main'] 对应的 daemon 模型 id。
+    """把指定会话的 agent_config.model 改成 mode['main'] 对应的 daemon 模型 id。
     返回 (是否成功, 提示文本)。供 apply 和锁定守护共用。"""
     models = _api_data(_api_json('GET', base + '/api/v1/models', token) or {}).get('items') or []
     mid = mode['main']
@@ -2080,30 +2106,28 @@ def _session_set_model(base, token, sid, mode):
     body = {'agent_config': {'model': send_id, 'thinking': thinking}}
     r = _api_json('POST', base + '/api/v1/sessions/%s/profile' % sid, token, body)
     if r is None:
+        detail = _api_data(_api_json('GET', base + '/api/v1/sessions/' + sid, token) or {})
+        actual = (detail.get('agent_config') or {}).get('model')
+        if actual == send_id:
+            return True, '会话模型已切换，思考档位未能确认'
         return False, '会话模型未即时切换（/reload 或手动选档）'
     return True, '发送框模型已同步为 %s' % (mi.get('display_name') or send_id)
 
 
 # ---------------- 模式锁定 ----------------
-# 锁定 = 切到指定档位 + 守护线程盯活动会话，凡是把会话模型改成档位主模型
-# 之外的操作都被改回。挂件仍按档位下发（secondary_model 已在 apply 时写入）。
+# 锁定同时守全局档位配置和已运行会话；休眠会话不能仅凭空模型强制 resume。
 _LOCK_STATE = threading.Lock()
-_LOCK_THREAD = [None]          # 正在跑的守护线程
-_LOCK_STOP = threading.Event() # 守护退出信号
-_LOCK_GEN = [0]                # 守护代数，防止旧线程写新档
+_LOCK_THREAD = [None]
+_LOCK_STOP = threading.Event()
+_LOCK_GEN = [0]
 
 
 def _lock_daemon_target():
-    """取当前活动会话 id + 该会话现在的 model；供守护比对。"""
     base = _server_endpoint()
     token = _server_token()
     if not base or not token:
-        return None, None, None
-    sess = _api_data(_api_json('GET', base + '/api/v1/sessions?page_size=1&sort=updated_desc', token) or {})
-    items = sess.get('items') or []
-    if not items:
-        return base, token, None
-    return base, token, items[0]
+        return None, None, []
+    return base, token, _live_session_targets(base, token)
 
 
 def _locked_main_id(base, token, main_alias):
@@ -2116,8 +2140,8 @@ def _locked_main_id(base, token, main_alias):
 
 
 def _lock_guard(gen):
-    """每 ~1.5s 检查活动会话模型；偏离锁定档位主模型就改回。
-    daemon 失联/无活动会话就静默重试；收到 _LOCK_STOP 或代数变了就退出。"""
+    """校准锁档全局配置与所有运行中会话；不唤醒休眠会话。"""
+    retry_at = 0.0
     while not _LOCK_STOP.is_set() and _LOCK_GEN[0] == gen:
         time.sleep(1.5)
         if _LOCK_STOP.is_set() or _LOCK_GEN[0] != gen:
@@ -2126,26 +2150,37 @@ def _lock_guard(gen):
             d = load_modes()
             locked = d.get('locked')
             if not (isinstance(locked, dict) and locked.get('locked')):
-                break                       # 已被解锁
+                break
             modes = d.get('modes') or []
             li = locked.get('index', -1)
-            if not (0 <= li < len(modes)):
-                continue                    # 锁定档位已被编辑删掉，继续守到用户解锁
-            mode = modes[li]
-            base, token, active = _lock_daemon_target()
-            if not base or not active:
-                continue                    # daemon 没起 / 无会话，下轮再看
-            sid = active.get('id')
-            cur = ((active.get('agent_config') or {}).get('model') or '')
-            want_id = _locked_main_id(base, token, mode['main'])
-            if not want_id or cur == want_id:
+            if not isinstance(li, int) or not 0 <= li < len(modes):
                 continue
-            # 活动会话被改成了别的模型 → 改回档位主模型
-            ok, _ = _session_set_model(base, token, sid, mode)
-            if ok:
-                log('mode-lock: session %s model %s -> %s' % (sid, cur, mode['main']))
+            mode = modes[li]
+            config = _load_toml(get_config_content()) or {}
+            if detect_active_mode(modes, config) != li:
+                if time.monotonic() >= retry_at:
+                    retry_at = time.monotonic() + 10
+                    ok, msg = apply_mode(li)
+                    if not ok:
+                        log('mode-lock: config drift correction failed: %s' % msg)
+                continue
+            base, token, targets = _lock_daemon_target()
+            if not base or not targets:
+                continue
+            want_id = _locked_main_id(base, token, mode['main'])
+            if not want_id:
+                continue
+            for item in targets:
+                if _LOCK_STOP.is_set() or _LOCK_GEN[0] != gen:
+                    break
+                sid, cur = item['id'], item['model']
+                if cur == want_id:
+                    continue
+                ok, _ = _session_set_model(base, token, sid, mode)
+                if ok:
+                    log('mode-lock: session %s model %s -> %s' % (sid, cur, mode['main']))
         except Exception:
-            pass                            # 静默重试，守护不能崩
+            pass
 
 
 def _start_lock_guard():
@@ -2166,9 +2201,9 @@ def _stop_lock_guard():
         _LOCK_THREAD[0] = None
 
 
-def lock_mode(index):
+def lock_mode(index, session_id=None):
     """锁到第 index 档：apply + 记 locked + 起守护。"""
-    ok, msg = apply_mode(index)
+    ok, msg = apply_mode(index, session_id)
     if not ok:
         return False, msg
     with CONFIG_LOCK:
@@ -3127,24 +3162,28 @@ class Handler(BaseHTTPRequestHandler):
                                    'data': get_modes_data()})
 
             if path == '/api/modes/apply':
-                idx = req.get('index')
+                idx, sid = req.get('index'), req.get('session_id')
                 if isinstance(idx, bool) or not isinstance(idx, int):
                     return self._json({'success': False, 'message': 'index 必须是整数'}, 400)
+                if sid is not None and (not isinstance(sid, str) or not _MODE_SESSION_RE.fullmatch(sid)):
+                    return self._json({'success': False, 'message': 'session_id 不合法'}, 400)
                 # 锁定时滑到别的档 = 解锁旧档 + 锁新档（locked 状态保持，档位换）
                 d0 = load_modes()
                 locked = d0.get('locked')
                 if isinstance(locked, dict) and locked.get('locked'):
-                    ok, msg = lock_mode(idx)
+                    ok, msg = lock_mode(idx, sid)
                 else:
-                    ok, msg = apply_mode(idx)
+                    ok, msg = apply_mode(idx, sid)
                 return self._json({'success': ok, 'message': msg, 'data': get_modes_data()},
                                   200 if ok else 400)
 
             if path == '/api/modes/lock':
-                idx = req.get('index')
+                idx, sid = req.get('index'), req.get('session_id')
                 if isinstance(idx, bool) or not isinstance(idx, int):
                     return self._json({'success': False, 'message': 'index 必须是整数'}, 400)
-                ok, msg = lock_mode(idx)
+                if sid is not None and (not isinstance(sid, str) or not _MODE_SESSION_RE.fullmatch(sid)):
+                    return self._json({'success': False, 'message': 'session_id 不合法'}, 400)
+                ok, msg = lock_mode(idx, sid)
                 return self._json({'success': ok, 'message': msg, 'data': get_modes_data()},
                                   200 if ok else 400)
 

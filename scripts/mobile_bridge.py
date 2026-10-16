@@ -42,6 +42,10 @@ try:
     import mobile_usage as _mobile_usage
 except ImportError:                          # 仅本脚本被单独复制时降级
     _mobile_usage = None
+try:
+    import mobile_panel as _mobile_panel
+except ImportError:
+    _mobile_panel = None
 
 CONTROL_PREFIX = '/api/mobile'
 RELAY_CONSENT_VERSION = 'cloudflare-quick-2026-09-v1'
@@ -245,7 +249,7 @@ def _static_allowed(path):
 _INJECT_TAG_RE = re.compile(
     r'\s*<script\b[^>]*?\bsrc\s*=\s*["\']/assets/(?:vendor/qrcodegen'
     r'|kimi-(?:embedded|usage)-(?:data|widget)|kimi-remote-(?:qr|api|widget)'
-    r'|kimi-mobile-api)\.js[^"\']*["\'][^>]*>(?:</script>)?\s*',
+    r'|kimi-mobile-api|kimi-model-tabs)\.js[^"\']*["\'][^>]*>(?:</script>)?\s*',
     re.IGNORECASE)
 
 # ---------- sessions 精确路由表（对照 native kap-server 路由） ----------
@@ -2065,6 +2069,10 @@ class _LanHandler(BaseHTTPRequestHandler):
             if not self._session_ok():
                 return self._err(403, '未配对或会话已过期，请重新扫码配对')
             return self._usage_data()
+        if path.startswith('/mobile/panel/'):
+            if not self._session_ok():
+                return self._err(403, '未配对或会话已过期，请重新扫码配对')
+            return self._panel_request(path)
         if path.startswith('/mobile/'):
             return self._err(404, '接口不存在')
         if not self._session_ok():
@@ -2304,6 +2312,65 @@ class _LanHandler(BaseHTTPRequestHandler):
         self.mgr.session_touch(self._session_sid(), self._generation)
         self._send_raw(200, body, 'application/json; charset=utf-8')
 
+    def _panel_request(self, path):
+        if _mobile_panel is None:
+            return self._err(503, '手机面板暂时不可用')
+        action = path[len('/mobile/panel/'):]
+        if not action or '/' in action:
+            return self._err(404, '接口不存在')
+        if self.command == 'GET':
+            if action not in _mobile_panel.READ_ROUTES:
+                return self._err(404, '接口不存在')
+            request = None
+        elif self.command == 'POST':
+            if action not in _mobile_panel.WRITE_ROUTES:
+                return self._err(404, '接口不存在')
+            if (self.headers.get('Content-Type') or '').split(';', 1)[0].strip().lower() != 'application/json':
+                return self._err(415, '只接受 JSON 请求')
+            body = self._read_body(16384)
+            if body is None:
+                return
+            try:
+                def unique(pairs):
+                    out = {}
+                    for key, value in pairs:
+                        if key in out:
+                            raise ValueError('duplicate key')
+                        out[key] = value
+                    return out
+                request = json.loads(body.decode('utf-8'), object_pairs_hook=unique,
+                                     parse_constant=lambda value: (_ for _ in ()).throw(ValueError()))
+            except (ValueError, UnicodeError):
+                return self._err(400, 'JSON 请求不合法')
+        else:
+            return self._err(404, '接口不存在')
+        if (action == 'provider' and isinstance(request, dict) and
+                isinstance(request.get('provider'), dict) and
+                request['provider'].get('key_action') == 'replace' and
+                not self._secure_cookie):
+            return self._err(403, '明文连接不允许提交密钥，请在电脑端操作')
+        try:
+            if self.command == 'POST' and isinstance(request, dict):
+                alias = request.get('alias') if action == 'default' else None
+                if action == 'model' and request.get('set_default') is True:
+                    alias = (request.get('model') or {}).get('alias')
+                if alias is not None:
+                    main = self._locked_mode_main()
+                    if main is not None and alias != main:
+                        return self._err(409, '档位已锁定，请先切档或解锁再设置默认模型')
+            status, payload = _mobile_panel.call(action, self.command, request)
+            data = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode('utf-8')
+        except MobileBridgeError as error:
+            return self._err(503, str(error))
+        except _mobile_panel.PanelError as error:
+            return self._err(error.status, str(error))
+        except Exception:
+            return self._err(503, '手机面板暂时不可用')
+        data = _redact_token(data, self.mgr.inject_token(self._generation))
+        if status < 500:
+            self.mgr.session_touch(self._session_sid(), self._generation)
+        self._send_raw(status, data, 'application/json; charset=utf-8')
+
     # ---------- API allowlist ----------
     @staticmethod
     def _api_allowed(method, path):
@@ -2470,6 +2537,142 @@ class _LanHandler(BaseHTTPRequestHandler):
         self.mgr.session_touch(self._session_sid(), self._generation)
         return self._proxy_http(raw_path, body=body)
 
+    def _locked_mode_main(self):
+        if _mobile_panel is None:
+            raise MobileBridgeError('无法确认档位锁，请稍后重试')
+        try:
+            status, data = _mobile_panel.call('modes', 'GET')
+            locked = data.get('locked')
+            if status != 200 or not isinstance(locked, dict) or type(locked.get('locked')) is not bool:
+                raise ValueError()
+            if not locked['locked']:
+                return None
+            index, modes = locked.get('index'), data.get('modes')
+            if type(index) is not int or not isinstance(modes, list) or not 0 <= index < len(modes):
+                raise ValueError()
+            main = modes[index].get('main')
+            if (not isinstance(main, str) or not main or len(main) > 256
+                    or any(ord(c) < 32 or ord(c) == 127 for c in main)):
+                raise ValueError()
+            return main
+        except Exception:
+            raise MobileBridgeError('无法确认档位锁，请稍后重试')
+
+    def _mode_owner_json(self, method, path, snapshot, sid, body=None):
+        config_write = (method == 'POST' and path == '/api/v1/config' and
+                        isinstance(body, dict) and set(body) == {'default_model'} and
+                        isinstance(body['default_model'], str) and bool(body['default_model']))
+        if not ((method == 'GET' and path == '/api/v1/models') or config_write):
+            raise MobileBridgeError('锁定校准接口不被允许')
+        host, port, token = snapshot
+        conn, sock = None, None
+        try:
+            conn = http.client.HTTPConnection(host, port, timeout=5)
+            conn.connect()
+            sock = conn.sock
+            if sock is None or not self.mgr.track_socket(sock, generation=self._generation):
+                raise ValueError()
+            if not self.mgr.first_authorization_valid(self._generation, snapshot, sid):
+                raise ValueError()
+            content = None if body is None else json.dumps(body, allow_nan=False).encode('utf-8')
+            headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json',
+                       'Accept-Encoding': 'identity'}
+            if content is not None:
+                headers['Content-Type'] = 'application/json'
+            conn.request(method, path, body=content, headers=headers)
+            resp = conn.getresponse()
+            if resp.status != 200 or (resp.length is not None and resp.length > 1024 * 1024):
+                raise ValueError()
+            deadline, chunks, total = time.monotonic() + 5, [], 0
+            while True:
+                if not self.mgr.authorization_valid(self._generation, snapshot, sid):
+                    raise ValueError()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ValueError()
+                try:
+                    sock.settimeout(min(5, remaining))
+                except OSError:
+                    pass
+                chunk = resp.read1(min(65536, 1024 * 1024 + 1 - total))
+                if not chunk:
+                    if resp.length not in (0, None):
+                        raise ValueError()
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > 1024 * 1024:
+                    raise ValueError()
+            result = json.loads(b''.join(chunks).decode('utf-8'))
+            if not isinstance(result, dict) or result.get('code') not in (0, '0'):
+                raise ValueError()
+            return result.get('data') if isinstance(result.get('data'), dict) else {}
+        except Exception:
+            raise MobileBridgeError('锁定模型校准失败，请稍后重试')
+        finally:
+            if sock is not None:
+                self.mgr.track_socket(sock, on=False, generation=self._generation)
+            if conn is not None:
+                conn.close()
+
+    def _mode_lock_body(self, raw_path, body, snapshot, sid):
+        if self.command != 'POST':
+            return body
+        path = self._clean_path() or ''
+        target = re.fullmatch(r'/api/v1/sessions/([^/]+)/(profile|prompts)', path)
+        if path not in ('/api/v1/config', '/api/v1/sessions') and target is None:
+            return body
+        try:
+            data = json.loads(body.decode('utf-8'), object_pairs_hook=_json_no_dup_object)
+            if not isinstance(data, dict):
+                return self._err(400, '模型请求必须是 JSON 对象')
+            if path == '/api/v1/config' and 'default_model' not in data:
+                return body
+            prompt = target is not None and target.group(2) == 'prompts'
+            if prompt and data.get('agent_id') not in (None, 'main'):
+                return body
+            main = self._locked_mode_main()
+            if main is None:
+                return body
+            if target is not None and not re.fullmatch(r'session_[A-Za-z0-9_-]{8,100}', target.group(1)):
+                return self._err(400, '会话标识不合法')
+            models = self._mode_owner_json('GET', '/api/v1/models', snapshot, sid).get('items') or []
+            model = next((m for m in models if isinstance(m, dict) and
+                          (m.get('id') == main or m.get('model') == main)), None)
+            canonical = (model.get('id') or model.get('model')) if model else None
+            if not isinstance(canonical, str) or not canonical:
+                raise MobileBridgeError('锁档模型未加载，请在电脑端重新载入配置')
+            allowed = {main, canonical}
+            if path == '/api/v1/config':
+                if data.get('default_model') not in allowed:
+                    return self._err(409, '档位已锁定，请在面板切档或解锁后再修改模型')
+                data['default_model'] = main
+            else:
+                agent = data.get('agent_config')
+                if agent is not None and not isinstance(agent, dict):
+                    return self._err(400, 'agent_config 必须是对象')
+                agent = dict(agent or {})
+                profile = target is not None and target.group(2) == 'profile'
+                if profile and (('model' in agent and agent['model'] not in allowed) or
+                                ('model' in data and data['model'] not in allowed)):
+                    return self._err(409, '档位已锁定，请在面板切档或解锁后再修改模型')
+                if path == '/api/v1/sessions' or profile or 'agent_config' in data:
+                    agent['model'] = canonical
+                    data['agent_config'] = agent
+                if prompt or 'model' in data:
+                    data['model'] = canonical
+                if path == '/api/v1/sessions':
+                    self._mode_owner_json('POST', '/api/v1/config', snapshot, sid,
+                                          {'default_model': main})
+            if self._locked_mode_main() != main:
+                return self._err(409, '档位状态已变化，请重新发送')
+            return json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8')
+        except MobileBridgeError as error:
+            self._err(503, str(error))
+        except Exception:
+            self._err(400, '模型请求格式不合法')
+        return None
+
     def _read_body(self, limit, idle=None, total=None):
         if self.headers.get_all('Transfer-Encoding'):
             self._err(400, '请求体格式不被支持')
@@ -2530,6 +2733,9 @@ class _LanHandler(BaseHTTPRequestHandler):
         snapshot = self.mgr.upstream_snapshot(self._generation)
         if not snapshot or not sid:
             return self._err(503, '手机连接已停止')
+        body = self._mode_lock_body(raw_path, body, snapshot, sid)
+        if body is None:
+            return
         host, port, token = snapshot
         conn = None
         tracked_sock = None

@@ -182,7 +182,13 @@ _TOP_KEYS = {
 _QUOTA_KEYS = {'used': _NUM, 'limit': _NUM, 'pct': _NUM, 'pace': _NUM,
                'reset': _STR, 'eta': _STR}
 _MODEL_KEYS = {'model': _STR, 'tokens_fmt': _STR, 'calls': _NUM,
-               'cache_pct': _NUM, 'cost_fmt': _STR}
+               'cache_pct': _NUM, 'cost_fmt': _STR, 'in_fmt': _STR, 'out_fmt': _STR}
+_DAY_KEYS = {'label': _STR, 'date': _STR, 'tokens': _NUM,
+             'tokens_fmt': _STR, 'calls': _NUM, 'cost': _NUM}
+_HOUR_KEYS = {'hour': _NUM, 'tokens': _NUM, 'calls': _NUM, 'tokens_fmt': _STR}
+_POINT_KEYS = {'label': _STR, 'tokens': _NUM, 'calls': _NUM}
+_SESSION_KEYS = {'short': _STR, 'tokens_fmt': _STR, 'calls': _NUM,
+                 'cache_pct': _NUM, 'cost_fmt': _STR}
 
 
 def _proj_dict(obj, keys, name):
@@ -214,6 +220,8 @@ def _project(raw):
     for key, keys in _TOP_KEYS.items():
         if key in raw and raw[key] is not None:
             out[key] = _proj_dict(raw[key], keys, key)
+            if key in ('today', 'yesterday', 'week', 'month') and isinstance(raw[key].get('models'), list):
+                out[key]['models'] = _proj_models(raw[key]['models'], key + '.models')
     quota = raw.get('quota')
     if quota is not None:
         if not isinstance(quota, dict):
@@ -227,6 +235,28 @@ def _project(raw):
     for key in ('today_models', 'cumul_models'):
         if key in raw and raw[key] is not None:
             out[key] = _proj_models(raw[key], key)
+    for key, fields, limit in (('days30', _DAY_KEYS, 31),
+                               ('hourly', _HOUR_KEYS, 24),
+                               ('sessions', _SESSION_KEYS, 8)):
+        if key in raw and raw[key] is not None:
+            if not isinstance(raw[key], list):
+                _fail_closed('用量数据结构不合规')
+            out[key] = [_proj_dict(item, fields, key) for item in raw[key][:limit]]
+    series = raw.get('timeseries')
+    if series is not None:
+        if not isinstance(series, dict):
+            _fail_closed('用量数据结构不合规')
+        out['timeseries'] = {}
+        for key, limit in (('today', 24), ('week', 7), ('month', 30)):
+            if key not in series or series[key] is None:
+                continue
+            points = series[key].get('points') if isinstance(series[key], dict) else None
+            if not isinstance(points, list):
+                _fail_closed('用量数据结构不合规')
+            out['timeseries'][key] = {'points': [_proj_dict(item, _POINT_KEYS, key)
+                                                    for item in points[:limit]]}
+    if isinstance(raw.get('session'), dict):
+        out['session'] = _proj_dict(raw['session'], _SESSION_KEYS, 'session')
     return out
 
 
@@ -499,6 +529,9 @@ ov.querySelector('.ku-mask').addEventListener('click',close);
 ov.querySelector('[data-ku-back]').addEventListener('click',close);
 })();
 </script>"""
+
+
+from mobile_panel_ui import PAGE_HTML as USAGE_PAGE_HTML, OVERLAY_HTML as USAGE_OVERLAY_HTML
 
 
 __all__ = ['fetch_usage', 'reset_cache', 'UsageFetchError', 'USAGE_PAGE_HTML',

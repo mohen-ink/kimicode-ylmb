@@ -3732,10 +3732,21 @@
     }).then(function(r) { return r.json(); });
   }
 
+  function kmdTargetBody(index) {
+    var body = { index: index };
+    try {
+      var app = document.querySelector('#app').__vue_app__;
+      var pinia = app.config.globalProperties.$pinia;
+      var sessions = pinia._s.get('kimi.sessions');
+      var sid = sessions && sessions.activeSessionId;
+      if (typeof sid === 'string' && /^session_[A-Za-z0-9_-]{8,100}$/.test(sid)) body.session_id = sid;
+    } catch (e) { /* no active session */ }
+    return body;
+  }
+
   function kmdApply(i) {
     if (kmdBusy || !kmdData) return;
     i = Math.round(i);
-    if (i === kmdData.active) { kmdRender(); return; }
     var card = document.getElementById(CARD_ID);
     var range = card && card.querySelector('#ku-mode-range');
     var prevActive = kmdData.active;
@@ -3746,7 +3757,7 @@
     if (range && kmdDragging) { kmdDragging = false; kmdSnapTo(range, i, null); }
     else if (range) range.value = String(i);
     kmdRender();
-    kmdPost('/api/modes/apply', { index: i })
+    kmdPost('/api/modes/apply', kmdTargetBody(i))
       .then(function(d) {
         if (d.success) {
           if (d.data) { kmdData = d.data; }
@@ -3889,7 +3900,7 @@
     if (!locked && (idx == null || idx < 0)) { kmmToast('先选一档再锁定', true); return; }
     kmdLockBusy = true;
     kmdRenderLock();
-    var call = locked ? kmdPost('/api/modes/unlock', {}) : kmdPost('/api/modes/lock', { index: idx });
+    var call = locked ? kmdPost('/api/modes/unlock', {}) : kmdPost('/api/modes/lock', kmdTargetBody(idx));
     call.then(function(d) {
       if (d.success) {
         if (d.data) kmdData = d.data;
