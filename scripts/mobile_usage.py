@@ -432,7 +432,7 @@ function render(host,d){
     st.textContent='采集于 '+(d.updated_at||'未知');
     st.className='ku-st';}}
 function kimiUsageMount(host,root){
-  var POLL=5000,FETCH_TIMEOUT=5500,timer=null,inflight=null,alive=true;
+  var POLL=15000,FETCH_TIMEOUT=12000,timer=null,inflight=null,alive=true;
   function q(k){return host.querySelector('[data-ku="'+k+'"]');}
   function fail(t){var st=q('status');if(st){st.textContent=t;st.className='ku-st ku-err';}}
   function poll(){
@@ -442,10 +442,21 @@ function kimiUsageMount(host,root){
     var to=setTimeout(function(){ctrl.abort();},FETCH_TIMEOUT);
     fetch(root+'/mobile/usage/data',{headers:{'Accept':'application/json'},signal:ctrl.signal})
       .then(function(r){
-        if(r.status===403){location.replace(root+'/mobile/pair');return null;}
-        if(!r.ok)throw new Error('bad');
-        return r.json();})
-      .then(function(d){if(d)render(host,d);})
+        // 隧道/中继在配对失效时回的是 HTML 页面，直接 r.json() 会把 <!doctype
+        // 当 JSON 解析，界面就冒出 Unexpected token '<'。先取文本再判类型。
+        return r.text().then(function(body){
+          var type=(r.headers.get('content-type')||'').toLowerCase();
+          if(r.status===403&&type.indexOf('json')<0)return {redirect:true};
+          if(type.indexOf('json')<0)throw new Error('njson');
+          var d;try{d=JSON.parse(body)}catch(e){throw new Error('njson')}
+          if(r.status===403)return {redirect:true};
+          if(!r.ok)throw new Error('bad');
+          return d;});
+      })
+      .then(function(d){
+        if(!d)return;
+        if(d.redirect){location.replace(root+'/mobile/pair');return;}
+        render(host,d);})
       .catch(function(e){if(e&&e.name!=='AbortError')fail('用量数据暂时不可用');else if(e)fail('用量数据请求超时');})
       .finally(function(){clearTimeout(to);inflight=null;});}
   function loop(){poll();if(alive)timer=setTimeout(loop,POLL);}

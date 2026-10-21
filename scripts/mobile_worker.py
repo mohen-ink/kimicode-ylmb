@@ -60,7 +60,7 @@ from mobile_bridge import (
     _TRUSTED_APP_ORIGIN, local_lan_addresses)
 
 WORKER_PROTOCOL = 1
-WORKER_VERSION = 'mobile-panel-lock-2'
+WORKER_VERSION = 'mobile-panel-json-errors-7'
 WORKER_HEADER = 'X-Kimi-Mobile-Worker'
 WORKER_MAX_BODY = 8192
 SECRET_BYTES = 32

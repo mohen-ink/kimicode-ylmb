@@ -32,7 +32,7 @@ import time
 from email.errors import StartBoundaryNotFoundDefect, MultipartInvariantViolationDefect
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit, unquote, quote
+from urllib.parse import urlsplit, unquote, quote, parse_qs
 
 _NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -190,7 +190,7 @@ _TRUSTED_APP_ORIGIN = 'app://renderer'
 # 机器级 / 越权面：任何方法都不放行（按路径段精确匹配，防尾缀绕过）
 _API_DENY_PREFIXES = (
     '/api/v1/debug', '/api/v1/shutdown', '/api/v1/remote-control',
-    '/api/v1/authority', '/api/v1/providers', '/api/v1/plugins',
+    '/api/v1/authority', '/api/v1/plugins',
     '/api/v1/mcp', '/api/v1/oauth', '/api/v1/connections',
     '/api/v1/gui-store', '/api/v1/runtime', '/api/v1/ws',
     '/api/v1/fs',      # 覆盖 /api/v1/fs::browse /fs::content 等全部 fs: 动作
@@ -201,6 +201,7 @@ _API_READ_ONLY = (
     '/api/v1/healthz', '/api/v1/meta', '/api/v1/models',
     '/api/v1/workspaces', '/api/v1/skills', '/api/v1/tools',
     '/api/v1/capabilities', '/api/v1/search', '/api/v1/media',
+    '/api/v1/providers',   # 供应商列表只读：写面（POST/PUT/DELETE）仍被下方 method 拒
     '/api/v1/auth',        # models_ready 探测，非 secret
     '/api/v1/config',      # 原生已脱敏；POST 见 _route 的 _config_post 白名单分支
 )
@@ -249,7 +250,7 @@ def _static_allowed(path):
 _INJECT_TAG_RE = re.compile(
     r'\s*<script\b[^>]*?\bsrc\s*=\s*["\']/assets/(?:vendor/qrcodegen'
     r'|kimi-(?:embedded|usage)-(?:data|widget)|kimi-remote-(?:qr|api|widget)'
-    r'|kimi-mobile-api|kimi-model-tabs)\.js[^"\']*["\'][^>]*>(?:</script>)?\s*',
+    r'|kimi-mobile-api|kimi-model-tabs|kimi-mobile-nav)\.js[^"\']*["\'][^>]*>(?:</script>)?\s*',
     re.IGNORECASE)
 
 # ---------- sessions 精确路由表（对照 native kap-server 路由） ----------
@@ -316,6 +317,15 @@ _ENCODED_SEP_RE = re.compile(r'%2f|%5c', re.IGNORECASE)
 _USAGE_ENTRY_HTML = (
     _mobile_usage.USAGE_OVERLAY_HTML.encode('utf-8')
     if _mobile_usage is not None else b'')
+
+# 手机端 SPA 交互补丁（assets/kimi-mobile-nav.js）的注入装置。
+# 该资产由插件 service.py 的 REMOTE_ASSETS 同步到 desktop-dist/assets，供手机
+# 经 /assets/ 转发取用；桥先从 SPA index 剥掉桌面注入的同名标签（_INJECT_TAG_RE
+# 已含 kimi-mobile-nav），再在此处自行下发，保证「手机标记 → 外部脚本」的顺序：
+#   _MOBILE_BRIDGE_HEAD 必须在 SPA 模块脚本之前执行（脚本据此判定手机页）；
+#   _MOBILE_NAV_TAG 在 body 末尾引入外部脚本本体。
+_MOBILE_BRIDGE_HEAD = b'<script>window.__kimiMobileBridge=true;</script>'
+_MOBILE_NAV_TAG = b'<script src="/assets/kimi-mobile-nav.js"></script>'
 
 # 局域网是明文 HTTP＝非安全上下文，浏览器不提供 crypto.randomUUID，原生前端
 # 渲染输入区时会抛错。仅在缺失时补一个基于 getRandomValues 的实现。
@@ -2318,9 +2328,19 @@ class _LanHandler(BaseHTTPRequestHandler):
         action = path[len('/mobile/panel/'):]
         if not action or '/' in action:
             return self._err(404, '接口不存在')
+        query = None
         if self.command == 'GET':
             if action not in _mobile_panel.READ_ROUTES:
                 return self._err(404, '接口不存在')
+            if action == 'modes':
+                params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                if set(params) - {'session_id'} or any(len(values) != 1 for values in params.values()):
+                    return self._err(400, '请求参数不合法')
+                sid = params.get('session_id', [None])[0]
+                if sid is not None:
+                    if not re.fullmatch(r'session_[A-Za-z0-9_-]{8,100}', sid):
+                        return self._err(400, '会话标识不合法')
+                    query = {'session_id': sid}
             request = None
         elif self.command == 'POST':
             if action not in _mobile_panel.WRITE_ROUTES:
@@ -2358,7 +2378,7 @@ class _LanHandler(BaseHTTPRequestHandler):
                     main = self._locked_mode_main()
                     if main is not None and alias != main:
                         return self._err(409, '档位已锁定，请先切档或解锁再设置默认模型')
-            status, payload = _mobile_panel.call(action, self.command, request)
+            status, payload = _mobile_panel.call(action, self.command, request, query=query)
             data = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode('utf-8')
         except MobileBridgeError as error:
             return self._err(503, str(error))
@@ -2537,26 +2557,64 @@ class _LanHandler(BaseHTTPRequestHandler):
         self.mgr.session_touch(self._session_sid(), self._generation)
         return self._proxy_http(raw_path, body=body)
 
-    def _locked_mode_main(self):
+    def _locked_mode_info(self):
+        """返回当前生效的锁信息：
+        {'main','scope'} 全局锁；或 {'main','scope':'session','session_id'}；
+        没有锁返回 None。单对话锁不约束其它对话。"""
         if _mobile_panel is None:
             raise MobileBridgeError('无法确认档位锁，请稍后重试')
         try:
             status, data = _mobile_panel.call('modes', 'GET')
+            if status != 200:
+                raise ValueError()
             locked = data.get('locked')
-            if status != 200 or not isinstance(locked, dict) or type(locked.get('locked')) is not bool:
+            if not isinstance(locked, dict):
                 raise ValueError()
-            if not locked['locked']:
-                return None
-            index, modes = locked.get('index'), data.get('modes')
-            if type(index) is not int or not isinstance(modes, list) or not 0 <= index < len(modes):
-                raise ValueError()
-            main = modes[index].get('main')
-            if (not isinstance(main, str) or not main or len(main) > 256
-                    or any(ord(c) < 32 or ord(c) == 127 for c in main)):
-                raise ValueError()
-            return main
+            if locked.get('locked') is True:
+                out = self._lock_entry(data, locked, 'global')
+                if out:
+                    return out
+            # 单对话锁：只在该对话的请求里生效，按请求目标判定
+            return None
+        except MobileBridgeError:
+            raise
         except Exception:
             raise MobileBridgeError('无法确认档位锁，请稍后重试')
+
+    @staticmethod
+    def _lock_entry(data, entry, scope):
+        index, modes = entry.get('index'), data.get('modes')
+        if type(index) is not int or not isinstance(modes, list) or not 0 <= index < len(modes):
+            return None
+        main = modes[index].get('main')
+        if (not isinstance(main, str) or not main or len(main) > 256
+                or any(ord(c) < 32 or ord(c) == 127 for c in main)):
+            return None
+        return {'main': main, 'scope': scope}
+
+    def _session_lock_main(self, sid):
+        """该对话自己的锁：返回 main 或 None。请求未带会话标识时不生效。"""
+        if not isinstance(sid, str) or not re.fullmatch(r'session_[A-Za-z0-9_-]{8,100}', sid):
+            return None
+        if _mobile_panel is None:
+            raise MobileBridgeError('无法确认档位锁，请稍后重试')
+        try:
+            status, data = _mobile_panel.call('modes', 'GET', query={'session_id': sid})
+            if status != 200:
+                raise ValueError()
+            entry = data.get('session_lock')
+            if not isinstance(entry, dict) or entry.get('locked') is not True:
+                return None
+            out = self._lock_entry(data, entry, 'session')
+            return out['main'] if out else None
+        except MobileBridgeError:
+            raise
+        except Exception:
+            raise MobileBridgeError('无法确认档位锁，请稍后重试')
+
+    def _locked_mode_main(self):
+        info = self._locked_mode_info()
+        return info['main'] if info else None
 
     def _mode_owner_json(self, method, path, snapshot, sid, body=None):
         config_write = (method == 'POST' and path == '/api/v1/config' and
@@ -2615,6 +2673,62 @@ class _LanHandler(BaseHTTPRequestHandler):
             if conn is not None:
                 conn.close()
 
+    def _canonical_for(self, main, snapshot, sid):
+        models = self._mode_owner_json('GET', '/api/v1/models', snapshot, sid).get('items') or []
+        model = next((m for m in models if isinstance(m, dict) and
+                      (m.get('id') == main or m.get('model') == main)), None)
+        canonical = (model.get('id') or model.get('model')) if model else None
+        if not isinstance(canonical, str) or not canonical:
+            raise MobileBridgeError('锁档模型未加载，请在电脑端重新载入配置')
+        return canonical
+
+    def _lock_prompt_body(self, data, target, snapshot, sid, global_main):
+        """发消息：全局锁优先；没有全局锁时只按目标对话自己的锁收敛。"""
+        target_sid = target.group(1) if target is not None else None
+        main = global_main
+        if main is None:
+            main = self._session_lock_main(target_sid)
+        if main is None:
+            return json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8')
+        canonical = self._canonical_for(main, snapshot, sid)
+        allowed = {main, canonical}
+        agent = data.get('agent_config')
+        if agent is not None and not isinstance(agent, dict):
+            return self._err(400, 'agent_config 必须是对象')
+        if isinstance(agent, dict) and 'model' in agent and agent['model'] not in allowed:
+            return self._err(409, '档位已锁定，请在面板切档或解锁后再修改模型')
+        if 'model' in data and data['model'] not in allowed:
+            return self._err(409, '档位已锁定，请在面板切档或解锁后再修改模型')
+        if isinstance(agent, dict) or 'agent_config' in data:
+            agent = dict(agent or {})
+            agent['model'] = canonical
+            data['agent_config'] = agent
+        data['model'] = canonical
+        return json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8')
+
+    def _session_lock_body(self, data, target, snapshot, sid):
+        """没有全局锁时：只有目标对话自己的锁生效，且不碰全局配置与新建对话。"""
+        target_sid = target.group(1) if target is not None else None
+        main = self._session_lock_main(target_sid)
+        if main is None:
+            return json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8')
+        canonical = self._canonical_for(main, snapshot, sid)
+        allowed = {main, canonical}
+        profile = target is not None and target.group(2) == 'profile'
+        if not profile:
+            # /api/v1/config、新建会话不受单对话锁约束
+            return json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8')
+        agent = data.get('agent_config')
+        if agent is not None and not isinstance(agent, dict):
+            return self._err(400, 'agent_config 必须是对象')
+        if (('model' in (agent or {}) and agent['model'] not in allowed) or
+                ('model' in data and data['model'] not in allowed)):
+            return self._err(409, '本对话档位已锁定，请在面板切档或解锁后再修改模型')
+        agent = dict(agent or {})
+        agent['model'] = canonical
+        data['agent_config'] = agent
+        return json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8')
+
     def _mode_lock_body(self, raw_path, body, snapshot, sid):
         if self.command != 'POST':
             return body
@@ -2632,8 +2746,11 @@ class _LanHandler(BaseHTTPRequestHandler):
             if prompt and data.get('agent_id') not in (None, 'main'):
                 return body
             main = self._locked_mode_main()
+            if prompt:
+                return self._lock_prompt_body(data, target, snapshot, sid, main)
             if main is None:
-                return body
+                # 没有全局锁：只按该对话自己的锁收敛 profile / 配置
+                return self._session_lock_body(data, target, snapshot, sid)
             if target is not None and not re.fullmatch(r'session_[A-Za-z0-9_-]{8,100}', target.group(1)):
                 return self._err(400, '会话标识不合法')
             models = self._mode_owner_json('GET', '/api/v1/models', snapshot, sid).get('items') or []
@@ -2819,12 +2936,19 @@ class _LanHandler(BaseHTTPRequestHandler):
                     # 仅 SPA index（非 /api/ 路径）追加同源 /mobile/usage 入口；
                     # /api/ 提供的 HTML 内容保持字节不变
                     if not raw_path.startswith('/api/'):
+                        # 手机标记脚本先于 SPA 模块脚本执行：kimi-mobile-nav.js
+                        # 据此判定"当前是手机页"，只在该页安装滚动修护与插队按钮
                         if b'<head>' in data:
-                            data = data.replace(b'<head>', b'<head>' + _RANDOM_UUID_SHIM, 1)
-                        if b'</body>' in data:
-                            data = data.replace(b'</body>', _USAGE_ENTRY_HTML + b'</body>', 1)
+                            data = data.replace(b'<head>', b'<head>' + _RANDOM_UUID_SHIM
+                                                + _MOBILE_BRIDGE_HEAD, 1)
                         else:
-                            data += _USAGE_ENTRY_HTML
+                            data = _MOBILE_BRIDGE_HEAD + data
+                        # body 末尾：用量入口 + 手机交互补丁外部脚本
+                        tail = _USAGE_ENTRY_HTML + _MOBILE_NAV_TAG
+                        if b'</body>' in data:
+                            data = data.replace(b'</body>', tail + b'</body>', 1)
+                        else:
+                            data += tail
                 except Exception:
                     pass
             # 出向体检：响应体/响应头中若出现真实 server.token 的原文、
@@ -2846,11 +2970,18 @@ class _LanHandler(BaseHTTPRequestHandler):
             normalized = _redact_token(normalized, token)
             if not self.mgr.authorization_valid(self._generation, snapshot, sid):
                 return
+            asset_path = self._clean_path() or ''
+            cacheable = (resp.status == 200 and self.command in ('GET', 'HEAD')
+                         and asset_path.startswith('/assets/')
+                         and asset_path.rsplit('/', 1)[-1] != 'kimi-usage-data.js'
+                         and asset_path.lower().endswith(('.js', '.css', '.woff', '.woff2', '.ttf', '.png', '.svg', '.ico')))
             self._send_status(resp.status)
             for k, v in rh:
+                if cacheable and k.lower() in ('cache-control', 'expires', 'pragma'):
+                    continue
                 self.send_header(k, v)
             self.send_header('Content-Length', str(len(data)))
-            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Cache-Control', 'private, max-age=3600' if cacheable else 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self._end_headers()
             if self.command != 'HEAD':
@@ -3345,7 +3476,9 @@ class _LanHandler(BaseHTTPRequestHandler):
         self._conn_hdr_sent = True
         if code == 429:
             close_hdr.append(('Retry-After', '1'))
-        if (self.path or '').startswith('/api/'):
+        path = (self.path or '').split('?', 1)[0]
+        if (path.startswith('/api/') or path.startswith('/mobile/panel/')
+                or path in ('/mobile/usage/data', '/mobile/pair/exchange')):
             # envelope：error 兼容旧前端；code=HTTP 状态码，msg/data 对齐 native
             body = json.dumps({'error': msg, 'code': code, 'msg': msg,
                                'data': None}, ensure_ascii=False).encode('utf-8')

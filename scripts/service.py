@@ -36,6 +36,7 @@ import time
 import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 _NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -44,7 +45,7 @@ PLUGIN_ROOT = os.environ.get('KIMI_PLUGIN_ROOT') or os.path.dirname(os.path.dirn
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_SRC = os.path.join(PLUGIN_ROOT, 'assets')
 HOME = os.path.expanduser('~')
-KIMI_HOME = os.path.join(HOME, '.kimi-code')
+KIMI_HOME = os.environ.get('KIMI_CODE_HOME') or os.path.join(HOME, '.kimi-code')
 CONFIG_PATH = os.path.join(KIMI_HOME, 'config.toml')
 CONFIG_NEW_PATH = os.path.join(KIMI_HOME, 'config-new.toml')
 STATE_FILE = os.path.join(KIMI_HOME, 'usage-collector-state.json')
@@ -53,13 +54,14 @@ LOG_FILE = os.path.join(SCRIPT_DIR, 'service.log')
 WIDGET_SRC = os.path.join(ASSETS_SRC, 'kimi-usage-widget.js')
 # 远程控制（本机 QR/链接手机遥控）可选资产，固定顺序即注入顺序：
 # vendor 依赖最先，remote-qr/api 次之，mobile-api 须在 remote-widget 之前，
-# remote-widget 再次，usage-widget 永远最后
+# remote-widget 再次，kimi-mobile-nav 收尾，usage-widget 永远最后
 REMOTE_ASSETS = (
     'vendor/qrcodegen.js',
     'kimi-remote-qr.js',
     'kimi-remote-api.js',
     'kimi-mobile-api.js',
     'kimi-remote-widget.js',
+    'kimi-mobile-nav.js',
 )
 REMOTE_STYLE_ASSETS = ('kimi-remote-widget-live.css',)
 PRICING_PATH = os.path.join(KIMI_HOME, 'usage-dashboard', 'pricing.json')
@@ -548,7 +550,7 @@ _NEEDPY_INJECT_RE = re.compile(r'\s*<script src="/assets/kimi-usage-needpy\.js[^
 # 远程控制可选资产的托管注入标签（点名清理，不碰任何其他 script 标签）：
 # 源文件被移除/未发布时旧标签必须一并摘掉，避免 404 脚本残留
 _REMOTE_INJECT_RE = re.compile(
-    r'\s*<script src="/assets/(?:vendor/qrcodegen|kimi-remote-(?:qr|api|widget)|kimi-mobile-api|kimi-model-tabs)\.js[^"]*"></script>\s*')
+    r'\s*<script src="/assets/(?:vendor/qrcodegen|kimi-remote-(?:qr|api|widget)|kimi-mobile-api|kimi-model-tabs|kimi-mobile-nav)\.js[^"]*"></script>\s*')
 
 
 def strip_legacy_injections():
@@ -1505,6 +1507,7 @@ def fix_issues(action, alias, code):
 # ---------------- 模式滑杆（主模型 + 挂件子代理档位） ----------------
 MODES_PATH = os.path.join(KIMI_HOME, 'usage-dashboard', 'modes.json')
 MODES_MIN, MODES_MAX, MODE_SUBS_MAX = 2, 6, 3
+MODE_SCOPES = ('global', 'session')
 _AGENT_TOOLS = ('Agent', 'AgentSwarm')
 _MODE_EFFORTS = ('', 'on', 'off') + EFFORT_LEVELS
 # 空白模板：main/subagents 用 '' 占位，load_modes 时解析成该机器
@@ -1648,6 +1651,10 @@ def load_modes(data=None):
     d['modes'] = _normalize_default_modes(d['modes'], data)
     if not isinstance(d.get('pool_hints'), dict):
         d['pool_hints'] = {}
+    if d.get('scope') not in MODE_SCOPES:
+        d['scope'] = 'global'
+    if not isinstance(d.get('session_modes'), dict):
+        d['session_modes'] = {}
     return d
 
 
@@ -1748,6 +1755,21 @@ def validate_modes(modes, data):
     return out, None
 
 
+_MODE_PARALLEL_TAG = '【挂件并发指引】'
+_MODE_PARALLEL_GUIDE = ('可与其他挂件在同一轮按需并行启动多个子代理；同构任务用 AgentSwarm 多 items，'
+                        '异构任务并列多个 Agent；允许多个实例复用同一模型，有依赖时才串行。')
+
+
+def _mode_pool_hints(subagents, hints):
+    result = {}
+    for alias in subagents:
+        raw = hints.get(alias) if isinstance(hints, dict) else None
+        text = raw.strip() if isinstance(raw, str) and raw.strip() else alias
+        base = text.split(_MODE_PARALLEL_TAG, 1)[0].rstrip('； ').strip() or alias
+        result[alias] = base[:180] + '；' + _MODE_PARALLEL_TAG + _MODE_PARALLEL_GUIDE
+    return result
+
+
 def apply_mode_to_text(content, mode, hints, tools_owned):
     """在完整配置对象上应用模式，返回 (完整 TOML, tools_owned 新值)。"""
     data = model_manager.parse(content)
@@ -1763,7 +1785,7 @@ def apply_mode_to_text(content, mode, hints, tools_owned):
     subs = mode['subagents']
     if subs:
         secondary['default_model'] = subs[0]
-        secondary['models'] = {alias: hints.get(alias) or alias for alias in subs}
+        secondary['models'] = _mode_pool_hints(subs, hints)
     effort = mode.get('effort') or old_sec.get('default_effort') or ''
     if effort:
         secondary['default_effort'] = effort
@@ -1830,8 +1852,46 @@ def detect_active_mode(modes, data):
     return None
 
 
+def _session_modes_map(d):
+    m = d.get('session_modes')
+    return m if isinstance(m, dict) else {}
+
+
+def _session_locks_map(d):
+    m = d.get('session_locks')
+    return m if isinstance(m, dict) else {}
+
+
+def session_mode_index(d, sid):
+    """该对话记住的档位序号；没记过返回 None。"""
+    if not isinstance(sid, str) or not _MODE_SESSION_RE.fullmatch(sid):
+        return None
+    value = _session_modes_map(d).get(sid)
+    if isinstance(value, dict):
+        value = value.get('index')
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def detect_session_mode(modes, model_id):
+    """按该对话当前主模型反查档位序号（daemon 模型 id 可能是 provider/model）。"""
+    if not isinstance(model_id, str) or not model_id:
+        return None
+    for i, m in enumerate(modes):
+        alias = m.get('main') or ''
+        if alias and (model_id == alias or model_id.endswith('/' + alias.split('/')[-1])):
+            return i
+    return None
+
+
+def get_modes_data(session_id=None):
+    """先读该对话真实模型（daemon 请求在配置锁外），再取档位状态，
+    避免每次轮询都长时间占着配置锁。"""
+    sid = session_id if isinstance(session_id, str) and _MODE_SESSION_RE.fullmatch(session_id) else None
+    return _modes_data_locked(sid, _session_live_model(sid) if sid else None)
+
+
 @_config_locked
-def get_modes_data():
+def _modes_data_locked(sid, live_model):
     content = get_config_content()
     data = _load_toml(content) or {}
     d = load_modes(data)
@@ -1857,17 +1917,50 @@ def get_modes_data():
     defined = _defined_aliases(data)
     undefined_pool = [k for k in (sec.get('models') or {}) if k not in defined]
     disabled = ((data.get('tools') or {}).get('disabled')) or []
-    return {'modes': d['modes'], 'active': detect_active_mode(d['modes'], data),
-            'last_applied': d.get('last_applied'),
-            'locked': d.get('locked') or {'locked': False},
-            'has_snapshot': bool(d.get('previous_snapshot')),
-            'current': {'default_model': data.get('default_model', ''),
-                        'secondary_default': sec.get('default_model', ''),
-                        'pool': list((sec.get('models') or {}).keys()),
-                        'agents_disabled': all(t in disabled for t in _AGENT_TOOLS)},
-            'undefined_pool': undefined_pool,
-            'models': models, 'subs_max': MODE_SUBS_MAX,
-            'min': MODES_MIN, 'max': MODES_MAX}
+    scope = d['scope']
+    out = {'modes': d['modes'], 'active': detect_active_mode(d['modes'], data),
+           'last_applied': d.get('last_applied'),
+           'locked': d.get('locked') or {'locked': False},
+           'has_snapshot': bool(d.get('previous_snapshot')),
+           'scope': scope,
+           'current': {'default_model': data.get('default_model', ''),
+                       'secondary_default': sec.get('default_model', ''),
+                       'pool': list((sec.get('models') or {}).keys()),
+                       'force': sec.get('force') is True,
+                       'agents_disabled': all(t in disabled for t in _AGENT_TOOLS)},
+           'undefined_pool': undefined_pool,
+           'models': models, 'subs_max': MODE_SUBS_MAX,
+           'min': MODES_MIN, 'max': MODES_MAX}
+    sid = sid
+    global_locked = d.get('locked') if isinstance(d.get('locked'), dict) else {'locked': False}
+    locks = _session_locks_map(d)
+    session_lock = locks.get(sid) if sid else None
+    out['session_id'] = sid
+    out['session_active'] = session_mode_index(d, sid) if sid else None
+    out['session_model'] = live_model if sid else None
+    out['session_lock'] = session_lock if isinstance(session_lock, dict) else None
+    out['session_locked'] = bool(global_locked.get('locked') or out['session_lock'])
+    if sid and out['session_active'] is None:
+        # 没记录过：按该对话真实模型反查，切回来时滑块才对得上
+        out['session_active'] = detect_session_mode(d['modes'], live_model)
+    selected = out['session_active']
+    pool = (sec.get('models') or {}) if isinstance(sec.get('models'), dict) else {}
+    out['session_unavailable_subagents'] = (
+        [alias for alias in d['modes'][selected].get('subagents', [])
+         if alias not in pool and alias != d['modes'][selected].get('main')]
+        if sid and isinstance(selected, int) and 0 <= selected < len(d['modes']) else [])
+    return out
+
+
+def _session_live_model(sid):
+    """读该对话当前主模型（daemon 侧）；读不到返回 None，不猜。"""
+    base, token = _server_endpoint(), _server_token()
+    if not base or not token:
+        return None
+    detail = _api_data(_api_json('GET', base + '/api/v1/sessions/' + sid, token) or {})
+    agent = detail.get('agent_config') or {}
+    model = agent.get('model') if isinstance(agent, dict) else None
+    return model if isinstance(model, str) and model else None
 
 
 def _snapshot_config(content):
@@ -1890,6 +1983,78 @@ def apply_mode(index, session_id=None):
     live = _apply_session_live(mode, old, session_id)
     extra = ('；%s' % live) if live else '，会话内 /reload 生效'
     return True, '已切到「%s」：主 %s · %s%s' % (mode['name'], mode['main'], desc, extra)
+
+
+def apply_session_mode(index, session_id):
+    """只改这一个对话的主模型和可派挂件白名单，不改其它对话的配置。"""
+    data = _load_toml(get_config_content()) or {}
+    d = load_modes(data)
+    modes, err = validate_modes(d['modes'], data)
+    if err:
+        return False, err
+    if isinstance(index, bool) or not isinstance(index, int) or not (0 <= index < len(modes)):
+        return False, '档位序号无效'
+    if not isinstance(session_id, str) or not _MODE_SESSION_RE.fullmatch(session_id):
+        return False, '本对话档位需要有效的会话标识（新对话请先发一条消息）'
+    mode = modes[index]
+    secondary = data.get('secondary_model') or {}
+    pool = (secondary.get('models') or {}) if isinstance(secondary, dict) else {}
+    missing = [alias for alias in mode['subagents'] if alias not in pool and alias != mode['main']]
+    disabled = ((data.get('tools') or {}).get('disabled') or [])
+    if mode['subagents'] and any(tool in disabled for tool in _AGENT_TOOLS):
+        return False, '宿主全局禁用了子代理工具，本对话无法单独开启；档位未切换'
+    base, token = _server_endpoint(), _server_token()
+    if not base or not token:
+        return False, '后台服务未找到，无法切换本对话模型'
+    ok, msg = _session_set_model(base, token, session_id, mode)
+    if not ok:
+        return False, msg
+    with CONFIG_LOCK:
+        cur = load_modes()
+        sm = dict(_session_modes_map(cur))
+        sm[session_id] = {'index': index, 'name': mode['name'],
+                          'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        cur['session_modes'] = sm
+        save_modes(cur)
+    n = len(mode['subagents'])
+    desc = '单干（本对话不派挂件）' if not n else ('%d 种挂件白名单，仅限本对话' % n)
+    warning = ('；宿主当前挂件目录缺少 %s，这些挂件暂不可派（没有改其它对话的全局目录）' % '、'.join(missing)) if missing else ''
+    return True, '本对话已切到「%s」：主 %s · %s；其它对话未改动%s' % (mode['name'], mode['main'], desc, warning)
+
+
+def lock_session_mode(index, session_id):
+    """单对话锁：只固定这一个对话的主模型，不写全局配置、不影响其它对话。"""
+    ok, msg = apply_session_mode(index, session_id)
+    if not ok:
+        return False, msg
+    with CONFIG_LOCK:
+        d = load_modes()
+        modes = d.get('modes') or []
+        if not modes:
+            return False, '档位列表为空'
+        if not 0 <= index < len(modes):
+            return False, '档位序号无效'
+        locks = dict(_session_locks_map(d))
+        locks[session_id] = {'locked': True, 'index': index,
+                             'name': modes[index]['name'],
+                             'main': modes[index]['main'],
+                             'subagents': list(modes[index]['subagents']),
+                             'effort': modes[index].get('effort', ''),
+                             'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        d['session_locks'] = locks
+        save_modes(d)
+    _start_lock_guard()
+    return True, '%s；已锁定本对话' % msg
+
+
+def set_modes_scope(scope):
+    if scope not in MODE_SCOPES:
+        return False, '档位作用域不合法'
+    with CONFIG_LOCK:
+        d = load_modes()
+        d['scope'] = scope
+        save_modes(d)
+    return True, '已切换为%s档位' % ('全局' if scope == 'global' else '本对话独立')
 
 
 @_config_locked
@@ -1979,6 +2144,16 @@ def _server_token():
         return None
 
 
+def _refresh_plugin_hooks():
+    time.sleep(2)
+    base, token = _server_endpoint(), _server_token()
+    if not base or not token:
+        log('plugin hook reload unavailable: desktop daemon not ready')
+        return
+    result = _api_json('POST', base + '/api/v1/plugins/kimi-code-usage:enable', token)
+    log('plugin hook reload %s' % ('ok' if result else 'failed'))
+
+
 def _api_json(method, url, token, body=None, timeout=6):
     req = urllib.request.Request(url, method=method)
     req.add_header('Authorization', 'Bearer ' + token)
@@ -2053,10 +2228,11 @@ def _apply_session_live(mode, old_data, session_id=None):
         return '后台服务未找到，配置已落盘（/reload 生效）'
     notes = []
     want_sec = mode['subagents']
+    expected_hints = _mode_pool_hints(want_sec, load_modes().get('pool_hints'))
     cur = _api_data(_api_json('GET', base + '/api/v1/config', token) or {})
     sec = cur.get('secondary_model')
     if isinstance(sec, dict):
-        sub = {'models': {s: s for s in want_sec}}
+        sub = {'models': expected_hints}
         if want_sec:
             sub['defaultModel'] = want_sec[0]
             if mode.get('effort'):
@@ -2069,7 +2245,9 @@ def _apply_session_live(mode, old_data, session_id=None):
             current = _api_data(_api_json('GET', base + '/api/v1/config', token) or {})
             ok = current.get('secondary_model') or {}
             live = ok.get('models') or {}
-            miss = [s for s in want_sec if s not in live]
+            if not isinstance(live, dict):
+                live = {}
+            miss = [s for s in want_sec if live.get(s) != expected_hints[s]]
             extra = [k for k in live if k not in want_sec]
             if not miss and not extra and (not want_sec or ok.get('defaultModel') == want_sec[0]):
                 notes.append('子代理池已即时更新')
@@ -2140,7 +2318,8 @@ def _locked_main_id(base, token, main_alias):
 
 
 def _lock_guard(gen):
-    """校准锁档全局配置与所有运行中会话；不唤醒休眠会话。"""
+    """校准锁档全局配置与所有运行中会话；不唤醒休眠会话。
+    全局锁只纠偏全局配置外的运行会话；单对话锁只守各自对话。"""
     retry_at = 0.0
     while not _LOCK_STOP.is_set() and _LOCK_GEN[0] == gen:
         time.sleep(1.5)
@@ -2148,10 +2327,28 @@ def _lock_guard(gen):
             break
         try:
             d = load_modes()
+            modes = d.get('modes') or []
+            session_locks = _session_locks_map(d)
+            for sid, entry in list(session_locks.items()):
+                if _LOCK_STOP.is_set() or _LOCK_GEN[0] != gen:
+                    break
+                if not (isinstance(entry, dict) and entry.get('locked')):
+                    continue
+                li = entry.get('index', -1)
+                if (not isinstance(sid, str) or not _MODE_SESSION_RE.fullmatch(sid)
+                        or not isinstance(li, int) or not 0 <= li < len(modes)):
+                    continue
+                base, token = _server_endpoint(), _server_token()
+                if not base or not token:
+                    continue
+                ok, _ = _session_set_model(base, token, sid, modes[li])
+                if not ok:
+                    log('mode-lock: session %s 未对齐锁档模型' % sid)
             locked = d.get('locked')
             if not (isinstance(locked, dict) and locked.get('locked')):
+                if any(isinstance(v, dict) and v.get('locked') for v in session_locks.values()):
+                    continue          # 还有单对话锁要守
                 break
-            modes = d.get('modes') or []
             li = locked.get('index', -1)
             if not isinstance(li, int) or not 0 <= li < len(modes):
                 continue
@@ -2201,9 +2398,14 @@ def _stop_lock_guard():
         _LOCK_THREAD[0] = None
 
 
-def lock_mode(index, session_id=None):
-    """锁到第 index 档：apply + 记 locked + 起守护。"""
-    ok, msg = apply_mode(index, session_id)
+def lock_mode(index, session_id=None, scope='global'):
+    """锁到第 index 档：apply + 记锁 + 起守护。scope='session' 只锁该对话。"""
+    if scope == 'session':
+        if not isinstance(session_id, str) or not _MODE_SESSION_RE.fullmatch(session_id):
+            return False, '本对话档位需要有效的会话标识（新对话请先发一条消息）'
+        ok, msg = apply_session_mode(index, session_id)
+    else:
+        ok, msg = apply_mode(index, session_id)
     if not ok:
         return False, msg
     with CONFIG_LOCK:
@@ -2212,25 +2414,46 @@ def lock_mode(index, session_id=None):
         modes, err = validate_modes(d['modes'], data)
         if err or not isinstance(index, int) or not 0 <= index < len(modes):
             return False, err or '档位序号无效'
-        d['locked'] = {'locked': True, 'index': index,
-                       'name': modes[index]['name'],
-                       'main': modes[index]['main'],
-                       'subagents': list(modes[index]['subagents']),
-                       'effort': modes[index].get('effort', ''),
-                       'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        entry = {'locked': True, 'index': index,
+                 'name': modes[index]['name'],
+                 'main': modes[index]['main'],
+                 'subagents': list(modes[index]['subagents']),
+                 'effort': modes[index].get('effort', ''),
+                 'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        if scope == 'session':
+            locks = dict(_session_locks_map(d))
+            locks[session_id] = entry
+            d['session_locks'] = locks
+        else:
+            d['locked'] = entry
         save_modes(d)
     _start_lock_guard()
     return True, '%s；已锁定' % msg
 
 
 @_config_locked
-def unlock_mode():
-    """解锁：停守护 + 清 locked；不改当前模型。"""
+def unlock_mode(session_id=None, scope='global'):
+    """解锁：停守护 + 清锁；不改当前模型。scope='session' 只解该对话的锁。"""
     d = load_modes()
-    was = d.get('locked')
-    d.pop('locked', None)
+    was = None
+    if scope == 'session':
+        if not isinstance(session_id, str) or not _MODE_SESSION_RE.fullmatch(session_id):
+            return False, '本对话档位需要有效的会话标识'
+        locks = dict(_session_locks_map(d))
+        was = locks.pop(session_id, None)
+        if was is None:
+            return False, '本对话没有锁定'
+        d['session_locks'] = locks
+    else:
+        was = d.pop('locked', None)
+        if was is None:
+            # 全局没锁但还有单对话锁：只提示，不动其它对话
+            return False, '当前没有全局锁定'
     save_modes(d)
-    _stop_lock_guard()
+    still = d.get('session_locks') or {}
+    if not (isinstance(d.get('locked'), dict) and d['locked'].get('locked')) and \
+            not any(isinstance(v, dict) and v.get('locked') for v in still.values()):
+        _stop_lock_guard()
     name = (was or {}).get('name', '') if isinstance(was, dict) else ''
     return True, '已解锁%s' % (('（原档：%s）' % name) if name else '')
 
@@ -2967,7 +3190,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == '/api/data':
             self._json(get_models_data())
         elif path == '/api/modes':
-            self._json(get_modes_data())
+            qs = parse_qs(urlsplit(self.path).query)
+            sid = (qs.get('session_id') or [None])[0]
+            self._json(get_modes_data(sid))
         elif path == '/api/reload':
             self._json({'success': True, 'data': collect_once() or {}})
         else:
@@ -3167,13 +3392,28 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({'success': False, 'message': 'index 必须是整数'}, 400)
                 if sid is not None and (not isinstance(sid, str) or not _MODE_SESSION_RE.fullmatch(sid)):
                     return self._json({'success': False, 'message': 'session_id 不合法'}, 400)
-                # 锁定时滑到别的档 = 解锁旧档 + 锁新档（locked 状态保持，档位换）
-                d0 = load_modes()
-                locked = d0.get('locked')
-                if isinstance(locked, dict) and locked.get('locked'):
-                    ok, msg = lock_mode(idx, sid)
+                scope = req.get('scope') or load_modes().get('scope') or 'global'
+                if scope not in MODE_SCOPES:
+                    return self._json({'success': False, 'message': 'scope 不合法'}, 400)
+                if scope == 'session':
+                    # 已有单对话锁时切档 = 换该对话的锁档；否则只改这一个对话
+                    if _session_locks_map(load_modes()).get(sid):
+                        ok, msg = lock_mode(idx, sid, 'session')
+                    else:
+                        ok, msg = apply_session_mode(idx, sid)
                 else:
-                    ok, msg = apply_mode(idx, sid)
+                    # 全局锁定时滑到别的档 = 换锁档；未锁则普通全局切档
+                    locked = load_modes().get('locked')
+                    if isinstance(locked, dict) and locked.get('locked'):
+                        ok, msg = lock_mode(idx, sid, 'global')
+                    else:
+                        ok, msg = apply_mode(idx, sid)
+                return self._json({'success': ok, 'message': msg, 'data': get_modes_data(sid)},
+                                  200 if ok else 400)
+
+            if path == '/api/modes/scope':
+                scope = req.get('scope')
+                ok, msg = set_modes_scope(scope)
                 return self._json({'success': ok, 'message': msg, 'data': get_modes_data()},
                                   200 if ok else 400)
 
@@ -3183,13 +3423,20 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({'success': False, 'message': 'index 必须是整数'}, 400)
                 if sid is not None and (not isinstance(sid, str) or not _MODE_SESSION_RE.fullmatch(sid)):
                     return self._json({'success': False, 'message': 'session_id 不合法'}, 400)
-                ok, msg = lock_mode(idx, sid)
-                return self._json({'success': ok, 'message': msg, 'data': get_modes_data()},
+                scope = req.get('scope') or load_modes().get('scope') or 'global'
+                if scope not in MODE_SCOPES:
+                    return self._json({'success': False, 'message': 'scope 不合法'}, 400)
+                ok, msg = lock_mode(idx, sid, scope)
+                return self._json({'success': ok, 'message': msg, 'data': get_modes_data(sid)},
                                   200 if ok else 400)
 
             if path == '/api/modes/unlock':
-                ok, msg = unlock_mode()
-                return self._json({'success': ok, 'message': msg, 'data': get_modes_data()},
+                sid = req.get('session_id')
+                scope = req.get('scope') or load_modes().get('scope') or 'global'
+                if scope not in MODE_SCOPES:
+                    return self._json({'success': False, 'message': 'scope 不合法'}, 400)
+                ok, msg = unlock_mode(sid, scope)
+                return self._json({'success': ok, 'message': msg, 'data': get_modes_data(sid)},
                                   200 if ok else 400)
 
             if path == '/api/modes/restore':
@@ -3561,6 +3808,7 @@ def run_server():
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         log('service listening on 127.0.0.1:%d' % PORT)
         threading.Thread(target=_mobile_restore_loop, daemon=True).start()
+        threading.Thread(target=_refresh_plugin_hooks, daemon=True).start()
     else:
         # 没绑到端口还继续跑只会攒脏 state（无法提供 API）——退出交给下次 tick 重拉
         save_state()

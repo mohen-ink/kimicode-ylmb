@@ -31,9 +31,11 @@ shutdown() 永久关闭。code 只用桥白名单里的码（TUNNEL_* / START_CA
 json + secrets + struct + threading。不装任何第三方。
 """
 import base64
+import gzip
 import hashlib
 import json
 import secrets
+import select
 import socket
 import struct
 import threading
@@ -133,7 +135,23 @@ def _ws_frame(opcode, payload, mask=True):
 
 
 def _send_all(sock, data):
-    sock.sendall(data)
+    view = memoryview(data)
+    sent = 0
+    deadline = time.monotonic() + SEND_TIMEOUT
+    while sent < len(view):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('tunnel send timeout')
+        _, writable, _ = select.select([], [sock], [], min(remaining, 1.0))
+        if not writable:
+            continue
+        try:
+            count = sock.send(view[sent:sent + 65536])
+        except (socket.timeout, BlockingIOError):
+            continue
+        if count <= 0:
+            raise OSError('tunnel closed during send')
+        sent += count
 
 
 class _WSock:
@@ -159,11 +177,7 @@ class _WSock:
         try:
             data = _ws_frame(opcode, payload, mask=self.masked_out)
             with self.wlock:
-                self._set_timeout(SEND_TIMEOUT)
-                try:
-                    self.sock.sendall(data)
-                finally:
-                    self._set_timeout(RECV_POLL)
+                _send_all(self.sock, data)
             return True
         except Exception:
             self.alive = False
@@ -715,10 +729,13 @@ class RelayClient:
 
         # 4) 主读循环：http / ws_open / ws_data / ws_close / ping
         last_ping = time.monotonic()
+        last_pong = last_ping
         while ws.alive:
             with self._lock:
                 if self._closing or self._ws is not ws:
                     break
+            if time.monotonic() - last_pong > PING_INTERVAL * 4:
+                break
             # 保活 ping
             if time.monotonic() - last_ping >= PING_INTERVAL:
                 if not ws.send_frame(9, b''):
@@ -737,6 +754,7 @@ class RelayClient:
             if opcode == 8:
                 break
             if opcode == 10:      # pong
+                last_pong = time.monotonic()
                 continue
             if opcode != 1:
                 continue
@@ -764,10 +782,24 @@ class RelayClient:
             body = base64.b64decode(msg.get('body') or '')
             if len(body) > MAX_HTTP_BODY:
                 raise ValueError('body')
+            path = str(msg.get('path') or '/')
+            headers = msg.get('headers') or {}
             status, rheaders, rbody = _bridge_http(
                 self._bound_port, str(msg.get('method') or 'GET'),
-                str(msg.get('path') or '/'),
-                msg.get('headers') or {}, body, self.public_host_header)
+                path, headers, body, self.public_host_header)
+            asset = path.split('?', 1)[0]
+            encoding = next((str(v) for k, v in headers.items() if k.lower() == 'accept-encoding'), '')
+            ctype = next((str(v).lower() for k, v in rheaders if k.lower() == 'content-type'), '')
+            encoded = any(k.lower() == 'content-encoding' for k, _ in rheaders)
+            if (status == 200 and msg.get('method') == 'GET' and asset.startswith('/assets/')
+                    and len(rbody) >= 131072 and 'gzip' in encoding.lower() and not encoded
+                    and ('javascript' in ctype or 'text/css' in ctype or 'svg+xml' in ctype)):
+                zipped = gzip.compress(rbody, compresslevel=5, mtime=0)
+                if len(zipped) < len(rbody) * .9:
+                    rbody = zipped
+                    rheaders = [(k, v) for k, v in rheaders
+                                if k.lower() not in ('content-length', 'etag', 'vary')]
+                    rheaders.extend([('Content-Encoding', 'gzip'), ('Vary', 'Accept-Encoding')])
             resp = {'type': 'http_resp', 'id': rid, 'status': status,
                     'headers': rheaders,
                     'body': base64.b64encode(rbody).decode('ascii')}

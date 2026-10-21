@@ -1314,6 +1314,16 @@
     .ku-mode-row:hover { border-color: color-mix(in srgb, var(--color-accent, #1a88ff) 30%, transparent); }
     .ku-mode-top { display: flex; align-items: center; gap: 7px; }
     .ku-mode-top .ku-row-label { font-size: 10px; font-weight: 700; color: var(--color-text-faint, #94a3b8); text-transform: uppercase; letter-spacing: .4px; width: auto; }
+    .ku-mode-scope { display: flex; gap: 4px; flex-shrink: 0; }
+    .ku-mode-scope button {
+      border: 1px solid color-mix(in srgb, var(--color-text-faint, #94a3b8) 28%, transparent);
+      background: transparent; cursor: pointer; font-size: 10px; font-weight: 600; padding: 2px 7px;
+      border-radius: 6px; color: var(--color-text-faint, #94a3b8); font-family: inherit; line-height: 1.5;
+      transition: all .15s ease;
+    }
+    .ku-mode-scope button:hover { color: var(--color-accent, #1a88ff); }
+    .ku-mode-scope button.on { color: #fff; background: var(--color-accent, #1a88ff); border-color: var(--color-accent, #1a88ff); }
+    .ku-mode-scope button:disabled { opacity: .5; cursor: wait; }
     .ku-mode-name { flex: 1; min-width: 0; font-size: 12.5px; font-weight: 700; color: var(--color-text, #0f172a); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .ku-mode-edit {
       border: 1px solid color-mix(in srgb, var(--color-accent, #1a88ff) 28%, transparent);
@@ -1698,6 +1708,10 @@
             <span class="ku-mode-name" id="ku-mode-name">--</span>
             <button class="ku-mode-lock" id="ku-mode-lock" title="锁定当前档：发送框模型被固定为本档主模型，后端守护自动改回">锁定</button>
             <button class="ku-mode-edit" id="ku-mode-edit" title="自定义各档主模型与挂件">编辑</button>
+          </div>
+          <div class="ku-mode-scope" id="ku-mode-scope" title="全局：改所有对话；本对话：只改当前这一个对话">
+            <button type="button" data-scope="global">全局</button>
+            <button type="button" data-scope="session">本对话</button>
           </div>
           <input type="range" class="ku-mode-range" id="ku-mode-range" min="0" max="3" step="0.02" value="0" title="拖动切换干活模式，松手生效">
           <div class="ku-mode-ticks" id="ku-mode-ticks"></div>
@@ -3612,6 +3626,8 @@
   var kmdOverlayEl = null;
   var kmdDraft = null;
   var kmdLastFetch = 0;
+  var kmdLastSid = null;
+  var kmdLastScope = null;
 
   function kmdModelName(alias) {
     var m = kmdData && (kmdData.models || []).find(function(x) { return x.alias === alias; });
@@ -3637,6 +3653,41 @@
     return s;
   }
 
+  function kmdScope() {
+    return (kmdData && kmdData.scope === 'session') ? 'session' : 'global';
+  }
+  function kmdActiveSessionId() {
+    try {
+      var app = document.querySelector('#app').__vue_app__;
+      var pinia = app.config.globalProperties.$pinia;
+      var sessions = pinia._s.get('kimi.sessions');
+      var sid = sessions && sessions.activeSessionId;
+      if (typeof sid === 'string' && /^session_[A-Za-z0-9_-]{8,100}$/.test(sid)) return sid;
+    } catch (e) { /* no active session */ }
+    return '';
+  }
+  function kmdShownIndex() {
+    var modes = (kmdData && kmdData.modes) || [];
+    if (kmdScope() === 'session' && typeof kmdData.session_active === 'number'
+        && kmdData.session_active >= 0 && kmdData.session_active < modes.length) {
+      return kmdData.session_active;
+    }
+    return kmdData.active;
+  }
+
+  function kmdRenderScope(card) {
+    var wrap = card.querySelector('#ku-mode-scope');
+    if (!wrap) return;
+    var scope = kmdScope();
+    wrap.querySelectorAll('button').forEach(function(b) {
+      b.classList.toggle('on', b.getAttribute('data-scope') === scope);
+      b.disabled = kmdBusy || (b.getAttribute('data-scope') === 'session' && !kmdActiveSessionId());
+      b.title = b.getAttribute('data-scope') === 'session'
+        ? (kmdActiveSessionId() ? '只改当前对话，其它对话不受影响' : '当前没有打开的对话')
+        : '改全局默认：所有对话一起变';
+    });
+  }
+
   function kmdRender(card) {
     card = card || document.getElementById(CARD_ID);
     if (!card || !kmdData) return;
@@ -3647,7 +3698,7 @@
     var ticks = card.querySelector('#ku-mode-ticks');
     if (!range || !modes.length) return;
     range.max = String(modes.length - 1);
-    var act = kmdData.active;
+    var act = kmdShownIndex();
     // act==null（编辑后当前 config 不再匹配任何档）时，滑块别停在失效
     // 位置：优先回到「最近一次应用」的档（last_applied.index），那才是
     // 用户最后明确选过的档位；都没有再退回 range.value。
@@ -3676,6 +3727,25 @@
       nameEl.textContent = (act + 1) + '/' + modes.length + ' · ' + modes[act].name;
       desc.innerHTML = kmdModeDesc(modes[act]);
     }
+    if (kmdScope() === 'session') {
+      if (!kmdActiveSessionId()) {
+        desc.innerHTML = '<span class="warn">未打开对话：本对话档位不可用，先打开一个对话。</span>';
+      } else {
+        var note = document.createElement('div');
+        note.className = 'ku-scope-note';
+        note.style.cssText = 'color:var(--color-text-faint,#94a3b8);font-size:10px;margin-top:2px;';
+        note.textContent = '仅作用于当前对话：主模型按档位切换，挂件调用按该档位白名单限制；宿主模型目录仍是全局的。';
+        desc.appendChild(note);
+        var missing = kmdData.session_unavailable_subagents || [];
+        if (missing.length || (kmdData.current && kmdData.current.agents_disabled)) {
+          var warning = document.createElement('div');
+          warning.className = 'warn';
+          warning.textContent = missing.length ? '宿主目录缺少 ' + missing.join('、') + '，这些挂件暂不能派送。' : '宿主已全局禁用子代理工具。';
+          desc.appendChild(warning);
+        }
+      }
+    }
+    kmdRenderScope(card);
     kmdRenderLock(card);
   }
 
@@ -3715,9 +3785,16 @@
   }
 
   function kmdFetch(force) {
-    if (!force && Date.now() - kmdLastFetch < 15000) { kmdRender(); return Promise.resolve(kmdData); }
+    var sid = kmdActiveSessionId();
+    var scope = kmdScope();
+    // 切对话后必须重新取：会话档位与锁状态都跟 session 绑定
+    var stale = force || Date.now() - kmdLastFetch >= 15000 || sid !== kmdLastSid || scope !== kmdLastScope;
+    if (!stale) { kmdRender(); return Promise.resolve(kmdData); }
     kmdLastFetch = Date.now();
-    return kapiFetch(API_BASE + '/api/modes')
+    kmdLastSid = sid;
+    kmdLastScope = scope;
+    var q = sid ? ('?session_id=' + encodeURIComponent(sid)) : '';
+    return kapiFetch(API_BASE + '/api/modes' + q)
       .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
       .then(function(d) { kmdData = d; kmdRender(); if (kmdOverlayEl && kmdOverlayEl.classList.contains('visible') && !kmdDraft) kmdRenderEditor(); return d; })
       .catch(function() {
@@ -3733,26 +3810,25 @@
   }
 
   function kmdTargetBody(index) {
-    var body = { index: index };
-    try {
-      var app = document.querySelector('#app').__vue_app__;
-      var pinia = app.config.globalProperties.$pinia;
-      var sessions = pinia._s.get('kimi.sessions');
-      var sid = sessions && sessions.activeSessionId;
-      if (typeof sid === 'string' && /^session_[A-Za-z0-9_-]{8,100}$/.test(sid)) body.session_id = sid;
-    } catch (e) { /* no active session */ }
+    var body = { index: index, scope: kmdScope() };
+    var sid = kmdActiveSessionId();
+    if (sid) body.session_id = sid;
     return body;
   }
 
   function kmdApply(i) {
     if (kmdBusy || !kmdData) return;
     i = Math.round(i);
+    var scope = kmdScope();
+    if (scope === 'session' && !kmdActiveSessionId()) { kmmToast('先打开一个对话再选本对话档位', true); return; }
     var card = document.getElementById(CARD_ID);
     var range = card && card.querySelector('#ku-mode-range');
     var prevActive = kmdData.active;
+    var prevSession = kmdData.session_active;
     // 乐观更新：先把 UI 落到目标档，后端失败再回滚
     kmdBusy = true;
-    kmdData.active = i;
+    if (scope === 'session') kmdData.session_active = i;
+    else kmdData.active = i;
     if (range) { range.disabled = true; }
     if (range && kmdDragging) { kmdDragging = false; kmdSnapTo(range, i, null); }
     else if (range) range.value = String(i);
@@ -3764,15 +3840,39 @@
           kmmToast(d.message || '已切换');
         } else {
           kmdData.active = prevActive;
+          kmdData.session_active = prevSession;
           kmmToast(d.message || '切换失败', true);
         }
       })
-      .catch(function() { kmdData.active = prevActive; kmmToast('切换失败：后台服务未响应', true); })
+      .catch(function() {
+        kmdData.active = prevActive;
+        kmdData.session_active = prevSession;
+        kmmToast('切换失败：后台服务未响应', true);
+      })
       .then(function() {
         kmdBusy = false;
-        if (range) { range.disabled = false; kmdSnapTo(range, kmdData.active == null ? i : kmdData.active, null); }
+        var now = kmdShownIndex();
+        if (range) { range.disabled = false; kmdSnapTo(range, now == null ? i : now, null); }
         kmdRender();
         if (typeof fetchModels === 'function') kmmRefreshAll();
+      });
+  }
+
+  function kmdSetScope(scope) {
+    if (!kmdData || kmdBusy || scope === kmdScope()) return;
+    if (scope === 'session' && !kmdActiveSessionId()) { kmmToast('先打开一个对话', true); return; }
+    kmdBusy = true;
+    kmdRender();
+    kmdPost('/api/modes/scope', { scope: scope }).then(function(d) {
+      if (d.success) {
+        if (d.data) kmdData = d.data;
+        else kmdData.scope = scope;
+        kmmToast(d.message || '已切换');
+      } else kmmToast(d.message || '切换失败', true);
+    }).catch(function() { kmmToast('切换失败：后台服务未响应', true); })
+      .then(function() {
+        kmdBusy = false;
+        kmdFetch(true);
       });
   }
 
@@ -3781,12 +3881,14 @@
   var kmdHostObs = null;          // MutationObserver 盯宿主 SPA 重挂选择器
 
   function kmdIsLocked() {
-    var l = kmdData && kmdData.locked;
-    return !!(l && l.locked);
+    if (kmdData && kmdData.locked && kmdData.locked.locked) return true;
+    return !!(kmdData && kmdData.session_lock);
   }
   function kmdLockedIndex() {
     var l = kmdData && kmdData.locked;
-    return (l && typeof l.index === 'number') ? l.index : null;
+    if (l && typeof l.index === 'number') return l.index;
+    var sl = kmdData && kmdData.session_lock;
+    return (sl && typeof sl.index === 'number') ? sl.index : null;
   }
 
   // 尽力找宿主发送框的模型选择器并禁用。宿主是 Kimi Code 桌面端 SPA，
@@ -3858,14 +3960,19 @@
     if (!card) return;
     var btn = card.querySelector('#ku-mode-lock');
     if (!btn) return;
-    var locked = kmdIsLocked();
+    var scopeNow = kmdScope();
+    var locked = scopeNow === 'session'
+      ? !!kmdData.session_lock
+      : !!(kmdData.locked && kmdData.locked.locked);
     var li = kmdLockedIndex();
     btn.classList.toggle('on', locked);
     btn.disabled = kmdLockBusy;
     btn.innerHTML = locked ? '🔒' : '🔓';
     btn.title = locked
       ? ('已锁定第 ' + (li + 1) + ' 档「' + ((kmdData.modes || [])[li] || {}).name + '」：发送框模型固定，点击解锁')
-      : '锁定当前档：发送框模型被固定为本档主模型，后端守护自动改回';
+      : (scopeNow === 'session'
+          ? '锁定本对话：只固定当前对话的主模型，其它对话不受影响'
+          : '锁定当前档：发送框模型被固定为本档主模型，后端守护自动改回');
     var nameEl = card.querySelector('#ku-mode-name');
     if (nameEl && locked) {
       // 名字后挂锁标，但不重复加
@@ -3884,7 +3991,9 @@
       var n = document.createElement('div');
       n.className = 'ku-lock-note';
       n.style.cssText = 'color:var(--color-warning,#d29922);font-size:10px;margin-top:2px;';
-      n.textContent = '已锁定：发送框请用档位主模型（后端会自动改回偏离的切换）';
+      n.textContent = (kmdData.session_lock && !(kmdData.locked && kmdData.locked.locked))
+        ? '已锁定本对话：只固定当前对话的主模型，其它对话不受影响'
+        : '已锁定：发送框请用档位主模型（后端会自动改回偏离的切换）';
       desc.appendChild(n);
     } else if (desc && !locked) {
       var on = desc.querySelector('.ku-lock-note');
@@ -3894,13 +4003,21 @@
 
   function kmdToggleLock() {
     if (kmdLockBusy || !kmdData) return;
-    var locked = kmdIsLocked();
-    var idx = locked ? null : (kmdData.active != null ? kmdData.active
+    var scope = kmdScope();
+    // 按当前作用域判定这把锁：本对话只看自己的锁，全局只看全局锁
+    var locked = scope === 'session'
+      ? !!kmdData.session_lock
+      : !!(kmdData.locked && kmdData.locked.locked);
+    var idx = locked ? null : (kmdShownIndex() != null ? kmdShownIndex()
                              : (kmdData.last_applied && kmdData.last_applied.index));
     if (!locked && (idx == null || idx < 0)) { kmmToast('先选一档再锁定', true); return; }
+    if (!locked && scope === 'session' && !kmdActiveSessionId()) { kmmToast('先打开一个对话', true); return; }
     kmdLockBusy = true;
     kmdRenderLock();
-    var call = locked ? kmdPost('/api/modes/unlock', {}) : kmdPost('/api/modes/lock', kmdTargetBody(idx));
+    var body = locked
+      ? { scope: scope, session_id: kmdActiveSessionId() || null }
+      : kmdTargetBody(idx);
+    var call = locked ? kmdPost('/api/modes/unlock', body) : kmdPost('/api/modes/lock', body);
     call.then(function(d) {
       if (d.success) {
         if (d.data) kmdData = d.data;
@@ -3935,11 +4052,14 @@
     range.onchange = function() {
       var i = Math.round(Number(range.value));
       kmdDragging = false;
-      if (kmdData && i === kmdData.active) { kmdSnapTo(range, i, function() { kmdRender(); }); return; }
+      if (kmdData && i === kmdShownIndex()) { kmdSnapTo(range, i, function() { kmdRender(); }); return; }
       kmdSnapTo(range, i, function() { kmdApply(i); });
     };
     el.querySelector('#ku-mode-edit').onclick = function(e) { e.stopPropagation(); kmdOpenEditor(); };
     el.querySelector('#ku-mode-lock').onclick = function(e) { e.stopPropagation(); kmdToggleLock(); };
+    el.querySelectorAll('#ku-mode-scope button').forEach(function(b) {
+      b.onclick = function(e) { e.stopPropagation(); kmdSetScope(b.getAttribute('data-scope')); };
+    });
     if (kmdData) { kmdRender(el); kmdRenderLock(el); kmdHostLockApply(); kmdHostLockWatch(); }
     kmdFetch(true).then(function() { kmdRenderLock(); kmdHostLockApply(); kmdHostLockWatch(); });
   }
@@ -3988,8 +4108,9 @@
             kmdBusy = false; kmdDragging = false;
             if (range) { range.blur(); }
             kmdRender();
-            if (range && kmdData && kmdData.active != null) {
-              kmdSnapTo(range, kmdData.active, null);
+            var nowIndex = kmdShownIndex();
+            if (range && kmdData && nowIndex != null) {
+              kmdSnapTo(range, nowIndex, null);
             }
           }, 350);
         } else {
@@ -4038,7 +4159,7 @@
       for (var k = 0; k < max; k++) {
         subs += '<select class="kmd-sub-sel" data-f="sub" data-k="' + k + '">' + kmdOptions((m.subagents || [])[k] || '', true) + '</select>';
       }
-      return '<div class="kmd-card' + (i === kmdData.active ? ' on' : '') + '" data-i="' + i + '">'
+      return '<div class="kmd-card' + (i === kmdShownIndex() ? ' on' : '') + '" data-i="' + i + '">'
         + '<div class="kmd-line"><span class="kmd-idx">第 ' + (i + 1) + ' 档</span>'
         + '<input type="text" data-f="name" maxlength="20" placeholder="档名" value="' + esc(m.name) + '">'
         + '<span class="kmd-acts">'

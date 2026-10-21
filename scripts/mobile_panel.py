@@ -3,7 +3,7 @@ import http.client
 import json
 import math
 import re
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 HOST = '127.0.0.1'
 PORT = 39281
@@ -14,6 +14,7 @@ READ_ROUTES = {
 }
 WRITE_ROUTES = {
     'apply': '/api/modes/apply',
+    'scope': '/api/modes/scope',
     'lock': '/api/modes/lock',
     'unlock': '/api/modes/unlock',
     'restore': '/api/modes/restore',
@@ -98,13 +99,27 @@ def _model(data):
 
 def validate(action, body):
     if action in ('apply', 'lock'):
-        _fields(body, ('index', 'session_id'), ('index',))
+        _fields(body, ('index', 'session_id', 'scope'), ('index',))
         if type(body['index']) is not int or not 0 <= body['index'] < 6:
             raise PanelError('档位序号不合法')
         if 'session_id' in body and (not isinstance(body['session_id'], str) or
                                     not re.fullmatch(r'session_[A-Za-z0-9_-]{8,100}', body['session_id'])):
             raise PanelError('会话标识不合法')
-    elif action in ('unlock', 'restore', 'reset'):
+        if 'scope' in body and body['scope'] not in ('global', 'session'):
+            raise PanelError('档位作用域不合法')
+    elif action == 'scope':
+        _fields(body, ('scope',), ('scope',))
+        if body['scope'] not in ('global', 'session'):
+            raise PanelError('档位作用域不合法')
+    elif action == 'unlock':
+        _fields(body, ('session_id', 'scope'))
+        if 'session_id' in body and body['session_id'] is not None and (
+                not isinstance(body['session_id'], str) or
+                not re.fullmatch(r'session_[A-Za-z0-9_-]{8,100}', body['session_id'])):
+            raise PanelError('会话标识不合法')
+        if 'scope' in body and body['scope'] not in ('global', 'session'):
+            raise PanelError('档位作用域不合法')
+    elif action in ('restore', 'reset'):
         _fields(body, ())
     elif action == 'save':
         _fields(body, ('modes',), ('modes',))
@@ -220,7 +235,9 @@ def _public(action, result):
         raise PanelError('面板响应格式异常', 502)
     if action == 'modes':
         return {key: result[key] for key in ('modes', 'active', 'last_applied', 'locked', 'has_snapshot',
-                                            'current', 'undefined_pool', 'models', 'subs_max', 'min', 'max') if key in result}
+                                            'current', 'undefined_pool', 'models', 'subs_max', 'min', 'max',
+                                            'scope', 'session_id', 'session_active', 'session_model',
+                                            'session_lock', 'session_locked', 'session_unavailable_subagents') if key in result}
     if action == 'audit':
         models = []
         for item in result.get('models', [])[:500]:
@@ -261,7 +278,7 @@ def _public(action, result):
                 'models': models, 'default_model': result.get('default_model', ''),
                 'provider_types': result.get('provider_types', []),
                 'effort_levels': result.get('effort_levels', [])}
-    if action in ('apply', 'lock', 'unlock', 'restore', 'reset', 'save'):
+    if action in ('apply', 'lock', 'unlock', 'restore', 'reset', 'save', 'scope'):
         return {'success': result.get('success') is True,
                 'message': _safe_message(result.get('message')),
                 'data': _public('modes', result['data']) if isinstance(result.get('data'), dict) else None}
@@ -283,16 +300,18 @@ def _public(action, result):
     return output
 
 
-def call(action, method, body=None):
+def call(action, method, body=None, query=None):
     path = READ_ROUTES.get(action) if method == 'GET' else WRITE_ROUTES.get(action) if method == 'POST' else None
     if path is None:
         raise PanelError('接口不存在', 404)
+    if query:
+        path = path + '?' + urlencode(query)
     payload = None
     if method == 'POST':
         payload = json.dumps(validate(action, body), ensure_ascii=False, allow_nan=False).encode('utf-8')
         if len(payload) > 16384:
             raise PanelError('请求体过大', 413)
-    conn = http.client.HTTPConnection(HOST, PORT, timeout=15 if action in ('catalog', 'match-prices') else 5)
+    conn = http.client.HTTPConnection(HOST, PORT, timeout=20 if action in ('catalog', 'match-prices') else 9)
     try:
         headers = {'Accept': 'application/json', 'Host': '%s:%d' % (HOST, PORT)}
         if action == 'manager' or method == 'POST':
