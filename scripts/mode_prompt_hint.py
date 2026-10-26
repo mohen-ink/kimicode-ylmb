@@ -5,6 +5,8 @@ import re
 import sys
 import urllib.request
 
+from plugin_settings import widgets_enabled
+
 SESSION = re.compile(r'^session_[A-Za-z0-9_-]{8,100}$')
 ALIAS = re.compile(r'^[A-Za-z0-9_.:/+-]{1,120}$')
 if hasattr(sys.stdout, 'reconfigure'):
@@ -20,6 +22,14 @@ def _kimi_home():
 
 
 def main():
+    if not widgets_enabled():
+        return
+    print('挂件功能已开启：档位挂件是可选模型池，不是任务数或并发实例上限。'
+          '独立工作项按需在同一轮并发派送多个 Agent，或用 AgentSwarm 多 items；同一模型可复用。'
+          '本对话选档后仅使用该档白名单且已在宿主目录注册的挂件；默认挂件符合时可省略 model。'
+          '锁定时禁止 model=primary、与主模型相同的挂件、fork 或恢复模型未知的子代理；单干档不派件。'
+          '简单任务、先后依赖或冲突写入保持单干或串行，结果齐后由主代理汇总。'
+          '此指引仅在挂件开关开启期间适用，关闭后不再使用历史挂件指引。')
     try:
         payload = json.load(sys.stdin)
         sid = payload.get('session_id', payload.get('sessionId'))

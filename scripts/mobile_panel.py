@@ -234,7 +234,7 @@ def _public(action, result):
     if not isinstance(result, dict):
         raise PanelError('面板响应格式异常', 502)
     if action == 'modes':
-        return {key: result[key] for key in ('modes', 'active', 'last_applied', 'locked', 'has_snapshot',
+        return {key: result[key] for key in ('widgets_enabled', 'modes', 'active', 'last_applied', 'locked', 'has_snapshot',
                                             'current', 'undefined_pool', 'models', 'subs_max', 'min', 'max',
                                             'scope', 'session_id', 'session_active', 'session_model',
                                             'session_lock', 'session_locked', 'session_unavailable_subagents') if key in result}

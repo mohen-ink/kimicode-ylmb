@@ -1702,7 +1702,7 @@
       </div>
 
       <div class="ku-expanded-body">
-        <div class="ku-mode-row" id="ku-mode-row">
+        <div class="ku-mode-row" id="ku-mode-row" style="display:none">
           <div class="ku-mode-top">
             <span class="ku-row-label">模式</span>
             <span class="ku-mode-name" id="ku-mode-name">--</span>
@@ -2436,6 +2436,86 @@
     kupApplyTheme(host === 'light' ? 'light' : 'dark');
   }
 
+  var kupSettings = null;
+  var kupSettingsBusy = false;
+  var kupSettingsEpoch = 0;
+  var kupSettingsPending = null;
+
+  function kupWidgetsEnabled() {
+    return kupSettings ? kupSettings.widgets_enabled : !!(kmdData && kmdData.widgets_enabled !== false);
+  }
+
+  function kupRenderSettings() {
+    var button = document.getElementById('kup-widgets-btn');
+    if (!button) return;
+    var enabled = kupSettings ? kupSettings.widgets_enabled : true;
+    button.disabled = kupSettingsBusy || !kupSettings;
+    button.textContent = '挂件：' + (kupSettingsBusy ? '保存中…' : !kupSettings ? '加载中…' : enabled ? '开' : '关');
+    button.setAttribute('aria-pressed', String(enabled));
+    button.title = enabled ? '点击关闭挂件：桌面与手机隐藏模式栏，并停用挂件提示、调用守卫和锁档；保留已有档位' : '点击开启挂件，恢复模式栏及挂件相关功能';
+    button.onclick = kupToggleWidgets;
+  }
+
+  function kupApplySettings(data) {
+    if (!data || typeof data.widgets_enabled !== 'boolean') throw new Error('挂件设置响应无效');
+    var changed = !kupSettings || kupSettings.widgets_enabled !== data.widgets_enabled;
+    if (changed) kupSettingsEpoch++;
+    kupSettings = { widgets_enabled: data.widgets_enabled };
+    kupRenderSettings();
+    if (!data.widgets_enabled) {
+      kmdDraft = null;
+      kmdDragging = false;
+      if (kmdSnapRaf) { cancelAnimationFrame(kmdSnapRaf); kmdSnapRaf = 0; }
+      if (kmdOverlayEl && kmdOverlayEl.classList.contains('visible')) kuLayerHide(kmdOverlayEl, 'visible');
+    }
+    kmdRender();
+    kmdHostLockWatch();
+    kmdHostLockApply();
+    return changed;
+  }
+
+  function kupFetchSettings() {
+    if (kupSettingsBusy || kupSettingsPending) return kupSettingsPending || Promise.resolve(kupSettings);
+    var epoch = kupSettingsEpoch;
+    kupSettingsPending = kapiFetch(API_BASE + '/api/settings', { cache: 'no-store' })
+      .then(function(r) { if (!r.ok) throw new Error('读取挂件设置失败'); return r.json(); })
+      .then(function(data) {
+        if (epoch !== kupSettingsEpoch) return kupSettings;
+        var changed = kupApplySettings(data);
+        if (changed && data.widgets_enabled) return kmdFetch(true);
+        return data;
+      }).catch(function() {
+        if (!kupSettings) {
+          var button = document.getElementById('kup-widgets-btn');
+          if (button) { button.textContent = '挂件：读取失败'; button.title = '读取挂件设置失败，请刷新页面后重试'; }
+        }
+      }).finally(function() { kupSettingsPending = null; });
+    return kupSettingsPending;
+  }
+
+  function kupToggleWidgets() {
+    if (!kupSettings || kupSettingsBusy) return;
+    var enabled = !kupSettings.widgets_enabled;
+    kupSettingsBusy = true;
+    kupSettingsEpoch++;
+    kupRenderSettings();
+    kapiFetch(API_BASE + '/api/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ widgets_enabled: enabled }), cache: 'no-store'
+    }).then(function(r) { return r.json(); }).then(function(data) {
+      if (!data || !data.success) throw new Error((data && data.message) || '挂件设置保存失败');
+      kupApplySettings(data.data);
+      kmmToast(data.message || '设置已保存');
+      if (enabled) return kmdFetch(true);
+    }).catch(function(error) {
+      kmmToast(error.message || '保存失败：后台服务未响应', true);
+    }).finally(function() {
+      kupSettingsBusy = false;
+      kupRenderSettings();
+      kupFetchSettings();
+    });
+  }
+
   function openPanel() {
     var modal = document.getElementById(PANEL_MODAL_ID);
     if (!modal) {
@@ -2451,6 +2531,7 @@
             <div class="kup-head-tools">
               <button class="kup-btn" id="kup-update-btn">更新</button>
               <button class="kup-btn" id="kup-uninstall-btn">卸载</button>
+              <button class="kup-btn" id="kup-widgets-btn" aria-pressed="true" disabled>挂件：加载中…</button>
               <button class="kup-btn" id="kup-mute-btn"></button>
               <button class="kup-btn" id="kup-theme-btn">切换主题</button>
               <button class="kup-btn kup-btn-primary" id="kup-refresh-btn">刷新</button>
@@ -2567,6 +2648,8 @@
       kupInitTheme();
     }
     kuLayerShow(modal, 'active');
+    kupRenderSettings();
+    kupFetchSettings();
     // 骨架占位：首次打开在重渲染完成前覆盖一层 shimmer，DOM/事件保持原样
     var app = modal.querySelector('#kup-app');
     var shell = modal.querySelector('.kup-shell');
@@ -3690,7 +3773,11 @@
 
   function kmdRender(card) {
     card = card || document.getElementById(CARD_ID);
-    if (!card || !kmdData) return;
+    if (!card) return;
+    var enabled = kupWidgetsEnabled();
+    var row = card.querySelector('#ku-mode-row');
+    if (row) row.style.display = enabled ? '' : 'none';
+    if (!enabled || !kmdData) return;
     var modes = kmdData.modes || [];
     var range = card.querySelector('#ku-mode-range');
     var nameEl = card.querySelector('#ku-mode-name');
@@ -3794,9 +3881,17 @@
     kmdLastSid = sid;
     kmdLastScope = scope;
     var q = sid ? ('?session_id=' + encodeURIComponent(sid)) : '';
-    return kapiFetch(API_BASE + '/api/modes' + q)
+    var epoch = kupSettingsEpoch;
+    return kapiFetch(API_BASE + '/api/modes' + q, { cache: 'no-store' })
       .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-      .then(function(d) { kmdData = d; kmdRender(); if (kmdOverlayEl && kmdOverlayEl.classList.contains('visible') && !kmdDraft) kmdRenderEditor(); return d; })
+      .then(function(d) {
+        if (epoch !== kupSettingsEpoch || sid !== kmdActiveSessionId()) return kmdData;
+        kmdData = d;
+        if ((!kupSettings || d.widgets_enabled === false) && typeof d.widgets_enabled === 'boolean') kupApplySettings(d);
+        kmdRender(); kmdHostLockApply(); kmdHostLockWatch();
+        if (kupWidgetsEnabled() && kmdOverlayEl && kmdOverlayEl.classList.contains('visible') && !kmdDraft) kmdRenderEditor();
+        return d;
+      })
       .catch(function() {
         var desc = document.querySelector('#' + CARD_ID + ' #ku-mode-desc');
         if (desc && !kmdData) desc.textContent = '后台服务离线，模式滑杆不可用';
@@ -3881,6 +3976,7 @@
   var kmdHostObs = null;          // MutationObserver 盯宿主 SPA 重挂选择器
 
   function kmdIsLocked() {
+    if (!kupWidgetsEnabled()) return false;
     if (kmdData && kmdData.locked && kmdData.locked.locked) return true;
     return !!(kmdData && kmdData.session_lock);
   }
@@ -3895,6 +3991,15 @@
   // 没有稳定 class 契约——多选择器 + MutationObserver 重挂，找不到就只挂提示。
   function kmdHostLockApply() {
     var locked = kmdIsLocked();
+    if (!locked) {
+      document.querySelectorAll('[data-ku-lock]').forEach(function(n) {
+        n.removeAttribute('data-ku-lock');
+        n.classList.remove('ku-host-model-locked', 'ku-host-model-locked-v');
+        if (n.tagName === 'BUTTON' || n.tagName === 'SELECT') n.disabled = false;
+        n.removeAttribute('title');
+      });
+      return 0;
+    }
     var hit = 0;
     // 只锁「模型切换器」叶子控件，绝不碰输入区容器/祖先——
     // 之前给容器加 pointer-events:none 会把里面的 textarea 也冻结，导致整框打不了字。
@@ -3957,7 +4062,7 @@
 
   function kmdRenderLock(card) {
     card = card || document.getElementById(CARD_ID);
-    if (!card) return;
+    if (!card || !kmdData || !kupWidgetsEnabled()) return;
     var btn = card.querySelector('#ku-mode-lock');
     if (!btn) return;
     var scopeNow = kmdScope();
@@ -4216,17 +4321,25 @@
   }
 
   function kmdOpenEditor() {
+    if (!kupWidgetsEnabled()) { kmmToast('挂件已关闭，请先在面板设置中开启', true); return; }
     var o = kmdEnsureOverlay();
     kmdDraft = null;
     kuLayerShow(o, 'visible');
     if (kmdData) kmdRenderEditor();
-    kmdFetch(true).then(function() { if (!kmdDraft) kmdRenderEditor(); });
+    kmdFetch(true).then(function() { if (kupWidgetsEnabled() && !kmdDraft) kmdRenderEditor(); });
   }
 
   setInterval(function() {
-    if (document.hidden || kmdBusy || !document.getElementById(CARD_ID)) return;
+    if (document.hidden || kmdBusy || !document.getElementById(CARD_ID) || !kupWidgetsEnabled()) return;
     kmdFetch(false);
   }, 20000);
+  setInterval(function() {
+    if (!document.hidden) kupFetchSettings();
+  }, 3000);
+  document.addEventListener('visibilitychange', function() {
+    if (!document.hidden) kupFetchSettings();
+  });
+  kupFetchSettings();
 
   function openModelModal() {
     var overlay = ensureModelOverlay();

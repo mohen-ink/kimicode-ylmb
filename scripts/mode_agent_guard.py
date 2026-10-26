@@ -5,6 +5,8 @@ import re
 import sys
 import urllib.request
 
+from plugin_settings import widgets_enabled
+
 SESSION_ID = re.compile(r'^session_[A-Za-z0-9_-]{8,100}$')
 
 
@@ -25,6 +27,8 @@ def _kimi_home():
 
 
 def main():
+    if not widgets_enabled():
+        return
     try:
         call = json.load(sys.stdin)
     except (OSError, ValueError):

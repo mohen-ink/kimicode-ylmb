@@ -166,9 +166,11 @@ _MOBILE_RESTORE_LOCK = threading.RLock()
 import model_manager  # noqa: E402
 import model_catalog  # noqa: E402
 import models_dev  # noqa: E402
+import plugin_settings  # noqa: E402
 
 CONFIG_LOCK = threading.RLock()
 CONFIG_CONFLICT = '配置已被其他操作更改，请刷新后重试'
+WIDGETS_DISABLED = '挂件已关闭，请先在面板设置中开启'
 
 
 def _config_locked(function):
@@ -176,6 +178,49 @@ def _config_locked(function):
         with CONFIG_LOCK:
             return function(*args, **kwargs)
     return locked
+
+
+def widgets_enabled():
+    return plugin_settings.widgets_enabled(KIMI_HOME)
+
+
+@_config_locked
+def save_plugin_settings(req):
+    if set(req) != {'widgets_enabled'} or type(req['widgets_enabled']) is not bool:
+        return {'success': False, 'message': '挂件开关必须是布尔值'}, 400
+    enabled = req['widgets_enabled']
+    path = plugin_settings.settings_path(KIMI_HOME)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='settings-', suffix='.tmp', dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as source:
+            json.dump({'widgets_enabled': enabled}, source, ensure_ascii=False, indent=2)
+            source.flush()
+            os.fsync(source.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+    if enabled:
+        d = load_modes()
+        if ((isinstance(d.get('locked'), dict) and d['locked'].get('locked')) or
+                any(isinstance(v, dict) and v.get('locked') for v in _session_locks_map(d).values())):
+            _start_lock_guard()
+    else:
+        _stop_lock_guard()
+    return {'success': True, 'message': '挂件已开启' if enabled else '挂件已关闭',
+            'data': plugin_settings.load_settings(KIMI_HOME)}, 200
+
+
+def _widgets_action(function):
+    def action(*args, **kwargs):
+        with CONFIG_LOCK:
+            if not widgets_enabled():
+                return False, WIDGETS_DISABLED
+            return function(*args, **kwargs)
+    return action
 
 
 def _config_change(transform):
@@ -1883,15 +1928,40 @@ def detect_session_mode(modes, model_id):
     return None
 
 
+def _mode_models(data):
+    pricing = load_pricing()
+    models = []
+    for alias, m in (data.get('models') or {}).items():
+        caps = _effective(m, 'capabilities') or []
+        models.append({'alias': alias, 'display_name': _effective(m, 'display_name') or alias,
+                       'has_tools': 'tool_use' in caps, 'has_image': 'image_in' in caps,
+                       'pricing': pricing.get(alias) or pricing.get(m.get('model', '')) or None})
+    return sorted(models, key=lambda x: x['alias'])
+
+
+@_config_locked
+def _disabled_modes_data(sid):
+    data = _load_toml(get_config_content()) or {}
+    return {'widgets_enabled': False, 'modes': [], 'locked': {'locked': False},
+            'session_id': sid, 'session_lock': None, 'session_locked': False,
+            'models': _mode_models(data)}
+
+
 def get_modes_data(session_id=None):
     """先读该对话真实模型（daemon 请求在配置锁外），再取档位状态，
     避免每次轮询都长时间占着配置锁。"""
     sid = session_id if isinstance(session_id, str) and _MODE_SESSION_RE.fullmatch(session_id) else None
-    return _modes_data_locked(sid, _session_live_model(sid) if sid else None)
+    if not widgets_enabled():
+        return _disabled_modes_data(sid)
+    result = _modes_data_locked(sid, _session_live_model(sid) if sid else None)
+    result.setdefault('widgets_enabled', True)
+    return result
 
 
 @_config_locked
 def _modes_data_locked(sid, live_model):
+    if not widgets_enabled():
+        return _disabled_modes_data(sid)
     content = get_config_content()
     data = _load_toml(content) or {}
     d = load_modes(data)
@@ -1906,14 +1976,7 @@ def _modes_data_locked(sid, live_model):
             changed = True
     if changed:
         save_modes(d)
-    pricing = load_pricing()
-    models = []
-    for alias, m in (data.get('models') or {}).items():
-        caps = _effective(m, 'capabilities') or []
-        models.append({'alias': alias, 'display_name': _effective(m, 'display_name') or alias,
-                       'has_tools': 'tool_use' in caps, 'has_image': 'image_in' in caps,
-                       'pricing': pricing.get(alias) or pricing.get(m.get('model', '')) or None})
-    models.sort(key=lambda x: x['alias'])
+    models = _mode_models(data)
     defined = _defined_aliases(data)
     undefined_pool = [k for k in (sec.get('models') or {}) if k not in defined]
     disabled = ((data.get('tools') or {}).get('disabled')) or []
@@ -2323,14 +2386,14 @@ def _lock_guard(gen):
     retry_at = 0.0
     while not _LOCK_STOP.is_set() and _LOCK_GEN[0] == gen:
         time.sleep(1.5)
-        if _LOCK_STOP.is_set() or _LOCK_GEN[0] != gen:
+        if _LOCK_STOP.is_set() or _LOCK_GEN[0] != gen or not widgets_enabled():
             break
         try:
             d = load_modes()
             modes = d.get('modes') or []
             session_locks = _session_locks_map(d)
             for sid, entry in list(session_locks.items()):
-                if _LOCK_STOP.is_set() or _LOCK_GEN[0] != gen:
+                if _LOCK_STOP.is_set() or _LOCK_GEN[0] != gen or not widgets_enabled():
                     break
                 if not (isinstance(entry, dict) and entry.get('locked')):
                     continue
@@ -2368,7 +2431,7 @@ def _lock_guard(gen):
             if not want_id:
                 continue
             for item in targets:
-                if _LOCK_STOP.is_set() or _LOCK_GEN[0] != gen:
+                if _LOCK_STOP.is_set() or _LOCK_GEN[0] != gen or not widgets_enabled():
                     break
                 sid, cur = item['id'], item['model']
                 if cur == want_id:
@@ -2380,8 +2443,11 @@ def _lock_guard(gen):
             pass
 
 
+@_config_locked
 def _start_lock_guard():
-    """启动（或重启）守护线程；幂等。"""
+    """挂件开启时启动（或重启）守护线程。"""
+    if not widgets_enabled():
+        return
     with _LOCK_STATE:
         _LOCK_GEN[0] += 1
         _LOCK_STOP.set()                     # 先让旧线程退出
@@ -2498,6 +2564,16 @@ def restore_mode_snapshot():
         _stop_lock_guard()
     save_modes(d)
     return True, '已恢复到使用滑杆之前的配置（%s 的快照），会话内 /reload 生效' % snap.get('time', '')
+
+
+apply_mode = _widgets_action(apply_mode)
+apply_session_mode = _widgets_action(apply_session_mode)
+lock_session_mode = _widgets_action(lock_session_mode)
+set_modes_scope = _widgets_action(set_modes_scope)
+lock_mode = _widgets_action(lock_mode)
+unlock_mode = _widgets_action(unlock_mode)
+restore_mode_snapshot = _widgets_action(restore_mode_snapshot)
+_session_set_model = _widgets_action(_session_set_model)
 
 
 # ---------------- 自更新 ----------------
@@ -3193,6 +3269,8 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(urlsplit(self.path).query)
             sid = (qs.get('session_id') or [None])[0]
             self._json(get_modes_data(sid))
+        elif path == '/api/settings':
+            self._json(plugin_settings.load_settings(KIMI_HOME))
         elif path == '/api/reload':
             self._json({'success': True, 'data': collect_once() or {}})
         else:
@@ -3246,6 +3324,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             req = {}
         try:
+            if path == '/api/settings':
+                payload, status = save_plugin_settings(req)
+                return self._json(payload, status)
+            if path.startswith('/api/modes/') and not widgets_enabled():
+                return self._json({'success': False, 'message': WIDGETS_DISABLED,
+                                   'data': _disabled_modes_data(None)}, 409)
             if path == '/api/plugin/uninstall':
                 if set(req) != {'confirm'} or req.get('confirm') is not True:
                     return self._json({'success': False, 'message': '卸载确认参数不正确'}, 400)
@@ -3367,6 +3451,8 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == '/api/modes/save':
                 with CONFIG_LOCK:
+                    if not widgets_enabled():
+                        return self._json({'success': False, 'message': WIDGETS_DISABLED}, 409)
                     data = _load_toml(get_config_content()) or {}
                     modes, err = validate_modes(req.get('modes'), data)
                     if err:
@@ -3379,6 +3465,8 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == '/api/modes/reset':
                 with CONFIG_LOCK:
+                    if not widgets_enabled():
+                        return self._json({'success': False, 'message': WIDGETS_DISABLED}, 409)
                     data = _load_toml(get_config_content()) or {}
                     d = load_modes(data)
                     d['modes'] = json.loads(json.dumps(DEFAULT_MODES))
@@ -3782,12 +3870,13 @@ def run_server():
     load_state()
     # 扫描由主循环 collect_once 驱动，不再另起后台线程（双线程曾并发扫文件导致重复计数）
     threading.Thread(target=_poll_official_loop, daemon=True).start()
-    # 服务重启自愈：modes.json 里还挂着锁就把守护线程拉回来
     try:
-        _d = load_modes()
-        if isinstance(_d.get('locked'), dict) and _d['locked'].get('locked'):
-            _start_lock_guard()
-            log('mode-lock guard restored (index=%s)' % _d['locked'].get('index'))
+        if widgets_enabled():
+            _d = load_modes()
+            if ((isinstance(_d.get('locked'), dict) and _d['locked'].get('locked')) or
+                    any(isinstance(v, dict) and v.get('locked') for v in _session_locks_map(_d).values())):
+                _start_lock_guard()
+                log('mode-lock guard restored')
     except Exception:
         pass
 

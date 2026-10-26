@@ -57,7 +57,7 @@ BODY = r"""
 <div class="ku-grab" aria-label="拖动面板"></div>
 <div class="ku-top"><h1>用量手册</h1><button type="button" data-ku="refresh" aria-label="刷新当前页">刷新</button><button type="button" data-ku="back">返回聊天</button></div>
 <div class="ku-tabs" role="tablist" aria-label="面板分区">
-<button type="button" role="tab" data-tab="overview" aria-selected="true">概览</button><button type="button" role="tab" data-tab="modes" aria-selected="false">模式</button><button type="button" role="tab" data-tab="reports" aria-selected="false">报表</button><button type="button" role="tab" data-tab="models" aria-selected="false">模型</button>
+<button type="button" role="tab" data-tab="overview" aria-selected="true">概览</button><button type="button" role="tab" data-tab="modes" aria-selected="false" hidden>模式</button><button type="button" role="tab" data-tab="reports" aria-selected="false">报表</button><button type="button" role="tab" data-tab="models" aria-selected="false">模型</button>
 </div>
 <div class="ku-status" role="status" aria-live="polite" data-ku="status">加载中…</div>
 <section class="ku-pane" data-pane="overview"><div class="ku-grid" data-ku="cards"></div><div class="ku-card" data-ku="quota"></div><div class="ku-card" data-ku="misc"></div><div class="ku-card" data-ku="recent"></div></section>
@@ -103,15 +103,26 @@ function kimiPanelMount(box,root){
   function send(action,data,after){if(state.busy){status('上一项操作仍在提交，请稍候');return}state.busy=true;epoch++;status('正在提交…');
     request('/mobile/panel/'+action,data).then(function(r){if(after)after(r);state.busy=false;return refresh().then(function(){status(r.message||'已保存')})})
     .catch(function(e){status(e.message||'操作失败',true)}).finally(function(){state.busy=false})}
-  function refresh(){var current=epoch,sid=modeSessionId(),view=state.tab,modesPath='/mobile/panel/modes'+(sid?'?session_id='+encodeURIComponent(sid):'');
-    var paths=view==='models'?[['modes',modesPath],['manager','/mobile/panel/manager'],['audit','/mobile/panel/audit']]
-      :view==='modes'?[['modes',modesPath]]:[['usage','/mobile/usage/data']];
+  function widgetsEnabled(){return !!state.modes&&state.modes.widgets_enabled!==false}
+  function syncWidgetVisibility(){var enabled=widgetsEnabled(),tab=box.querySelector('[data-tab="modes"]'),switched=false;
+    tab.hidden=!enabled;
+    if(!enabled){
+      clear(q('modePanel'));var editor=q('modeEditor');editor.hidden=true;clear(editor);delete editor.parentNode.dataset.editing;
+      if(state.tab==='modes'){editing=false;sliding=false;state.tab='overview';switched=true;
+        box.querySelectorAll('[data-tab]').forEach(function(b){b.setAttribute('aria-selected',b.dataset.tab===state.tab?'true':'false')});
+        box.querySelectorAll('[data-pane]').forEach(function(p){p.hidden=p.dataset.pane!==state.tab})}
+    }
+    return switched}
+  function refresh(onlyModes){var current=epoch,sid=modeSessionId(),view=state.tab,modesPath='/mobile/panel/modes'+(sid?'?session_id='+encodeURIComponent(sid):'');
+    var paths=onlyModes?[['modes',modesPath]]:view==='models'?[['modes',modesPath],['manager','/mobile/panel/manager'],['audit','/mobile/panel/audit']]
+      :view==='modes'?[['modes',modesPath]]:[['modes',modesPath],['usage','/mobile/usage/data']];
     return Promise.allSettled(paths.map(function(p){return request(p[1])})).then(function(results){
       if(!alive||current!==epoch||sid!==modeSessionId()||view!==state.tab)return;
       var errors=[];results.forEach(function(r,i){if(r.status==='fulfilled')state[paths[i][0]]=r.value;else errors.push(r.reason.message||'连接中断')});
-      renderAll();status(errors.length?errors.join('；'):'已更新 · '+new Date().toLocaleTimeString(),!!errors.length)
+      var switched=syncWidgetVisibility();renderAll();status(errors.length?errors.join('；'):'已更新 · '+new Date().toLocaleTimeString(),!!errors.length);
+      if(switched)return refresh()
     })}
-  function renderAll(){if(editing||sliding)return;
+  function renderAll(){syncWidgetVisibility();if(editing||sliding)return;
     if(state.tab==='overview')renderOverview();else if(state.tab==='reports')renderReports();
     else if(state.tab==='modes')renderModes();else if(state.tab==='models'&&!(box.contains(document.activeElement)&&document.activeElement.tagName==='INPUT'))renderManager()}
   function renderOverview(){var d=state.usage||{},cards=clear(q('cards'));
@@ -253,11 +264,11 @@ function kimiPanelMount(box,root){
   box.querySelector('[data-ku="refresh"]').addEventListener('click',function(){if(editing){status('编辑中，请先保存或取消',true);return}refresh()});
   box.querySelectorAll('[data-tab]').forEach(function(b){b.addEventListener('click',function(){if(editing){status('请先保存或取消当前编辑',true);return}epoch++;state.tab=b.dataset.tab;box.querySelectorAll('[data-tab]').forEach(function(t){t.setAttribute('aria-selected',t===b?'true':'false')});box.querySelectorAll('[data-pane]').forEach(function(p){p.hidden=p.dataset.pane!==state.tab});var scroller=box.closest('.ku-sheet')||document.scrollingElement;if(scroller)scroller.scrollTop=0;renderAll();status('正在加载'+b.textContent+'…');refresh()})});
   box.querySelectorAll('[data-period]').forEach(function(b){b.addEventListener('click',function(){state.period=b.dataset.period;box.querySelectorAll('[data-period]').forEach(function(t){t.setAttribute('aria-selected',t===b?'true':'false')});renderReports()})});
-  function schedule(){if(alive&&!document.hidden&&timer===null)timer=setTimeout(poll,12000)}
-  function poll(){timer=null;if(!alive||document.hidden)return;if(editing||sliding||state.busy){schedule();return}refresh().catch(function(e){status(e.message||'连接暂不可用',true)}).finally(schedule)}
+  function schedule(){if(alive&&!document.hidden&&timer===null)timer=setTimeout(poll,3000)}
+  function poll(){timer=null;if(!alive||document.hidden)return;if(state.busy){schedule();return}refresh(editing||sliding).catch(function(e){status(e.message||'连接暂不可用',true)}).finally(schedule)}
   function visible(){if(document.hidden){epoch++;if(timer)clearTimeout(timer);timer=null}else if(alive&&!timer)poll()}
   document.addEventListener('visibilitychange',visible);poll();
-  return {stop:function(){alive=false;epoch++;if(timer)clearTimeout(timer);timer=null;document.removeEventListener('visibilitychange',visible)},start:function(){if(!alive){alive=true;epoch++;document.addEventListener('visibilitychange',visible)}if(editing)status('草稿未保存，请保存或取消');else if(!timer&&!document.hidden)poll()}};
+  return {stop:function(){alive=false;epoch++;if(timer)clearTimeout(timer);timer=null;document.removeEventListener('visibilitychange',visible)},start:function(){if(!alive){alive=true;epoch++;document.addEventListener('visibilitychange',visible)}if(editing)status('草稿未保存，请保存或取消');if(!timer&&!document.hidden)poll()}};
 }
 """
 PAGE_HTML = '<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="referrer" content="no-referrer"><title>Kimi Code · 手机面板</title><style>*{box-sizing:border-box}body{background:#f5f2e7;margin:0;padding:10px max(12px,env(safe-area-inset-right)) max(16px,env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left))}' + CSS + '</style></head><body><div id="kuBox">' + BODY + '</div><script>(function(){"use strict";' + JS + 'var root=location.pathname.replace(/\\/mobile\\/usage\\/?$/,""),box=document.getElementById("kuBox");kimiPanelMount(box,root);box.querySelector("[data-ku=back]").onclick=function(){location.href=root+"/"};})();</script></body></html>'
@@ -374,15 +385,15 @@ function kimiNativeModeLock(root,btn){
   function poll(){if(document.hidden||pending)return;pending=true;var ctrl=new AbortController(),timeout=setTimeout(function(){ctrl.abort()},4500);
     var sid='';try{sid=document.querySelector('#app').__vue_app__.config.globalProperties.$pinia._s.get('kimi.sessions').activeSessionId||''}catch(e){}
     var query=/^session_[A-Za-z0-9_-]{8,100}$/.test(sid)?'?session_id='+encodeURIComponent(sid):'';
-    fetch(root+'/mobile/panel/modes'+query,{credentials:'same-origin',signal:ctrl.signal}).then(function(r){if(!r.ok)throw Error();return r.json()})
-      .then(function(data){locked=!!(data.locked&&data.locked.locked||data.session_lock);paint()})
+    fetch(root+'/mobile/panel/modes'+query,{credentials:'same-origin',signal:ctrl.signal,cache:'no-store'}).then(function(r){if(!r.ok)throw Error();return r.json()})
+      .then(function(data){locked=data.widgets_enabled!==false&&!!(data.locked&&data.locked.locked||data.session_lock);paint()})
       .catch(function(){}).finally(function(){clearTimeout(timeout);pending=false})}
   function block(e){if(!locked||!e.target.closest||!e.target.closest('.model-pill'))return;
     e.preventDefault();e.stopImmediatePropagation();btn.textContent='面板 · 已锁'}
   document.addEventListener('pointerdown',block,true);
   document.addEventListener('click',block,true);
   document.addEventListener('visibilitychange',function(){if(!document.hidden)poll()});
-  setInterval(poll,12000);poll();
+  setInterval(poll,3000);poll();
 }
 """
 OVERLAY_HTML = '<style>.ku-phone-model-locked{opacity:.65;cursor:not-allowed}#kuOv{position:fixed;inset:0;z-index:10000}#kuOv[hidden]{display:none}#kuOv .ku-mask{position:absolute;inset:0;background:rgba(43,61,47,.42)}#kuOv .ku-sheet{position:absolute;inset:4dvh 0 0;background:#f5f2e7;border-radius:18px 18px 0 0;overflow-y:auto;overscroll-behavior:contain;padding:8px max(12px,env(safe-area-inset-right)) max(20px,env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left));box-shadow:0 -8px 26px rgba(48,55,42,.16)}#kuOv .ku-grab{height:22px;touch-action:none;cursor:ns-resize;position:relative}#kuOv .ku-grab:before{content:"";position:absolute;top:3px;left:calc(50% - 22px);width:44px;height:5px;border-radius:4px;background:#91a998}@supports not (height:1dvh){#kuOv .ku-sheet{inset:4% 0 0}}</style><style>' + CSS + '</style><div id="kuOv" hidden><div class="ku-mask"></div><div class="ku-sheet"><div id="kuBox">' + BODY + '</div></div></div><button id="kuUsageBtn" type="button" style="position:fixed;right:max(12px,env(safe-area-inset-right));bottom:max(12px,env(safe-area-inset-bottom));z-index:10001;min-height:48px;touch-action:none;user-select:none;padding:10px 16px;border-radius:99px;background:#386c5b;color:#fff;border:1px solid #749781;font:14px system-ui">面板</button><script>(function(){"use strict";' + JS + DRAG_JS + 'var m=location.pathname.match(/^(\\/t\\/[A-Za-z0-9_-]{4,32})(?=\\/|$)/),root=m?m[1]:"",ov=document.getElementById("kuOv"),btn=document.getElementById("kuUsageBtn"),inst=null;function open(){ov.hidden=false;btn.style.visibility="hidden";if(!inst)inst=kimiPanelMount(document.getElementById("kuBox"),root);else inst.start()}function close(){ov.hidden=true;btn.style.visibility="visible";if(inst)inst.stop()}kimiDragPanel(btn,function(){ov.hidden?open():close()},ov);kimiSheetDrag(ov);kimiNativeModeLock(root,btn);ov.querySelector(".ku-mask").onclick=close;ov.querySelector("[data-ku=back]").onclick=close})();</script>'

@@ -2730,7 +2730,8 @@ class _LanHandler(BaseHTTPRequestHandler):
         return json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8')
 
     def _mode_lock_body(self, raw_path, body, snapshot, sid):
-        if self.command != 'POST':
+        from plugin_settings import widgets_enabled
+        if self.command != 'POST' or not widgets_enabled(self.mgr.kimi_home):
             return body
         path = self._clean_path() or ''
         target = re.fullmatch(r'/api/v1/sessions/([^/]+)/(profile|prompts)', path)
