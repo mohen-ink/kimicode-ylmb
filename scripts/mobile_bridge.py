@@ -2583,17 +2583,18 @@ class _LanHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _lock_entry(data, entry, scope):
-        index, modes = entry.get('index'), data.get('modes')
-        if type(index) is not int or not isinstance(modes, list) or not 0 <= index < len(modes):
-            return None
-        main = modes[index].get('main')
+        main = entry.get('main')
+        if not main:
+            index, modes = entry.get('index'), data.get('modes')
+            if type(index) is not int or not isinstance(modes, list) or not 0 <= index < len(modes):
+                return None
+            main = modes[index].get('main')
         if (not isinstance(main, str) or not main or len(main) > 256
                 or any(ord(c) < 32 or ord(c) == 127 for c in main)):
             return None
         return {'main': main, 'scope': scope}
 
     def _session_lock_main(self, sid):
-        """该对话自己的锁：返回 main 或 None。请求未带会话标识时不生效。"""
         if not isinstance(sid, str) or not re.fullmatch(r'session_[A-Za-z0-9_-]{8,100}', sid):
             return None
         if _mobile_panel is None:
@@ -2602,11 +2603,15 @@ class _LanHandler(BaseHTTPRequestHandler):
             status, data = _mobile_panel.call('modes', 'GET', query={'session_id': sid})
             if status != 200:
                 raise ValueError()
-            entry = data.get('session_lock')
+            if data.get('widgets_enabled') is False:
+                return None
+            entry = data.get('session_policy') if data.get('policy_version', 0) >= 2 else data.get('session_lock') or data.get('locked')
             if not isinstance(entry, dict) or entry.get('locked') is not True:
                 return None
             out = self._lock_entry(data, entry, 'session')
-            return out['main'] if out else None
+            if out is None:
+                raise ValueError()
+            return out['main']
         except MobileBridgeError:
             raise
         except Exception:
@@ -2746,14 +2751,15 @@ class _LanHandler(BaseHTTPRequestHandler):
             prompt = target is not None and target.group(2) == 'prompts'
             if prompt and data.get('agent_id') not in (None, 'main'):
                 return body
-            main = self._locked_mode_main()
-            if prompt:
-                return self._lock_prompt_body(data, target, snapshot, sid, main)
-            if main is None:
-                # 没有全局锁：只按该对话自己的锁收敛 profile / 配置
+            if target is not None:
+                if not re.fullmatch(r'session_[A-Za-z0-9_-]{8,100}', target.group(1)):
+                    return self._err(400, '会话标识不合法')
+                if prompt:
+                    return self._lock_prompt_body(data, target, snapshot, sid, None)
                 return self._session_lock_body(data, target, snapshot, sid)
-            if target is not None and not re.fullmatch(r'session_[A-Za-z0-9_-]{8,100}', target.group(1)):
-                return self._err(400, '会话标识不合法')
+            main = self._locked_mode_main()
+            if main is None:
+                return body
             models = self._mode_owner_json('GET', '/api/v1/models', snapshot, sid).get('items') or []
             model = next((m for m in models if isinstance(m, dict) and
                           (m.get('id') == main or m.get('model') == main)), None)

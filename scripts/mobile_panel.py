@@ -13,6 +13,7 @@ READ_ROUTES = {
     'audit': '/api/data',
 }
 WRITE_ROUTES = {
+    'follow-global': '/api/modes/follow-global',
     'apply': '/api/modes/apply',
     'scope': '/api/modes/scope',
     'lock': '/api/modes/lock',
@@ -107,6 +108,10 @@ def validate(action, body):
             raise PanelError('会话标识不合法')
         if 'scope' in body and body['scope'] not in ('global', 'session'):
             raise PanelError('档位作用域不合法')
+    elif action == 'follow-global':
+        _fields(body, ('session_id',), ('session_id',))
+        if not isinstance(body['session_id'], str) or not re.fullmatch(r'session_[A-Za-z0-9_-]{8,100}', body['session_id']):
+            raise PanelError('会话标识不合法')
     elif action == 'scope':
         _fields(body, ('scope',), ('scope',))
         if body['scope'] not in ('global', 'session'):
@@ -237,7 +242,8 @@ def _public(action, result):
         return {key: result[key] for key in ('widgets_enabled', 'modes', 'active', 'last_applied', 'locked', 'has_snapshot',
                                             'current', 'undefined_pool', 'models', 'subs_max', 'min', 'max',
                                             'scope', 'session_id', 'session_active', 'session_model',
-                                            'session_lock', 'session_locked', 'session_unavailable_subagents') if key in result}
+                                            'session_lock', 'session_locked', 'session_unavailable_subagents',
+                                            'session_independent', 'session_policy', 'global_mode', 'policy_version') if key in result}
     if action == 'audit':
         models = []
         for item in result.get('models', [])[:500]:
@@ -278,7 +284,7 @@ def _public(action, result):
                 'models': models, 'default_model': result.get('default_model', ''),
                 'provider_types': result.get('provider_types', []),
                 'effort_levels': result.get('effort_levels', [])}
-    if action in ('apply', 'lock', 'unlock', 'restore', 'reset', 'save', 'scope'):
+    if action in ('apply', 'lock', 'unlock', 'restore', 'reset', 'save', 'scope', 'follow-global'):
         return {'success': result.get('success') is True,
                 'message': _safe_message(result.get('message')),
                 'data': _public('modes', result['data']) if isinstance(result.get('data'), dict) else None}

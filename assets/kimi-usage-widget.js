@@ -3777,7 +3777,8 @@
     var enabled = kupWidgetsEnabled();
     var row = card.querySelector('#ku-mode-row');
     if (row) row.style.display = enabled ? '' : 'none';
-    if (!enabled || !kmdData) return;
+    if (!enabled) { kmdRenderLock(card); return; }
+    if (!kmdData) return;
     var modes = kmdData.modes || [];
     var range = card.querySelector('#ku-mode-range');
     var nameEl = card.querySelector('#ku-mode-name');
@@ -3814,6 +3815,11 @@
       nameEl.textContent = (act + 1) + '/' + modes.length + ' · ' + modes[act].name;
       desc.innerHTML = kmdModeDesc(modes[act]);
     }
+    var policy = kmdScope() === 'session' ? kmdData.session_policy : kmdData.global_mode;
+    if (policy && act == null) {
+      nameEl.textContent = policy.name + '（已应用快照）';
+      desc.innerHTML = kmdModeDesc(policy);
+    }
     if (kmdScope() === 'session') {
       if (!kmdActiveSessionId()) {
         desc.innerHTML = '<span class="warn">未打开对话：本对话档位不可用，先打开一个对话。</span>';
@@ -3821,16 +3827,26 @@
         var note = document.createElement('div');
         note.className = 'ku-scope-note';
         note.style.cssText = 'color:var(--color-text-faint,#94a3b8);font-size:10px;margin-top:2px;';
-        note.textContent = '仅作用于当前对话：主模型按档位切换，挂件调用按该档位白名单限制；宿主模型目录仍是全局的。';
+        note.textContent = '选档自动同步挂件目录；实际可派范围按本对话白名单限制，其它对话主模型不变。';
         desc.appendChild(note);
         var missing = kmdData.session_unavailable_subagents || [];
         if (missing.length || (kmdData.current && kmdData.current.agents_disabled)) {
           var warning = document.createElement('div');
           warning.className = 'warn';
-          warning.textContent = missing.length ? '宿主目录缺少 ' + missing.join('、') + '，这些挂件暂不能派送。' : '宿主已全局禁用子代理工具。';
+          warning.textContent = missing.length ? '目录待同步：' + missing.join('、') + '。重新点击当前档位自动修复。' : '宿主已全局禁用子代理工具。';
           desc.appendChild(warning);
         }
       }
+    }
+    if (kmdData.session_independent && kmdData.session_id === kmdActiveSessionId()) {
+      var tip = document.createElement('div');
+      tip.className = 'warn';
+      tip.textContent = '本对话使用独立档位' + (kmdData.session_lock ? '（已锁定）' : '') + '，全局切档不会覆盖它。';
+      var follow = document.createElement('button');
+      follow.type = 'button'; follow.className = 'kmm-tbtn';
+      follow.textContent = '本对话跟随全局'; follow.disabled = kmdBusy;
+      follow.onclick = function(e) { e.stopPropagation(); kmdFollowGlobal(); };
+      desc.appendChild(tip); desc.appendChild(follow);
     }
     kmdRenderScope(card);
     kmdRenderLock(card);
@@ -3912,83 +3928,99 @@
   }
 
   function kmdApply(i) {
-    if (kmdBusy || !kmdData) return;
+    if (kmdBusy || !kmdData || !kupWidgetsEnabled()) return;
     i = Math.round(i);
-    var scope = kmdScope();
-    if (scope === 'session' && !kmdActiveSessionId()) { kmmToast('先打开一个对话再选本对话档位', true); return; }
+    var scope = kmdScope(), sid = kmdActiveSessionId(), epoch = kupSettingsEpoch;
+    if (scope === 'session' && !sid) { kmmToast('先打开一个对话再选本对话档位', true); return; }
+    var target = (kmdData.modes || [])[i];
+    if (!target) return;
+    var entry = scope === 'session' ? kmdData.session_lock : kmdData.locked;
+    var tip = '切换至「' + target.name + '」？';
+    if (scope === 'global' && kmdData.session_independent) tip += '\n当前对话仍用独立档位，不会改变。要同步请点“本对话跟随全局”。';
+    if (entry && entry.locked) tip += '\n保持锁定，并更新锁定档位，无需手动解锁。';
+    if ((scope === 'global' && kmdData.session_independent || entry && entry.locked) && !confirm(tip)) { kmdRender(); return; }
     var card = document.getElementById(CARD_ID);
     var range = card && card.querySelector('#ku-mode-range');
-    var prevActive = kmdData.active;
-    var prevSession = kmdData.session_active;
-    // 乐观更新：先把 UI 落到目标档，后端失败再回滚
+    var prevActive = kmdData.active, prevSession = kmdData.session_active;
     kmdBusy = true;
     if (scope === 'session') kmdData.session_active = i;
     else kmdData.active = i;
-    if (range) { range.disabled = true; }
+    if (range) range.disabled = true;
     if (range && kmdDragging) { kmdDragging = false; kmdSnapTo(range, i, null); }
     else if (range) range.value = String(i);
     kmdRender();
-    kmdPost('/api/modes/apply', kmdTargetBody(i))
-      .then(function(d) {
-        if (d.success) {
-          if (d.data) { kmdData = d.data; }
-          kmmToast(d.message || '已切换');
-        } else {
-          kmdData.active = prevActive;
-          kmdData.session_active = prevSession;
-          kmmToast(d.message || '切换失败', true);
-        }
-      })
-      .catch(function() {
-        kmdData.active = prevActive;
-        kmdData.session_active = prevSession;
-        kmmToast('切换失败：后台服务未响应', true);
-      })
-      .then(function() {
-        kmdBusy = false;
-        var now = kmdShownIndex();
-        if (range) { range.disabled = false; kmdSnapTo(range, now == null ? i : now, null); }
-        kmdRender();
-        if (typeof fetchModels === 'function') kmmRefreshAll();
-      });
+    kmdPost('/api/modes/apply', kmdTargetBody(i)).then(function(d) {
+      if (epoch !== kupSettingsEpoch || sid !== kmdActiveSessionId()) return;
+      if (d.success) {
+        if (d.data) kmdData = d.data;
+        kmmToast(d.message || '已切换');
+      } else {
+        kmdData.active = prevActive; kmdData.session_active = prevSession;
+        kmmToast(d.message || '切换失败', true);
+      }
+    }).catch(function() {
+      if (epoch !== kupSettingsEpoch || sid !== kmdActiveSessionId()) return;
+      kmdData.active = prevActive; kmdData.session_active = prevSession;
+      kmmToast('切换失败：后台服务未响应', true);
+    }).finally(function() {
+      kmdBusy = false;
+      if (range) range.disabled = !kupWidgetsEnabled();
+      kmdFetch(true);
+      if (typeof fetchModels === 'function') kmmRefreshAll();
+    });
   }
 
   function kmdSetScope(scope) {
-    if (!kmdData || kmdBusy || scope === kmdScope()) return;
+    if (!kmdData || kmdBusy || !kupWidgetsEnabled() || scope === kmdScope()) return;
     if (scope === 'session' && !kmdActiveSessionId()) { kmmToast('先打开一个对话', true); return; }
-    kmdBusy = true;
-    kmdRender();
+    if (scope === 'global' && kmdData.session_independent && !confirm('仅打开全局设置，不会解除本对话独立档位或锁定。要让当前对话同步，请点击“本对话跟随全局”。')) return;
+    var epoch = kupSettingsEpoch, sid = kmdActiveSessionId();
+    kmdBusy = true; kmdRender();
     kmdPost('/api/modes/scope', { scope: scope }).then(function(d) {
+      if (epoch !== kupSettingsEpoch || sid !== kmdActiveSessionId()) return;
       if (d.success) {
-        if (d.data) kmdData = d.data;
-        else kmdData.scope = scope;
+        kmdData.scope = scope;
         kmmToast(d.message || '已切换');
       } else kmmToast(d.message || '切换失败', true);
     }).catch(function() { kmmToast('切换失败：后台服务未响应', true); })
-      .then(function() {
-        kmdBusy = false;
-        kmdFetch(true);
-      });
+      .finally(function() { kmdBusy = false; kmdFetch(true); });
   }
 
   /* ---- 档位锁定 ---- */
   var kmdLockBusy = false;
-  var kmdHostObs = null;          // MutationObserver 盯宿主 SPA 重挂选择器
+  var kmdHostObs = null;
 
+  function kmdFollowGlobal() {
+    var sid = kmdActiveSessionId(), epoch = kupSettingsEpoch;
+    if (kmdBusy || !sid || !kupWidgetsEnabled()) return;
+    if (!confirm('解除本对话独立档位和锁定，并立即跟随全局？其它独立对话不变。')) return;
+    kmdBusy = true; kmdRender();
+    kmdPost('/api/modes/follow-global', { session_id: sid }).then(function(d) {
+      if (epoch !== kupSettingsEpoch || sid !== kmdActiveSessionId()) return;
+      if (d.data) kmdData = d.data;
+      kmmToast(d.message || (d.success ? '本对话已跟随全局' : '切换失败'), !d.success);
+    }).catch(function() { kmmToast('切换失败：后台服务未响应', true); })
+      .finally(function() { kmdBusy = false; kmdFetch(true); });
+  }
   function kmdIsLocked() {
-    if (!kupWidgetsEnabled()) return false;
-    if (kmdData && kmdData.locked && kmdData.locked.locked) return true;
-    return !!(kmdData && kmdData.session_lock);
+    if (!kupWidgetsEnabled() || !kmdData) return false;
+    var sid = kmdActiveSessionId();
+    if (!sid) return !!(kmdData.locked && kmdData.locked.locked);
+    return kmdData.session_id === sid && kmdData.session_locked === true;
+  }
+  // 当前作用域自己那把锁：本对话只看本对话锁，全局只看全局锁。
+  // 不能拿「生效锁」（可能来自全局）去决定会话解锁按钮，否则会去解一把不存在的锁。
+  function kmdScopeLocked() {
+    if (!kupWidgetsEnabled() || !kmdData) return false;
+    return kmdScope() === 'session'
+      ? !!(kmdData.session_lock && kmdData.session_lock.locked)
+      : !!(kmdData.locked && kmdData.locked.locked);
   }
   function kmdLockedIndex() {
-    var l = kmdData && kmdData.locked;
-    if (l && typeof l.index === 'number') return l.index;
-    var sl = kmdData && kmdData.session_lock;
-    return (sl && typeof sl.index === 'number') ? sl.index : null;
+    var index = kmdData && (kmdScope() === 'session' ? kmdData.session_active : kmdData.active);
+    return typeof index === 'number' ? index : null;
   }
 
-  // 尽力找宿主发送框的模型选择器并禁用。宿主是 Kimi Code 桌面端 SPA，
-  // 没有稳定 class 契约——多选择器 + MutationObserver 重挂，找不到就只挂提示。
   function kmdHostLockApply() {
     var locked = kmdIsLocked();
     if (!locked) {
@@ -4028,6 +4060,15 @@
       });
     }
     cand.forEach(function(n) {
+      if (n.closest('#' + CARD_ID + ',#kmd-overlay,#kmm-overlay,.ku-sheet')) {
+        if (n.hasAttribute('data-ku-lock')) {
+          n.removeAttribute('data-ku-lock');
+          n.classList.remove('ku-host-model-locked', 'ku-host-model-locked-v');
+          if (n.tagName === 'BUTTON' || n.tagName === 'SELECT') n.disabled = false;
+          n.removeAttribute('title');
+        }
+        return;
+      }
       // 安全闸：命中元素若包住/就是输入框，跳过，绝不锁。
       if (n.tagName === 'TEXTAREA' || n.tagName === 'INPUT'
           || n.isContentEditable
@@ -4062,13 +4103,28 @@
 
   function kmdRenderLock(card) {
     card = card || document.getElementById(CARD_ID);
-    if (!card || !kmdData || !kupWidgetsEnabled()) return;
+    if (!card) return;
     var btn = card.querySelector('#ku-mode-lock');
     if (!btn) return;
+    var nameEl = card.querySelector('#ku-mode-name');
+    var desc = card.querySelector('#ku-mode-desc');
+    if (!kmdData || !kupWidgetsEnabled()) {
+      btn.classList.remove('on');
+      btn.disabled = true;
+      btn.innerHTML = '🔓';
+      btn.title = '挂件已关闭';
+      if (nameEl) {
+        var staleBadge = nameEl.querySelector('.ku-mode-lock-badge');
+        if (staleBadge) staleBadge.remove();
+      }
+      if (desc) {
+        var staleNote = desc.querySelector('.ku-lock-note');
+        if (staleNote) staleNote.remove();
+      }
+      return;
+    }
     var scopeNow = kmdScope();
-    var locked = scopeNow === 'session'
-      ? !!kmdData.session_lock
-      : !!(kmdData.locked && kmdData.locked.locked);
+    var locked = kmdScopeLocked();
     var li = kmdLockedIndex();
     btn.classList.toggle('on', locked);
     btn.disabled = kmdLockBusy;
@@ -4078,7 +4134,6 @@
       : (scopeNow === 'session'
           ? '锁定本对话：只固定当前对话的主模型，其它对话不受影响'
           : '锁定当前档：发送框模型被固定为本档主模型，后端守护自动改回');
-    var nameEl = card.querySelector('#ku-mode-name');
     if (nameEl && locked) {
       // 名字后挂锁标，但不重复加
       if (!nameEl.querySelector('.ku-mode-lock-badge')) {
@@ -4091,7 +4146,6 @@
       var old = nameEl.querySelector('.ku-mode-lock-badge');
       if (old) old.remove();
     }
-    var desc = card.querySelector('#ku-mode-desc');
     if (desc && locked && !desc.querySelector('.ku-lock-note')) {
       var n = document.createElement('div');
       n.className = 'ku-lock-note';
@@ -4107,23 +4161,22 @@
   }
 
   function kmdToggleLock() {
-    if (kmdLockBusy || !kmdData) return;
+    if (kmdLockBusy || !kmdData || !kupWidgetsEnabled()) return;
     var scope = kmdScope();
-    // 按当前作用域判定这把锁：本对话只看自己的锁，全局只看全局锁
-    var locked = scope === 'session'
-      ? !!kmdData.session_lock
-      : !!(kmdData.locked && kmdData.locked.locked);
+    var locked = kmdScopeLocked();
     var idx = locked ? null : (kmdShownIndex() != null ? kmdShownIndex()
                              : (kmdData.last_applied && kmdData.last_applied.index));
     if (!locked && (idx == null || idx < 0)) { kmmToast('先选一档再锁定', true); return; }
     if (!locked && scope === 'session' && !kmdActiveSessionId()) { kmmToast('先打开一个对话', true); return; }
     kmdLockBusy = true;
     kmdRenderLock();
+    var epoch = kupSettingsEpoch, sid = kmdActiveSessionId();
     var body = locked
-      ? { scope: scope, session_id: kmdActiveSessionId() || null }
+      ? { scope: scope, session_id: sid || null }
       : kmdTargetBody(idx);
     var call = locked ? kmdPost('/api/modes/unlock', body) : kmdPost('/api/modes/lock', body);
     call.then(function(d) {
+      if (epoch !== kupSettingsEpoch || sid !== kmdActiveSessionId()) return;
       if (d.success) {
         if (d.data) kmdData = d.data;
         kmmToast(d.message || (locked ? '已解锁' : '已锁定'));
@@ -4131,7 +4184,7 @@
         kmmToast(d.message || '操作失败', true);
       }
     }).catch(function() { kmmToast('操作失败：后台服务未响应', true); })
-      .then(function() {
+      .finally(function() {
         kmdLockBusy = false;
         kmdRender();
         kmdRenderLock();

@@ -249,36 +249,35 @@
   ].join('');
 
   function installScrollFix() {
-    // 抑制滚动链：聊天区到达边界后不再把滚动交给 WebView 根滚动器
-    // （根滚动器的越界回弹/发光正是"抖一下"的另一半来源）
     try {
       var style = document.createElement('style');
       style.id = 'ku-mobile-nav-style';
-      style.textContent = '.panes.chat-scroll{overscroll-behavior-y:contain}' + LAYOUT_CSS;
+      style.textContent = '.panes.chat-scroll{overscroll-behavior-y:contain}' + LAYOUT_CSS +
+        '.u-bub table{display:block;max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}' +
+        '.u-bub pre{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}';
       (document.head || document.documentElement).appendChild(style);
     } catch (e) { /* 样式失败不影响手势修正 */ }
 
-    var startY = null, awayUntil = 0;
-    document.addEventListener('touchstart', function(e) {
-      startY = e.touches.length === 1 && e.target.closest && e.target.closest('.panes.chat-scroll')
-        ? e.touches[0].clientY : null;
-      awayUntil = 0;
+    var UNPIN_GAP = 32, PIN_GAP = 48;
+    function gapToBottom(el) { return el.scrollHeight - el.scrollTop - el.clientHeight; }
+    function isChatPane(el) { return !!(el.matches && el.matches('.panes.chat-scroll')); }
+    document.addEventListener('scroll', function(e) {
+      var t = e.target;
+      if (!isChatPane(t)) return;
+      var gap = gapToBottom(t);
+      if (gap < PIN_GAP) t._kuUnpinned = false;
+      else if (gap > UNPIN_GAP) t._kuUnpinned = true;
     }, { passive: true, capture: true });
-    document.addEventListener('touchmove', function(e) {
-      if (startY === null || e.touches.length !== 1) return;
-      var dy = e.touches[0].clientY - startY;
-      if (dy > 4) awayUntil = Date.now() + 450;
-      else if (dy < -4) awayUntil = 0;
-    }, { passive: true, capture: true });
-    function endTouch() {
-      startY = null;
-      if (awayUntil) awayUntil = Date.now() + 450;
-    }
-    document.addEventListener('touchend', endTouch, { passive: true, capture: true });
-    document.addEventListener('touchcancel', endTouch, { passive: true, capture: true });
     function skipWrite(el, top) {
-      return el.matches && el.matches('.panes.chat-scroll') && typeof top === 'number' &&
-        (Math.abs(top - el.scrollTop) <= 1 || (Date.now() < awayUntil && top > el.scrollTop + 1));
+      if (!isChatPane(el) || typeof top !== 'number') return false;
+      if (el._kuUnpinned && gapToBottom(el) <= PIN_GAP) el._kuUnpinned = false;
+      if (Math.abs(top - el.scrollTop) <= 1) return true;
+      var down = top > el.scrollTop;
+      if (el._kuUnpinned && down) return true;
+      var gapAfter = el.scrollHeight - top - el.clientHeight;
+      if (gapAfter >= UNPIN_GAP) el._kuUnpinned = true;
+      else if (gapAfter <= PIN_GAP && !down) el._kuUnpinned = false;
+      return false;
     }
     try {
       var origScrollTo = Element.prototype.scrollTo;
@@ -302,13 +301,15 @@
     lockHorizontal();
   }
 
-  // 横向锁：任何残留的宽元素都不该让整页左右滑动。允许横向滚动的只有
-  // 明确的横滑容器（顶部标签、图表、输入区媒体轨、媒体灯箱）。
   var HSCROLL_OK = '.composer-media-rail,.ku-tabs,.ku-period,.ku-ticks,.ku-chart,.media-lightbox,' +
     '.media-thumb,.view-tabs,[style*="overflow-x"]';
   function allowHScroll(el) {
-    for (var n = el; n && n !== document.body; n = n.parentElement) {
+    for (var n = el; n && n.nodeType === 1 && n !== document.body && n !== document.documentElement; n = n.parentElement) {
       if (n.matches && n.matches(HSCROLL_OK)) return true;
+      if (n.scrollWidth - n.clientWidth <= 4) continue;
+      var cs;
+      try { cs = window.getComputedStyle(n); } catch (e) { cs = null; }
+      if (cs && (cs.overflowX === 'auto' || cs.overflowX === 'scroll')) return true;
     }
     return false;
   }
@@ -316,7 +317,7 @@
     function reset() {
       if (window.scrollX !== 0) window.scrollTo(0, window.scrollY);
       if (document.documentElement.scrollLeft !== 0) document.documentElement.scrollLeft = 0;
-      if (document.body.scrollLeft !== 0) document.body.scrollLeft = 0;
+      if (document.body && document.body.scrollLeft !== 0) document.body.scrollLeft = 0;
     }
     document.addEventListener('scroll', function (e) {
       var t = e.target;

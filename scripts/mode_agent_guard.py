@@ -64,18 +64,19 @@ def main():
     if not isinstance(record, dict) or not isinstance(lock, dict):
         deny('本对话挂件配置格式异常，不允许派送。')
         return
-    locked = isinstance(lock.get(sid), dict) and lock[sid].get('locked') is True
-    selected = lock.get(sid) or record.get(sid)
+    import mode_policy
+    selected = mode_policy.session_record(data, sid)
+    if selected is None:
+        selected = mode_policy.global_record(data)
     if selected is None:
         return
-    index = selected.get('index') if isinstance(selected, dict) else selected
-    modes = data.get('modes')
-    if type(index) is not int or not isinstance(modes, list) or not 0 <= index < len(modes):
+    mode = mode_policy.resolve(data, selected)
+    if mode is None:
         deny('本对话档位无效，不能确认挂件权限。')
         return
-    mode = modes[index]
-    allowed = (selected.get('subagents') if isinstance(selected, dict) and
-               selected.get('locked') is True else mode.get('subagents') if isinstance(mode, dict) else None)
+    selected = mode
+    locked = mode.get('locked') is True
+    allowed = mode.get('subagents')
     if not isinstance(allowed, list) or any(not isinstance(item, str) for item in allowed):
         deny('本对话挂件白名单无效，不能派送。')
         return

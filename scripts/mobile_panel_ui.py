@@ -146,41 +146,61 @@ function kimiPanelMount(box,root){
     return body}
   function modeOptions(){return (state.modes&&state.modes.models||[]).map(function(m){return [m.alias,m.display_name||m.alias]})}
   function renderModes(){var boxMode=clear(q('modePanel')),m=state.modes;if(!m){boxMode.textContent='正在加载档位…';return}
+    if(!widgetsEnabled())return;
     var modes=m.modes||[],scope=m.scope==='session'?'session':'global';
     var sid=modeSessionId(),matched=scope==='session'?m.session_active:m.active;
     var index=typeof matched==='number'&&matched>=0&&matched<modes.length?matched:null;
-    var selected=index===null?null:modes[index],title=node('h2',null,'滑动变阻器 · '+(selected?selected.name:'未匹配'));
-    var pool=m.current&&m.current.pool||[],sessionLocked=scope==='session'&&m.session_lock&&m.session_lock.locked;
-    var available=selected&&!m.current?.agents_disabled?(selected.subagents||[]).filter(function(alias){return !(sessionLocked&&alias===m.session_lock.main)&&(pool.indexOf(alias)!==-1||!sessionLocked&&alias===selected.main)}).length:0;
-    boxMode.append(title,node('div','ku-muted',selected?(selected.scene||'')+' · 主模型 '+selected.main+' · 已配置 '+(selected.subagents||[]).length+' 种挂件 · 当前可派 '+available+' 种'+(scope==='session'?'（仅本对话）':'（全局）'):scope==='session'&&!sid?'当前对话未识别，请返回聊天后重新打开面板':'当前配置不匹配预设，选择一档后应用'));
+    var selected=(scope==='session'?m.session_policy:m.global_mode)||(index===null?null:modes[index]);
+    var locked=scope==='session'?!!(m.session_lock&&m.session_lock.locked):!!(m.locked&&m.locked.locked);
+    var pool=m.current&&m.current.pool||[],effectiveLocked=!!(selected&&selected.locked);
+    var available=selected&&!(m.current&&m.current.agents_disabled)&&!(m.current&&m.current.force)?(selected.subagents||[]).filter(function(alias){return !(effectiveLocked&&alias===selected.main)&&pool.indexOf(alias)!==-1}).length:0;
+    boxMode.append(node('h2',null,'滑动变阻器 · '+(selected?selected.name:'未匹配')+(selected&&index===null?'（已应用快照）':'')),
+      node('div','ku-muted',selected?(selected.scene||'')+' · 主模型 '+selected.main+' · 已配置 '+(selected.subagents||[]).length+' 种挂件 · 当前可派 '+available+' 种':'请选择一档应用'));
     if(!modes.length)return;
     var scopes=node('div','ku-actions');
     [['global','全局'],['session','本对话']].forEach(function(pair){var b=button(pair[1],function(){
       if(pair[0]==='session'&&!modeSessionId()){status('先打开一个对话',true);return}
       if(pair[0]===scope)return;
-      if(!confirm(pair[0]==='global'?'切换成全局操作？仅切换操作方式，选档后才会应用。':'切换成本对话操作？仅切换操作方式，选档后才会应用。'))return;
+      var tip=pair[0]==='global'?'仅切换到全局设置，不会解除本对话独立档位或锁定。要让本对话一起改变，请点“本对话跟随全局”。':'仅切换到本对话设置，选档后应用；其它对话不变。';
+      if(!confirm(tip))return;
       send('scope',{scope:pair[0]})});
-      b.setAttribute('aria-selected',pair[0]===scope?'true':'false');b.disabled=pair[0]==='session'&&!modeSessionId();scopes.append(b)});
+      b.setAttribute('aria-selected',pair[0]===scope?'true':'false');b.disabled=pair[0]==='session'&&!sid;scopes.append(b)});
     boxMode.append(scopes);
+    if(sid&&m.session_id===sid&&m.session_independent){
+      boxMode.append(node('div','ku-warning','当前对话使用独立档位'+(m.session_lock&&m.session_lock.locked?'（已锁定）':'')+'，全局切档不会覆盖它。'));
+      boxMode.append(button('本对话跟随全局',function(){
+        if(modeSessionId()!==sid){status('对话已切换，请刷新面板',true);return}
+        if(confirm('解除本对话的独立档位和锁定，并立即跟随当前全局档位？其它独立对话不会改变。'))send('follow-global',{session_id:sid});
+      }));
+    }else if(sid)boxMode.append(node('div','ku-muted','当前对话跟随全局；选择本对话档位后独立生效。'));
     var slider=node('input','ku-range');slider.type='range';slider.min=0;slider.max=modes.length-1;slider.step=1;slider.value=index===null?0:index;slider.setAttribute('aria-label','选择模式档位');
-    var preview=node('div','ku-muted',index===null?(scope==='session'&&!sid?'本对话还没选过档位；拖动仅预览，松手后确认应用':'当前未匹配档位；拖动仅预览，松手后确认应用'):'拖动仅预览，松手后确认应用');slider.addEventListener('input',function(){var v=modes[Number(slider.value)];preview.textContent=v.name+' · '+v.main+' · '+(v.subagents||[]).length+' 个挂件'});
+    var preview=node('div','ku-muted',index===null?'当前配置与预设不同，重新选档应用':'拖动预览，松手确认；点击档位可重新同步');
+    slider.addEventListener('input',function(){var v=modes[Number(slider.value)];preview.textContent=v.name+' · '+v.main+' · '+(v.subagents||[]).length+' 种挂件'});
     function apply(i){var target=modes[i];if(!target)return;
-      if(scope==='session'&&!modeSessionId()){status('先打开一个对话再选本对话档位',true);slider.value=index===null?0:index;return}
-      if(confirm((i===index?'重新同步':'切换至')+'「'+target.name+'」？\n主模型 '+target.main+' · '+(target.subagents||[]).length+' 个挂件'+(scope==='session'?'\n（仅当前对话限制挂件）':'\n（全局，影响所有对话）'))){slider.value=i;send('apply',modeRequest(i,scope))}else slider.value=index===null?0:index}
+      if(modeSessionId()!==sid||scope==='session'&&!sid){status('请打开目标对话后刷新面板',true);slider.value=index===null?0:index;return}
+      var tip=(i===index?'重新同步':'切换至')+'「'+target.name+'」？\n主模型 '+target.main+' · '+(target.subagents||[]).length+' 种挂件';
+      tip+=scope==='session'?'\n只修改当前对话。':'\n只影响跟随全局的对话，独立对话保留原设置。';
+      if(scope==='global'&&m.session_independent)tip+='\n当前对话不会改变，需另点“本对话跟随全局”。';
+      if(locked)tip+='\n保持锁定，将锁定档位一起更新。';
+      if(confirm(tip)){slider.value=i;send('apply',modeRequest(i,scope))}else slider.value=index===null?0:index;
+    }
     slider.addEventListener('pointerdown',function(){sliding=true});slider.addEventListener('pointerup',function(){sliding=false});slider.addEventListener('pointercancel',function(){sliding=false});
     slider.addEventListener('change',function(){sliding=false;apply(Number(slider.value))});boxMode.append(slider,preview);
     var ticks=node('div','ku-ticks');modes.forEach(function(v,i){var b=button(v.name,function(){apply(i)});b.setAttribute('aria-pressed',i===index?'true':'false');ticks.append(b)});boxMode.append(ticks);
-    var actions=node('div','ku-actions'),locked=!!m.session_locked&&scope==='session'?true:!!(m.locked&&m.locked.locked&&(!m.locked.scope||m.locked.scope==='global'));
-    var lockButton=button(locked?'解锁':'锁定',function(){if(confirm(locked?'解锁当前档位？':(scope==='session'?'锁住本对话的主模型？其它对话不受影响':'锁定此档并校准所有对话及新会话默认模型？')))send(locked?'unlock':'lock',locked?(scope==='session'?{scope:scope,session_id:sid}:{scope:scope}):modeRequest(index,scope))});
+    var actions=node('div','ku-actions');
+    var lockButton=button(locked?'解锁':'锁定',function(){
+      if(modeSessionId()!==sid){status('对话已切换，请刷新面板',true);return}
+      if(confirm(locked?'只解除当前作用域的锁，不清除独立档位。要跟随全局请使用专用按钮。':(scope==='session'?'锁住本对话的主模型与挂件白名单？':'锁定全局档位？独立对话不受影响。')))send(locked?'unlock':'lock',locked?(scope==='session'?{scope:scope,session_id:sid}:{scope:scope}):modeRequest(index,scope));
+    });
     lockButton.disabled=scope==='session'&&!sid||!locked&&index===null;actions.append(lockButton);
     actions.append(button('编辑档位',function(){openModeEditor()}));
     if(m.has_snapshot)actions.append(button('恢复切档前配置',function(){if(confirm('恢复切档前的模型配置？'))send('restore',{})}));boxMode.append(actions);
-    if(locked)boxMode.append(node('div','ku-warning',scope==='session'?'已锁定本对话：固定当前对话的主模型和可用挂件，其它对话不受影响。':'已锁定：手机不能直接改其他主模型；消息发送前会核对目标会话，校准失败不会发送。切档或解锁请使用本面板。'));
+    if(locked)boxMode.append(node('div','ku-warning','已锁定当前作用域；选另一档会直接更新锁档，无需先手动解锁。'));
     if(scope==='session'){
-      boxMode.append(node('div','ku-muted','本对话档位设置主模型及挂件白名单；宿主模型目录仍是全局配置。'));
-      if(m.current&&m.current.agents_disabled)boxMode.append(node('div','ku-warning','宿主全局禁用了子代理工具，本对话无法单独启用。'));
-      if(selected&&m.session_lock&&m.session_lock.locked&&(selected.subagents||[]).indexOf(m.session_lock.main)!==-1)boxMode.append(node('div','ku-warning','当前档位将主模型也配成挂件；锁定期间禁止用主模型派子代理。请编辑该档挂件或切档。'));
-      if(m.session_unavailable_subagents&&m.session_unavailable_subagents.length)boxMode.append(node('div','ku-warning','当前目录缺少 '+m.session_unavailable_subagents.join('、')+'；这些挂件暂不能派送。'));
+      boxMode.append(node('div','ku-muted','选档自动注册缺少的挂件目录；可派模型仍按本对话白名单限制，不改变其它对话主模型。'));
+      if(m.current&&m.current.agents_disabled)boxMode.append(node('div','ku-warning','宿主全局禁用了子代理工具。'));
+      if(selected&&effectiveLocked&&(selected.subagents||[]).indexOf(selected.main)!==-1)boxMode.append(node('div','ku-warning','当前挂件包含主模型；锁定时禁止派送主模型，请编辑挂件后重新应用。'));
+      if(m.session_unavailable_subagents&&m.session_unavailable_subagents.length)boxMode.append(node('div','ku-warning','目录尚未同步 '+m.session_unavailable_subagents.join('、')+'；重新点当前档位自动修复。'));
     }
   }
   function openModeEditor(){var wrap=clear(q('modeEditor')),m=state.modes;if(!m)return;editing=true;wrap.hidden=false;
@@ -380,13 +400,18 @@ function kimiSheetDrag(overlay){
 }
 function kimiNativeModeLock(root,btn){
   var locked=false,pending=false;
+  function currentSession(){
+    if(window.KimiNav&&typeof window.KimiNav.activeSession==='function'){
+      try{return window.KimiNav.activeSession()||''}catch(e){return ''}
+    }
+    try{return document.querySelector('#app').__vue_app__.config.globalProperties.$pinia._s.get('kimi.sessions').activeSessionId||''}catch(e){return ''}
+  }
   function paint(){var label=locked?'面板 · 已锁':'面板';if(btn.textContent!==label&&btn.textContent!=='位置已复位')btn.textContent=label;
     document.querySelectorAll('.model-pill,.ku-phone-model-locked').forEach(function(el){el.classList.toggle('ku-phone-model-locked',locked)})}
   function poll(){if(document.hidden||pending)return;pending=true;var ctrl=new AbortController(),timeout=setTimeout(function(){ctrl.abort()},4500);
-    var sid='';try{sid=document.querySelector('#app').__vue_app__.config.globalProperties.$pinia._s.get('kimi.sessions').activeSessionId||''}catch(e){}
-    var query=/^session_[A-Za-z0-9_-]{8,100}$/.test(sid)?'?session_id='+encodeURIComponent(sid):'';
+    var sid=currentSession(),query=/^session_[A-Za-z0-9_-]{8,100}$/.test(sid)?'?session_id='+encodeURIComponent(sid):'';
     fetch(root+'/mobile/panel/modes'+query,{credentials:'same-origin',signal:ctrl.signal,cache:'no-store'}).then(function(r){if(!r.ok)throw Error();return r.json()})
-      .then(function(data){locked=data.widgets_enabled!==false&&!!(data.locked&&data.locked.locked||data.session_lock);paint()})
+      .then(function(data){if(sid!==currentSession())return;locked=data.widgets_enabled!==false&&data.session_locked===true;paint()})
       .catch(function(){}).finally(function(){clearTimeout(timeout);pending=false})}
   function block(e){if(!locked||!e.target.closest||!e.target.closest('.model-pill'))return;
     e.preventDefault();e.stopImmediatePropagation();btn.textContent='面板 · 已锁'}

@@ -41,18 +41,11 @@ def main():
             return
         with open(modes_path, encoding='utf-8') as source:
             data = json.load(source)
-        locks = data.get('session_locks') or {}
-        records = data.get('session_modes') or {}
-        chosen = locks.get(sid) or records.get(sid)
+        import mode_policy
+        chosen = mode_policy.effective(data, sid)
         if chosen is None:
             return
-        index = chosen.get('index') if isinstance(chosen, dict) else chosen
-        modes = data.get('modes') or []
-        if type(index) is not int or not 0 <= index < len(modes):
-            return
-        mode = modes[index]
-        wanted = (chosen.get('subagents') if isinstance(chosen, dict) and chosen.get('locked')
-                  else mode.get('subagents')) or []
+        wanted = chosen.get('subagents') or []
         if not isinstance(wanted, list) or any(not isinstance(a, str) or not ALIAS.fullmatch(a) for a in wanted):
             return
         with urllib.request.urlopen('http://127.0.0.1:39281/api/modes', timeout=1.5) as response:
@@ -60,7 +53,7 @@ def main():
         pool = current.get('pool') or []
         if not isinstance(pool, list):
             return
-        locked = isinstance(locks.get(sid), dict) and locks[sid].get('locked') is True
+        locked = chosen.get('locked') is True
         main_model = chosen.get('main') if locked else None
         available = [a for a in wanted if a in pool and not (locked and a == main_model)]
         if not wanted:

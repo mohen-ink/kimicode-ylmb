@@ -167,8 +167,10 @@ import model_manager  # noqa: E402
 import model_catalog  # noqa: E402
 import models_dev  # noqa: E402
 import plugin_settings  # noqa: E402
+import mode_policy
 
 CONFIG_LOCK = threading.RLock()
+MODE_LOCK = threading.RLock()
 CONFIG_CONFLICT = '配置已被其他操作更改，请刷新后重试'
 WIDGETS_DISABLED = '挂件已关闭，请先在面板设置中开启'
 
@@ -180,11 +182,18 @@ def _config_locked(function):
     return locked
 
 
+def _mode_locked(function):
+    def locked(*args, **kwargs):
+        with MODE_LOCK:
+            return function(*args, **kwargs)
+    return locked
+
+
 def widgets_enabled():
     return plugin_settings.widgets_enabled(KIMI_HOME)
 
 
-@_config_locked
+@_mode_locked
 def save_plugin_settings(req):
     if set(req) != {'widgets_enabled'} or type(req['widgets_enabled']) is not bool:
         return {'success': False, 'message': '挂件开关必须是布尔值'}, 400
@@ -216,7 +225,7 @@ def save_plugin_settings(req):
 
 def _widgets_action(function):
     def action(*args, **kwargs):
-        with CONFIG_LOCK:
+        with MODE_LOCK:
             if not widgets_enabled():
                 return False, WIDGETS_DISABLED
             return function(*args, **kwargs)
@@ -1815,43 +1824,50 @@ def _mode_pool_hints(subagents, hints):
     return result
 
 
-def apply_mode_to_text(content, mode, hints, tools_owned):
-    """在完整配置对象上应用模式，返回 (完整 TOML, tools_owned 新值)。"""
+def apply_mode_to_text(content, mode, hints, tools_owned, required=(), session_only=False):
     data = model_manager.parse(content)
-    model_manager._set_default_model_data(data, mode['main'])
+    if not session_only:
+        model_manager._set_default_model_data(data, mode['main'])
     old_sec = data.get('secondary_model', {})
     if isinstance(old_sec, str):
-        old_sec = {}
-    if not isinstance(old_sec, dict):
-        raise model_manager.ConfigError('secondary_model 必须是表或模型别名')
+        old_sec = {'default_model': old_sec}
+    if not isinstance(old_sec, dict) or not isinstance(old_sec.get('models', {}), dict):
+        raise model_manager.ConfigError('secondary_model 及 models 必须是表')
+    if session_only and old_sec.get('force'):
+        raise model_manager.ConfigError('宿主设置了强制挂件模型，请先关闭强制模型；本对话未切换')
     secondary = dict(old_sec)
-    for key in ('default_model', 'force', 'models'):
-        secondary.pop(key, None)
-    subs = mode['subagents']
-    if subs:
-        secondary['default_model'] = subs[0]
-        secondary['models'] = _mode_pool_hints(subs, hints)
-    effort = mode.get('effort') or old_sec.get('default_effort') or ''
-    if effort:
-        secondary['default_effort'] = effort
+    secondary.pop('force', None)
+    subs = mode.get('subagents') or []
+    pool = dict(old_sec.get('models') or {})
+    for alias, hint in _mode_pool_hints(list(dict.fromkeys(list(required) + subs)), hints).items():
+        pool.setdefault(alias, hint)
+    default = subs[0] if subs and not session_only else secondary.get('default_model')
+    if pool and default and default not in pool:
+        if default not in _defined_aliases(data):
+            raise model_manager.ConfigError('当前默认挂件未注册为有效模型；请先修复该模型配置')
+        pool[default] = hints.get(default) or default
+    if pool:
+        secondary['models'] = pool
+        secondary['default_model'] = default or next(iter(pool))
+    if not session_only and mode.get('effort'):
+        secondary['default_effort'] = mode['effort']
     data['secondary_model'] = secondary
-
     tools = data.get('tools', {})
     if not isinstance(tools, dict):
         raise model_manager.ConfigError('tools 必须是表')
     disabled = tools.get('disabled', [])
     if not isinstance(disabled, list) or any(not isinstance(item, str) for item in disabled):
         raise model_manager.ConfigError('tools.disabled 必须是字符串数组')
-    disabled = list(disabled)
-    owned = tools_owned
+    if (subs or required) and any(t in disabled for t in _AGENT_TOOLS) and not tools_owned:
+        raise model_manager.ConfigError('子代理工具被用户全局禁用；请在工具设置启用后再切档')
     if not subs:
         added = [tool for tool in _AGENT_TOOLS if tool not in disabled]
         if added:
-            disabled += added
-            owned = True
+            disabled = disabled + added
+            tools_owned = True
     elif tools_owned:
         disabled = [tool for tool in disabled if tool not in _AGENT_TOOLS]
-        owned = False
+        tools_owned = False
     if disabled:
         tools['disabled'] = disabled
         data['tools'] = tools
@@ -1859,7 +1875,79 @@ def apply_mode_to_text(content, mode, hints, tools_owned):
         del tools['disabled']
         if not tools:
             data.pop('tools', None)
-    return model_manager.dumps(data), owned
+    return model_manager.dumps(data), tools_owned
+
+
+def _sync_mode_catalog(data):
+    if not widgets_enabled():
+        return False, WIDGETS_DISABLED
+    base, token = _server_endpoint(), _server_token()
+    if not base or not token:
+        return False, '后台服务未找到，挂件目录未同步'
+    sec = data.get('secondary_model') or {}
+    if isinstance(sec, str):
+        sec = {'default_model': sec}
+    live = _api_json('GET', base + '/api/v1/config', token)
+    if live is None:
+        return False, '无法读取宿主挂件目录'
+    previous = _api_data(live).get('secondary_model') or {}
+    if not isinstance(previous, dict):
+        return False, '宿主挂件目录格式异常'
+    pool = dict(previous.get('models') or {})
+    pool.update(sec.get('models') or {})
+    payload = dict(previous)
+    payload.pop('force', None)
+    payload['models'] = pool
+    if pool:
+        payload['defaultModel'] = sec.get('default_model') or next(iter(pool))
+    if sec.get('default_effort'):
+        payload['defaultEffort'] = sec['default_effort']
+    body = {'secondary_model': payload}
+    if isinstance(data.get('tools'), dict):
+        body['tools'] = data['tools']
+    current_tools = _api_data(live).get('tools')
+    if (not previous.get('force') and previous.get('models') == pool
+            and previous.get('defaultModel') == payload.get('defaultModel')
+            and previous.get('defaultEffort') == payload.get('defaultEffort')
+            and (not body.get('tools') or current_tools == body['tools'])):
+        return True, '宿主挂件目录已就绪'
+    result = _api_json('POST', base + '/api/v1/config', token, body)
+    verified = _api_json('GET', base + '/api/v1/config', token) if result is not None else None
+    current = _api_data(verified or {}).get('secondary_model') or {}
+    actual = current.get('models') or {}
+    if verified is None or current.get('force') or any(alias not in actual for alias in pool):
+        return False, '宿主挂件目录同步失败，未应用档位，请重试'
+    return True, '挂件目录已同步'
+
+
+def _ensure_session_catalog(mode):
+    if not widgets_enabled():
+        return False, WIDGETS_DISABLED
+    with CONFIG_LOCK:
+        content = get_config_content()
+        old = model_manager.parse(content)
+        d = load_modes(old)
+        required = mode_policy.required_subagents(d, mode)
+        try:
+            new_content, _ = apply_mode_to_text(content, mode, d['pool_hints'],
+                                                bool(d.get('tools_owned')), required, True)
+            new = model_manager.parse(new_content)
+        except model_manager.ConfigError as error:
+            return False, str(error)
+        if not _diff_outside(old, new, ('secondary_model', 'tools')):
+            return False, '挂件注册涉及无关配置，已拒绝'
+        if get_config_content() != content:
+            return False, '配置已被其它操作修改，请重新选择档位'
+    return _sync_mode_catalog(new)
+
+
+def _global_mode_matches(mode, data):
+    sec = data.get('secondary_model') or {}
+    if not isinstance(sec, dict) or data.get('default_model') != mode.get('main') or sec.get('force'):
+        return False
+    subs = mode.get('subagents') or []
+    return (all(alias in (sec.get('models') or {}) for alias in subs)
+            and (not subs or sec.get('default_model') == subs[0]))
 
 
 def _diff_outside(old, new, keys=('default_model', 'secondary_model', 'tools')):
@@ -1897,35 +1985,9 @@ def detect_active_mode(modes, data):
     return None
 
 
-def _session_modes_map(d):
-    m = d.get('session_modes')
-    return m if isinstance(m, dict) else {}
-
-
 def _session_locks_map(d):
     m = d.get('session_locks')
     return m if isinstance(m, dict) else {}
-
-
-def session_mode_index(d, sid):
-    """该对话记住的档位序号；没记过返回 None。"""
-    if not isinstance(sid, str) or not _MODE_SESSION_RE.fullmatch(sid):
-        return None
-    value = _session_modes_map(d).get(sid)
-    if isinstance(value, dict):
-        value = value.get('index')
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def detect_session_mode(modes, model_id):
-    """按该对话当前主模型反查档位序号（daemon 模型 id 可能是 provider/model）。"""
-    if not isinstance(model_id, str) or not model_id:
-        return None
-    for i, m in enumerate(modes):
-        alias = m.get('main') or ''
-        if alias and (model_id == alias or model_id.endswith('/' + alias.split('/')[-1])):
-            return i
-    return None
 
 
 def _mode_models(data):
@@ -1944,7 +2006,8 @@ def _disabled_modes_data(sid):
     data = _load_toml(get_config_content()) or {}
     return {'widgets_enabled': False, 'modes': [], 'locked': {'locked': False},
             'session_id': sid, 'session_lock': None, 'session_locked': False,
-            'models': _mode_models(data)}
+            'session_independent': False, 'session_policy': None, 'global_mode': None,
+            'policy_version': 2, 'models': _mode_models(data)}
 
 
 def get_modes_data(session_id=None):
@@ -1994,24 +2057,21 @@ def _modes_data_locked(sid, live_model):
            'undefined_pool': undefined_pool,
            'models': models, 'subs_max': MODE_SUBS_MAX,
            'min': MODES_MIN, 'max': MODES_MAX}
-    sid = sid
-    global_locked = d.get('locked') if isinstance(d.get('locked'), dict) else {'locked': False}
-    locks = _session_locks_map(d)
-    session_lock = locks.get(sid) if sid else None
+    global_mode = mode_policy.resolve(d, mode_policy.global_record(d))
+    if global_mode and _global_mode_matches(global_mode, data):
+        out['active'] = mode_policy.index_for(d, global_mode)
+    out['global_mode'] = global_mode
+    out['policy_version'] = 2
+    selected = mode_policy.effective(d, sid) if sid else None
     out['session_id'] = sid
-    out['session_active'] = session_mode_index(d, sid) if sid else None
+    out['session_independent'] = bool(sid and mode_policy.independent(d, sid))
+    out['session_policy'] = selected
+    out['session_active'] = mode_policy.index_for(d, selected)
     out['session_model'] = live_model if sid else None
-    out['session_lock'] = session_lock if isinstance(session_lock, dict) else None
-    out['session_locked'] = bool(global_locked.get('locked') or out['session_lock'])
-    if sid and out['session_active'] is None:
-        # 没记录过：按该对话真实模型反查，切回来时滑块才对得上
-        out['session_active'] = detect_session_mode(d['modes'], live_model)
-    selected = out['session_active']
+    out['session_lock'] = _session_locks_map(d).get(sid) if sid else None
+    out['session_locked'] = bool(selected and selected.get('locked'))
     pool = (sec.get('models') or {}) if isinstance(sec.get('models'), dict) else {}
-    out['session_unavailable_subagents'] = (
-        [alias for alias in d['modes'][selected].get('subagents', [])
-         if alias not in pool and alias != d['modes'][selected].get('main')]
-        if sid and isinstance(selected, int) and 0 <= selected < len(d['modes']) else [])
+    out['session_unavailable_subagents'] = [alias for alias in (selected or {}).get('subagents', []) if alias not in pool]
     return out
 
 
@@ -2042,72 +2102,75 @@ def apply_mode(index, session_id=None):
         return False, result
     mode, old = result
     n = len(mode['subagents'])
-    desc = '单干（已禁用 Agent/AgentSwarm）' if not n else '%d 个挂件' % n
+    desc = '单干（跟随全局的对话禁止派挂件）' if not n else '%d 种挂件' % n
     live = _apply_session_live(mode, old, session_id)
     extra = ('；%s' % live) if live else '，会话内 /reload 生效'
     return True, '已切到「%s」：主 %s · %s%s' % (mode['name'], mode['main'], desc, extra)
 
 
 def apply_session_mode(index, session_id):
-    """只改这一个对话的主模型和可派挂件白名单，不改其它对话的配置。"""
     data = _load_toml(get_config_content()) or {}
     d = load_modes(data)
     modes, err = validate_modes(d['modes'], data)
     if err:
         return False, err
-    if isinstance(index, bool) or not isinstance(index, int) or not (0 <= index < len(modes)):
+    if type(index) is not int or not (0 <= index < len(modes)):
         return False, '档位序号无效'
     if not isinstance(session_id, str) or not _MODE_SESSION_RE.fullmatch(session_id):
         return False, '本对话档位需要有效的会话标识（新对话请先发一条消息）'
     mode = modes[index]
-    secondary = data.get('secondary_model') or {}
-    pool = (secondary.get('models') or {}) if isinstance(secondary, dict) else {}
-    missing = [alias for alias in mode['subagents'] if alias not in pool and alias != mode['main']]
-    disabled = ((data.get('tools') or {}).get('disabled') or [])
-    if mode['subagents'] and any(tool in disabled for tool in _AGENT_TOOLS):
-        return False, '宿主全局禁用了子代理工具，本对话无法单独开启；档位未切换'
     base, token = _server_endpoint(), _server_token()
     if not base or not token:
         return False, '后台服务未找到，无法切换本对话模型'
+    ok, msg = _ensure_session_catalog(mode)
+    if not ok:
+        return False, msg
     ok, msg = _session_set_model(base, token, session_id, mode)
     if not ok:
         return False, msg
     with CONFIG_LOCK:
         cur = load_modes()
-        sm = dict(_session_modes_map(cur))
-        sm[session_id] = {'index': index, 'name': mode['name'],
-                          'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        cur['session_modes'] = sm
+        entry = mode_policy.snapshot(mode, index)
+        entry['time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        cur.setdefault('session_modes', {})[session_id] = entry
+        if _session_locks_map(cur).get(session_id):
+            cur['session_locks'][session_id] = dict(entry, locked=True)
         save_modes(cur)
-    n = len(mode['subagents'])
-    desc = '单干（本对话不派挂件）' if not n else ('%d 种挂件白名单，仅限本对话' % n)
-    warning = ('；宿主当前挂件目录缺少 %s，这些挂件暂不可派（没有改其它对话的全局目录）' % '、'.join(missing)) if missing else ''
-    return True, '本对话已切到「%s」：主 %s · %s；其它对话未改动%s' % (mode['name'], mode['main'], desc, warning)
+    desc = '单干（本对话不派挂件）' if not mode['subagents'] else '%d 种挂件白名单' % len(mode['subagents'])
+    return True, '本对话已切到「%s」：%s；目录已同步，其它对话主模型及权限不变' % (mode['name'], desc)
 
 
 def lock_session_mode(index, session_id):
-    """单对话锁：只固定这一个对话的主模型，不写全局配置、不影响其它对话。"""
-    ok, msg = apply_session_mode(index, session_id)
+    return lock_mode(index, session_id, 'session')
+
+
+@_widgets_action
+def follow_global_mode(session_id):
+    if not isinstance(session_id, str) or not _MODE_SESSION_RE.fullmatch(session_id):
+        return False, '需要有效的当前会话标识'
+    data = _load_toml(get_config_content()) or {}
+    d = load_modes(data)
+    mode = mode_policy.resolve(d, mode_policy.global_record(d))
+    if mode is None:
+        index = detect_active_mode(d['modes'], data)
+        mode = d['modes'][index] if index is not None else None
+    if mode is None:
+        return False, '请先选择全局档位，再让本对话跟随'
+    ok, msg = _ensure_session_catalog(mode)
+    if not ok:
+        return False, msg
+    base, token = _server_endpoint(), _server_token()
+    if not base or not token:
+        return False, '后台服务未找到，本对话设置保留'
+    ok, msg = _session_set_model(base, token, session_id, mode)
     if not ok:
         return False, msg
     with CONFIG_LOCK:
         d = load_modes()
-        modes = d.get('modes') or []
-        if not modes:
-            return False, '档位列表为空'
-        if not 0 <= index < len(modes):
-            return False, '档位序号无效'
-        locks = dict(_session_locks_map(d))
-        locks[session_id] = {'locked': True, 'index': index,
-                             'name': modes[index]['name'],
-                             'main': modes[index]['main'],
-                             'subagents': list(modes[index]['subagents']),
-                             'effort': modes[index].get('effort', ''),
-                             'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        d['session_locks'] = locks
+        d.setdefault('session_modes', {}).pop(session_id, None)
+        d.setdefault('session_locks', {}).pop(session_id, None)
         save_modes(d)
-    _start_lock_guard()
-    return True, '%s；已锁定本对话' % msg
+    return True, '本对话已解除独立锁定并跟随全局「%s」；其它独立对话不变' % mode['name']
 
 
 def set_modes_scope(scope):
@@ -2117,10 +2180,10 @@ def set_modes_scope(scope):
         d = load_modes()
         d['scope'] = scope
         save_modes(d)
-    return True, '已切换为%s档位' % ('全局' if scope == 'global' else '本对话独立')
+    return True, '已打开%s设置；本对话独立档位和锁不变，需要同步请点“本对话跟随全局”' % ('全局' if scope == 'global' else '本对话')
 
 
-@_config_locked
+@_widgets_action
 def _apply_mode_config(index):
     content = get_config_content()
     old, err = _strict_toml(content)
@@ -2130,13 +2193,13 @@ def _apply_mode_config(index):
     modes, err = validate_modes(d['modes'], old)
     if err:
         return False, err
-    if not isinstance(index, int) or not (0 <= index < len(modes)):
+    if type(index) is not int or not (0 <= index < len(modes)):
         return False, '档位序号无效'
     mode = modes[index]
     hints = dict(d['pool_hints'])
     secondary = old.get('secondary_model', {})
     if isinstance(secondary, str):
-        secondary = {}
+        secondary = {'default_model': secondary}
     if not isinstance(secondary, dict) or not isinstance(secondary.get('models', {}), dict):
         return False, 'secondary_model 及其 models 必须是表或模型别名'
     for k, v in secondary.get('models', {}).items():
@@ -2147,7 +2210,8 @@ def _apply_mode_config(index):
             mm = (old.get('models') or {}).get(s) or {}
             hints[s] = _effective(mm, 'display_name') or s
     try:
-        new_content, owned = apply_mode_to_text(content, mode, hints, bool(d.get('tools_owned')))
+        new_content, owned = apply_mode_to_text(content, mode, hints, bool(d.get('tools_owned')),
+                                                mode_policy.required_subagents(d, mode))
     except model_manager.ConfigError as error:
         return False, str(error)
     new, err = _strict_toml(new_content)
@@ -2159,14 +2223,25 @@ def _apply_mode_config(index):
         return False, '改写校验失败：default_model 未生效'
     if not d.get('previous_snapshot'):
         d['previous_snapshot'] = _snapshot_config(content)
+    if get_config_content() != content:
+        return False, '配置已被其它操作修改，请重新选择档位'
     ok, msg = safe_apply_config(new_content, base_content=content)
     if not ok:
         return False, msg
-    d['pool_hints'] = hints
-    d['tools_owned'] = owned
-    d['last_applied'] = {'index': index, 'name': mode['name'],
-                         'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-    save_modes(d)
+    ok, msg = _sync_mode_catalog(new)
+    if not ok:
+        log('mode-apply: 目录同步未完成：%s' % msg)
+    with CONFIG_LOCK:
+        persisted = model_manager.parse(get_config_content())
+        if not _global_mode_matches(mode, persisted):
+            return False, '全局档位未能完整同步，请重试'
+        if not _diff_outside(old, persisted):
+            return False, '同步期间配置发生并发变更，请重新选择档位'
+        d['pool_hints'] = hints
+        d['tools_owned'] = owned
+        d['last_applied'] = mode_policy.snapshot(mode, index)
+        d['last_applied']['time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        save_modes(d)
     return True, (mode, old)
 
 
@@ -2284,50 +2359,23 @@ def _live_session_targets(base, token, session_id=None):
 
 
 def _apply_session_live(mode, old_data, session_id=None):
-    """将档位下发到原生配置及所有运行中的会话；指定会话可显式唤醒。"""
-    base = _server_endpoint()
-    token = _server_token()
+    base, token = _server_endpoint(), _server_token()
     if not base or not token:
-        return '后台服务未找到，配置已落盘（/reload 生效）'
+        return '后台服务未找到，会话模型尚未同步'
     notes = []
-    want_sec = mode['subagents']
-    expected_hints = _mode_pool_hints(want_sec, load_modes().get('pool_hints'))
-    cur = _api_data(_api_json('GET', base + '/api/v1/config', token) or {})
-    sec = cur.get('secondary_model')
-    if isinstance(sec, dict):
-        sub = {'models': expected_hints}
-        if want_sec:
-            sub['defaultModel'] = want_sec[0]
-            if mode.get('effort'):
-                sub['defaultEffort'] = mode['effort']
-        r = _api_json('POST', base + '/api/v1/config', token,
-                      {'default_model': mode['main'], 'secondary_model': sub})
-        if r is None:
-            notes.append('运行时配置未能即时下发（/reload 后生效）')
-        else:
-            current = _api_data(_api_json('GET', base + '/api/v1/config', token) or {})
-            ok = current.get('secondary_model') or {}
-            live = ok.get('models') or {}
-            if not isinstance(live, dict):
-                live = {}
-            miss = [s for s in want_sec if live.get(s) != expected_hints[s]]
-            extra = [k for k in live if k not in want_sec]
-            if not miss and not extra and (not want_sec or ok.get('defaultModel') == want_sec[0]):
-                notes.append('子代理池已即时更新')
-            else:
-                notes.append('子代理池校验偏差（/reload 修正）')
-    else:
-        notes.append('config 接口异常，子代理池 /reload 后生效')
-
-    targets = _live_session_targets(base, token, session_id)
-    if targets:
-        results = [_session_set_model(base, token, item['id'], mode) for item in targets]
-        good = sum(1 for ok, _ in results if ok)
-        notes.append('已同步 %d/%d 个会话模型' % (good, len(targets)))
-        if good != len(targets):
-            notes.append('部分会话未即时切换，请在该会话重新选择档位')
-    else:
-        notes.append('无运行中的会话，新会话将按当前档位启动')
+    result = _api_json('POST', base + '/api/v1/config', token, {'default_model': mode['main']})
+    if result is None:
+        notes.append('运行时默认模型未即时下发（/reload 后生效）')
+    d = load_modes()
+    targets = [item for item in _live_session_targets(base, token, session_id)
+               if not mode_policy.independent(d, item['id'])]
+    results = [_session_set_model(base, token, item['id'], mode) for item in targets]
+    good = sum(1 for ok, _ in results if ok)
+    notes.append('已同步 %d/%d 个跟随全局的会话；独立会话保留原档位' % (good, len(targets)))
+    if good != len(targets):
+        notes.append('部分会话未即时切换，请在该会话重新选择档位')
+    if session_id and mode_policy.independent(d, session_id):
+        notes.append('当前对话仍使用独立档位；需要同步请点“本对话跟随全局”')
     return '；'.join(notes)
 
 
@@ -2381,66 +2429,60 @@ def _locked_main_id(base, token, main_alias):
 
 
 def _lock_guard(gen):
-    """校准锁档全局配置与所有运行中会话；不唤醒休眠会话。
-    全局锁只纠偏全局配置外的运行会话；单对话锁只守各自对话。"""
     retry_at = 0.0
-    while not _LOCK_STOP.is_set() and _LOCK_GEN[0] == gen:
-        time.sleep(1.5)
-        if _LOCK_STOP.is_set() or _LOCK_GEN[0] != gen or not widgets_enabled():
-            break
+    while not _LOCK_STOP.wait(1.5) and _LOCK_GEN[0] == gen:
         try:
-            d = load_modes()
-            modes = d.get('modes') or []
-            session_locks = _session_locks_map(d)
-            for sid, entry in list(session_locks.items()):
+            with MODE_LOCK:
                 if _LOCK_STOP.is_set() or _LOCK_GEN[0] != gen or not widgets_enabled():
                     break
-                if not (isinstance(entry, dict) and entry.get('locked')):
-                    continue
-                li = entry.get('index', -1)
-                if (not isinstance(sid, str) or not _MODE_SESSION_RE.fullmatch(sid)
-                        or not isinstance(li, int) or not 0 <= li < len(modes)):
-                    continue
-                base, token = _server_endpoint(), _server_token()
-                if not base or not token:
-                    continue
-                ok, _ = _session_set_model(base, token, sid, modes[li])
-                if not ok:
-                    log('mode-lock: session %s 未对齐锁档模型' % sid)
-            locked = d.get('locked')
-            if not (isinstance(locked, dict) and locked.get('locked')):
-                if any(isinstance(v, dict) and v.get('locked') for v in session_locks.values()):
-                    continue          # 还有单对话锁要守
-                break
-            li = locked.get('index', -1)
-            if not isinstance(li, int) or not 0 <= li < len(modes):
-                continue
-            mode = modes[li]
-            config = _load_toml(get_config_content()) or {}
-            if detect_active_mode(modes, config) != li:
-                if time.monotonic() >= retry_at:
+                d = load_modes()
+                mode = mode_policy.resolve(d, d.get('locked'))
+                global_locked = bool(mode and mode.get('locked'))
+                if not global_locked and not any(v.get('locked') for v in _session_locks_map(d).values() if isinstance(v, dict)):
+                    break
+                policies = {}
+                for sid in set(d.get('session_locks') or {}) | set(d.get('session_modes') or {}):
+                    policy = mode_policy.effective(d, sid)
+                    if policy and policy.get('locked'):
+                        policies[sid] = policy
+                config = _load_toml(get_config_content()) or {}
+                drift = global_locked and not _global_mode_matches(mode, config) and time.monotonic() >= retry_at
+                if drift:
                     retry_at = time.monotonic() + 10
-                    ok, msg = apply_mode(li)
+                    hints = dict(d['pool_hints'])
+                    owned = bool(d.get('tools_owned'))
+                    required = mode_policy.required_subagents(d)
+            # 网络与目录同步放在模式锁外，避免守护线程长时间阻塞面板操作
+            base, token, targets = _lock_daemon_target()
+            if not base or not token:
+                continue
+            if drift:
+                content = get_config_content()
+                try:
+                    text, _ = apply_mode_to_text(content, mode, hints, owned, required)
+                except model_manager.ConfigError as error:
+                    log('mode-lock: config drift correction failed: %s' % error)
+                else:
+                    ok, msg = safe_apply_config(text, base_content=content)
                     if not ok:
                         log('mode-lock: config drift correction failed: %s' % msg)
-                continue
-            base, token, targets = _lock_daemon_target()
-            if not base or not targets:
-                continue
-            want_id = _locked_main_id(base, token, mode['main'])
-            if not want_id:
-                continue
+                    else:
+                        ok, msg = _sync_mode_catalog(model_manager.parse(text))
+                        if ok:
+                            _api_json('POST', base + '/api/v1/config', token, {'default_model': mode['main']})
+                        else:
+                            log('mode-lock: catalog sync failed: %s' % msg)
             for item in targets:
                 if _LOCK_STOP.is_set() or _LOCK_GEN[0] != gen or not widgets_enabled():
                     break
-                sid, cur = item['id'], item['model']
-                if cur == want_id:
+                policy = policies.get(item['id'])
+                if policy is None:
                     continue
-                ok, _ = _session_set_model(base, token, sid, mode)
-                if ok:
-                    log('mode-lock: session %s model %s -> %s' % (sid, cur, mode['main']))
+                want_id = _locked_main_id(base, token, policy['main'])
+                if want_id and item['model'] != want_id:
+                    _session_set_model(base, token, item['id'], policy)
         except Exception:
-            pass
+            log('mode-lock: 本轮校准未完成，将稍后重试')
 
 
 @_config_locked
@@ -3450,7 +3492,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({'success': ok, 'message': msg}, 200 if ok else 400)
 
             if path == '/api/modes/save':
-                with CONFIG_LOCK:
+                with MODE_LOCK, CONFIG_LOCK:
                     if not widgets_enabled():
                         return self._json({'success': False, 'message': WIDGETS_DISABLED}, 409)
                     data = _load_toml(get_config_content()) or {}
@@ -3458,21 +3500,31 @@ class Handler(BaseHTTPRequestHandler):
                     if err:
                         return self._json({'success': False, 'message': err}, 400)
                     d = load_modes(data)
+                    mode_policy.pin_records(d)
                     d['modes'] = modes
                     save_modes(d)
-                return self._json({'success': True, 'message': '已保存 %d 个档位' % len(modes),
+                return self._json({'success': True, 'message': '已保存 %d 个预设；已应用的对话档位不变，请重新选档应用修改' % len(modes),
                                    'data': get_modes_data()})
 
             if path == '/api/modes/reset':
-                with CONFIG_LOCK:
+                with MODE_LOCK, CONFIG_LOCK:
                     if not widgets_enabled():
                         return self._json({'success': False, 'message': WIDGETS_DISABLED}, 409)
                     data = _load_toml(get_config_content()) or {}
                     d = load_modes(data)
+                    mode_policy.pin_records(d)
                     d['modes'] = json.loads(json.dumps(DEFAULT_MODES))
                     save_modes(d)
-                return self._json({'success': True, 'message': '档位已恢复为内置预设',
+                return self._json({'success': True, 'message': '档位预设已恢复；已应用的对话档位保留',
                                    'data': get_modes_data()})
+
+            if path == '/api/modes/follow-global':
+                sid = req.get('session_id')
+                if not isinstance(sid, str) or not _MODE_SESSION_RE.fullmatch(sid):
+                    return self._json({'success': False, 'message': 'session_id 不合法'}, 400)
+                ok, msg = follow_global_mode(sid)
+                return self._json({'success': ok, 'message': msg, 'data': get_modes_data(sid)},
+                                  200 if ok else 400)
 
             if path == '/api/modes/apply':
                 idx, sid = req.get('index'), req.get('session_id')
@@ -3878,7 +3930,7 @@ def run_server():
                 _start_lock_guard()
                 log('mode-lock guard restored')
     except Exception:
-        pass
+        log('mode-lock guard restore failed')
 
     httpd = None
     try:
