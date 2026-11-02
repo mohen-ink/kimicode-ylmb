@@ -166,12 +166,15 @@ _MOBILE_RESTORE_LOCK = threading.RLock()
 import model_manager  # noqa: E402
 import model_catalog  # noqa: E402
 import models_dev  # noqa: E402
+import mcp_store  # noqa: E402
+import skill_store  # noqa: E402
 import plugin_settings  # noqa: E402
 import mode_policy
 
 CONFIG_LOCK = threading.RLock()
 MODE_LOCK = threading.RLock()
 CONFIG_CONFLICT = '配置已被其他操作更改，请刷新后重试'
+MCP_CONFLICT = 'mcp.json 已被其他操作更改，请刷新后重试'
 WIDGETS_DISABLED = '挂件已关闭，请先在面板设置中开启'
 
 
@@ -303,7 +306,10 @@ def save_model_manager(path, req):
     try:
         is_batch = path == '/api/model-manager/batch'
         is_provider = path == '/api/model-manager/provider'
-        if is_batch:
+        is_provider_delete = path == '/api/model-manager/provider/delete'
+        if is_provider_delete:
+            allowed = required = {'version', 'name'}
+        elif is_batch:
             allowed = required = {'version', 'provider', 'upserts', 'removes'}
         else:
             item_key = 'provider' if is_provider else 'model'
@@ -317,7 +323,9 @@ def save_model_manager(path, req):
         if req['version'] != model_manager.version(base):
             return {'success': False, 'code': 'CONFIG_CONFLICT', 'message': CONFIG_CONFLICT}, 409
         modes_version = None
-        if is_batch:
+        if is_provider_delete:
+            new = model_manager.delete_provider(base, req['name'])
+        elif is_batch:
             if not isinstance(req['removes'], list):
                 raise model_manager.ConfigError('removes 必须是数组')
             references = None
@@ -349,6 +357,177 @@ def log(msg):
             f.write('[%s] %s\n' % (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), msg))
     except Exception:
         pass
+
+
+# ---------------- MCP 管理 ----------------
+MCP_LOCK = threading.RLock()
+PLUGIN_SKILLS_DIR = os.path.join(PLUGIN_ROOT, 'skills')
+
+
+def _mcp_locked(function):
+    def locked(*args, **kwargs):
+        with MCP_LOCK:
+            return function(*args, **kwargs)
+    return locked
+
+
+def _current_workspace_root():
+    """取最近打开的 workspace 根目录，用于项目级 skill 扫描；拿不到就返回 None。"""
+    try:
+        with open(os.path.join(KIMI_HOME, 'workspaces.json'), encoding='utf-8') as source:
+            data = json.load(source)
+        items = (data or {}).get('workspaces') or {}
+        best, best_at = None, ''
+        for entry in items.values():
+            if not isinstance(entry, dict):
+                continue
+            root = entry.get('root')
+            if not isinstance(root, str) or not root:
+                continue
+            opened = str(entry.get('last_opened_at') or '')
+            if best is None or opened > best_at:
+                best, best_at = root, opened
+        return best
+    except Exception:
+        return None
+
+
+@_mcp_locked
+def get_mcp_data():
+    try:
+        return mcp_store.snapshot(mcp_store.read_content(KIMI_HOME))
+    except mcp_store.StoreError as error:
+        result = mcp_store.snapshot('')
+        result.update(editable=False, message=str(error))
+        return result
+    except Exception:
+        result = mcp_store.snapshot('')
+        result.update(editable=False, message='无法读取 mcp.json，拒绝改写')
+        return result
+
+
+@_mcp_locked
+def save_mcp(action, req):
+    """MCP 写入：upsert / delete / toggle。全部重读基线并做版本比对后再原子替换。"""
+    try:
+        if not isinstance(req, dict) or req.get('version') is None:
+            raise mcp_store.StoreError('请求参数不被允许或缺少必填字段')
+        mcp_store._text(req['version'], 'version', 128)
+        if action == 'upsert':
+            if set(req) != {'version', 'original_name', 'server'}:
+                raise mcp_store.StoreError('请求参数不被允许或缺少必填字段')
+            original = req['original_name']
+            if original is not None:
+                mcp_store._text(original, 'original_name', 64)
+            server = req['server']
+            if not isinstance(server, dict) or 'name' not in server:
+                raise mcp_store.StoreError('缺少服务器名称')
+        elif action == 'delete':
+            if set(req) != {'version', 'name'}:
+                raise mcp_store.StoreError('请求参数不被允许或缺少必填字段')
+        elif action == 'toggle':
+            if set(req) != {'version', 'name', 'enabled'}:
+                raise mcp_store.StoreError('请求参数不被允许或缺少必填字段')
+            if type(req['enabled']) is not bool:
+                raise mcp_store.StoreError('enabled 必须是布尔值')
+        else:
+            raise mcp_store.StoreError('接口不存在')
+        base = mcp_store.read_content(KIMI_HOME)
+        if req['version'] != mcp_store.version(base):
+            return {'success': False, 'code': 'CONFIG_CONFLICT',
+                    'message': MCP_CONFLICT}, 409
+        if action == 'upsert':
+            new = mcp_store.upsert_server(base, req.get('original_name'), server)
+        elif action == 'delete':
+            new = mcp_store.delete_server(base, req['name'])
+        else:
+            new = mcp_store.set_enabled(base, req['name'], req['enabled'])
+        target = mcp_store.config_path(KIMI_HOME)
+        mcp_store.apply(new, base, target)
+        return {'success': True, 'message': '已保存，新会话或重连后生效',
+                'version': mcp_store.version(mcp_store.read_content(path=target))}, 200
+    except mcp_store.StoreError as error:
+        message = str(error)
+        if message == MCP_CONFLICT:
+            return {'success': False, 'code': 'CONFIG_CONFLICT', 'message': message}, 409
+        return {'success': False, 'message': message}, 400
+    except Exception:
+        return {'success': False, 'message': 'MCP 配置操作失败，文件未改动'}, 500
+
+
+def get_skills_data():
+    workspace = _current_workspace_root()
+    result = skill_store.scan(KIMI_HOME, workspace, PLUGIN_SKILLS_DIR)
+    home = os.path.expanduser('~')
+    prefixes = [(PLUGIN_ROOT, '插件目录')]
+    if workspace:
+        prefixes.append((workspace, '当前项目'))
+    rows = [skill_store.public(item, home, prefixes) for item in result['skills']]
+    result['skills'] = rows
+    for root in result['roots']:
+        root['path'] = skill_store.public({'path': root['path']}, home, prefixes)['path']
+    result['workspace'] = skill_store.public({'path': workspace or ''}, home, prefixes)['path']
+    return result
+
+
+def get_skill_body(key):
+    return skill_store.read_body(key, KIMI_HOME, _current_workspace_root(), PLUGIN_SKILLS_DIR)
+
+
+SKILL_LOCK = threading.RLock()
+
+
+def save_skill(req):
+    """新增或编辑 skill。只写用户级目录，插件与项目级只读。"""
+    try:
+        if not isinstance(req, dict):
+            raise skill_store.SkillPathError('请求参数不被允许')
+        allowed = {'key', 'name', 'description', 'body', 'disabled'}
+        if set(req) - allowed or not {'name', 'description', 'body', 'disabled'} <= set(req):
+            raise skill_store.SkillPathError('请求参数不被允许或缺少必填字段')
+        key = req.get('key') or ''
+        if not isinstance(key, str) or (key and not re.fullmatch(r'[0-9a-f]{16}', key)):
+            raise skill_store.SkillPathError('无效的 skill 标识')
+        with SKILL_LOCK:
+            result = skill_store.save(key, req['name'], req['description'], req['body'],
+                                      req['disabled'], KIMI_HOME,
+                                      _current_workspace_root(), PLUGIN_SKILLS_DIR)
+        return {'success': True, 'message': result['message']}, 200
+    except skill_store.SkillPathError as error:
+        return {'success': False, 'message': str(error)}, 400
+    except Exception:
+        return {'success': False, 'message': 'skill 写入失败，文件未改动'}, 500
+
+
+def delete_skill(req):
+    try:
+        if not isinstance(req, dict) or set(req) != {'key'}:
+            raise skill_store.SkillPathError('请求参数不被允许或缺少必填字段')
+        with SKILL_LOCK:
+            result = skill_store.delete(req['key'], KIMI_HOME,
+                                        _current_workspace_root(), PLUGIN_SKILLS_DIR)
+        return {'success': True, 'message': result['message']}, 200
+    except skill_store.SkillPathError as error:
+        return {'success': False, 'message': str(error)}, 400
+    except Exception:
+        return {'success': False, 'message': '删除失败，文件未改动'}, 500
+
+
+def toggle_skill(req):
+    try:
+        if not isinstance(req, dict) or set(req) != {'key', 'disabled'}:
+            raise skill_store.SkillPathError('请求参数不被允许或缺少必填字段')
+        if type(req['disabled']) is not bool:
+            raise skill_store.SkillPathError('禁用状态必须是布尔值')
+        with SKILL_LOCK:
+            result = skill_store.set_disabled(req['key'], req['disabled'], KIMI_HOME,
+                                              _current_workspace_root(), PLUGIN_SKILLS_DIR)
+        return {'success': True, 'message': result['message'],
+                'disabled': result['disabled']}, 200
+    except skill_store.SkillPathError as error:
+        return {'success': False, 'message': str(error)}, 400
+    except Exception:
+        return {'success': False, 'message': '操作失败，文件未改动'}, 500
 
 
 # ---------------- desktop-dist 定位 ----------------
@@ -3260,7 +3439,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         origin = getattr(self, '_torigin', '')
         self._cors(origin if origin and self._origin_ok(origin) else '')
-        if self.path.split('?')[0].startswith('/api/model-manager'):
+        if self.path.split('?')[0].startswith(('/api/model-manager', '/api/mcp', '/api/skill')):
             self.send_header('Cache-Control', 'no-store')
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
@@ -3294,6 +3473,23 @@ class Handler(BaseHTTPRequestHandler):
             if (self.headers.get(_CONTROL_HEADER) or '').strip() != '1':
                 return self._deny()
             return self._json(get_model_manager_data())
+        if path == '/api/mcp':
+            if (self.headers.get(_CONTROL_HEADER) or '').strip() != '1':
+                return self._deny()
+            return self._json(get_mcp_data())
+        if path == '/api/skills':
+            if (self.headers.get(_CONTROL_HEADER) or '').strip() != '1':
+                return self._deny()
+            return self._json(get_skills_data())
+        if path == '/api/skill':
+            if (self.headers.get(_CONTROL_HEADER) or '').strip() != '1':
+                return self._deny()
+            qs = parse_qs(urlsplit(self.path).query)
+            target = (qs.get('key') or [''])[0]
+            try:
+                return self._json(get_skill_body(target))
+            except skill_store.SkillPathError as error:
+                return self._json({'error': str(error)}, 400)
         if path in ('/api/status', '/api/health'):
             self._json({'status': 'ok', 'name': 'kimi-code-usage', 'port': PORT,
                         'pid': os.getpid(), 'version': PLUGIN_VERSION,
@@ -3389,7 +3585,23 @@ class Handler(BaseHTTPRequestHandler):
                 payload, status = get_model_manager_catalog(req)
                 return self._json(payload, status)
 
-            if path in ('/api/model-manager/provider', '/api/model-manager/model', '/api/model-manager/batch'):
+            if path.startswith('/api/mcp/'):
+                action = path[len('/api/mcp/'):]
+                if action not in ('upsert', 'delete', 'toggle'):
+                    return self._json({'success': False, 'message': '接口不存在'}, 404)
+                payload, status = save_mcp(action, req)
+                return self._json(payload, status)
+
+            if path.startswith('/api/skills/'):
+                action = path[len('/api/skills/'):]
+                handler = {'save': save_skill, 'delete': delete_skill, 'toggle': toggle_skill}.get(action)
+                if handler is None:
+                    return self._json({'success': False, 'message': '接口不存在'}, 404)
+                payload, status = handler(req)
+                return self._json(payload, status)
+
+            if path in ('/api/model-manager/provider', '/api/model-manager/provider/delete',
+                        '/api/model-manager/model', '/api/model-manager/batch'):
                 payload, status = save_model_manager(path, req)
                 return self._json(payload, status)
 

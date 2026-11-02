@@ -523,6 +523,40 @@ def upsert_provider(content, original_name, item):
     return dumps(data)
 
 
+def provider_deletion_reasons(data):
+    providers, models = data.get('providers', {}), data.get('models', {})
+    if not isinstance(providers, dict) or not isinstance(models, dict):
+        raise ConfigError('providers/models 必须是表')
+    counts = {}
+    for model in models.values():
+        if not isinstance(model, dict):
+            raise ConfigError('模型必须是表')
+        name = _string(model.get('provider', ''), 'provider')
+        counts[name] = counts.get(name, 0) + 1
+    protected = {}
+    for name, provider in providers.items():
+        if not isinstance(provider, dict):
+            raise ConfigError('供应商必须是表')
+        if managed_provider(name, provider):
+            protected[name] = '托管/OAuth 供应商由官方管理，不允许删除'
+        elif counts.get(name):
+            protected[name] = '仍有 %d 个模型引用此供应商，请先删除或迁移这些模型' % counts[name]
+    return protected
+
+
+def delete_provider(content, name):
+    _string(name, 'name', True)
+    data = parse(content)
+    providers = _table(data, ('providers',))
+    if name not in providers or not isinstance(providers[name], dict):
+        raise ConfigError('供应商不存在')
+    reason = provider_deletion_reasons(data).get(name)
+    if reason:
+        raise ConfigError('供应商不可删除：' + reason)
+    del providers[name]
+    return dumps(data)
+
+
 def _set_default_model_data(data, alias):
     if not isinstance(alias, str) or alias not in data.get('models', {}):
         raise ConfigError('模型不存在')
@@ -547,6 +581,7 @@ def snapshot(content, references=None):
             raise ConfigError('providers/models 必须是表')
         result['default_model'] = _string(data.get('default_model', ''), 'default_model')
         protected = deletion_reasons(data, references)
+        protected_providers = provider_deletion_reasons(data)
         for name, provider in providers.items():
             if not isinstance(provider, dict):
                 raise ConfigError('供应商必须是表')
@@ -555,7 +590,9 @@ def snapshot(content, references=None):
             result['providers'].append({'name': name, 'type': provider.get('type', ''),
                                         'base_url': provider.get('base_url', ''),
                                         'has_api_key': bool(provider.get('api_key') or provider.get('api_key_env')),
-                                        'managed': managed_provider(name, provider)})
+                                        'managed': managed_provider(name, provider),
+                                        'delete_protected': name in protected_providers,
+                                        'delete_reason': protected_providers.get(name, '')})
         for alias, model in models.items():
             if not isinstance(model, dict):
                 raise ConfigError('模型必须是表')
