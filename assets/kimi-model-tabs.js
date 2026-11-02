@@ -352,7 +352,7 @@
     'padding:var(--menu-pad,3.5px);background:var(--color-menu-bg,rgba(41,41,41,.95));',
     '-webkit-backdrop-filter:var(--p-menu-backdrop,blur(20px));backdrop-filter:var(--p-menu-backdrop,blur(20px));',
     'border:var(--p-hairline,1px) solid var(--color-line,rgba(255,255,255,.1));border-radius:var(--radius-lg,12px);',
-    'box-shadow:var(--shadow-menu,0 6px 18px rgba(0,0,0,.2));overflow:hidden;',
+    'box-shadow:var(--shadow-menu,0 6px 18px rgba(0,0,0,.2));overflow:hidden;overscroll-behavior:contain;',
     'font-family:var(--font-ui,system-ui);color:var(--color-text,#eee);user-select:none}',
     '.kmt-panel.kmt-open{display:flex}',
     /* 供应商标签条：官方 ModelPicker chip-strip/chip 样式（data-v-565a5940，高度 28→24 同 seg-sm） */
@@ -364,7 +364,7 @@
     '.kmt-tab.kmt-active{background:var(--color-selected,rgba(255,255,255,.13));color:var(--color-text,#fff);font-weight:var(--weight-medium,500)}',
     '.kmt-tab:focus-visible{outline:none;box-shadow:var(--p-focus-ring,0 0 0 2px rgba(23,131,255,.5))}',
     /* 模型列表：ui-menu-item 原样（padding 5px 9px + is-active=hover 底色） */
-    '.kmt-list{flex:1;overflow-y:auto;min-height:0}',
+    '.kmt-list{flex:1;overflow-y:auto;min-height:0;overscroll-behavior:contain}',
     '.kmt-row{display:flex;align-items:center;gap:var(--menu-row-gap-icon,7px);width:100%;',
     'padding:var(--menu-item-padding-block,5px) var(--menu-item-padding-inline,9px);border:none;border-radius:var(--radius-menu-item,calc(var(--radius-lg,12px) - var(--menu-pad,3.5px)));',
     'background:transparent;color:var(--color-text,#eee);font-family:var(--font-ui,system-ui);font-size:var(--text-sm,13px);',
@@ -563,8 +563,8 @@
     // 绝不重新测量/重算位置。定位只在 openPanel 里做一次。
   }
 
-  // 官方行为对齐：位置 = 打开时对 pill 的快照（底边贴 pill 顶边、右对齐 pill
-  // 右缘），此后换档/重建都不动；页面滚动则直接关闭（官方 y(): scroll → R()）。
+  // 位置 = 打开时对 pill 的快照（底边贴 pill 顶边、右对齐 pill 右缘），
+  // 此后换档/重建都不动；只有 pill 真的发生垂直漂移才关闭。
   function openPanel(rt, anchor) {
     var panel = ensurePanel();
     panel.__state.tab = null;   // 每次打开重置到当前模型的供应商
@@ -572,12 +572,15 @@
     panel.classList.add('kmt-open');
     var r = anchor.getBoundingClientRect();
     panel.__anchor = { top: r.top, right: r.right, innerH: window.innerHeight, innerW: window.innerWidth };
+    panel.__pill = anchor;      // 漂移校验用
     panel.style.top = 'auto';
     panel.style.bottom = Math.max(8, window.innerHeight - r.top + 6) + 'px';
     panel.style.left = Math.max(8, r.right - panel.offsetWidth) + 'px';
   }
 
-  // 外点 / 失焦 / 缩放关闭；页面滚动关闭（对齐官方 y(): scroll → R()）
+  // 外点 / 失焦 / 缩放关闭。滚动只在 pill 真的垂直漂移时才关闭：
+  // scroll 不冒泡但捕获阶段会从 window 下传，面板自己的 .kmt-list 滚动也会被收到，
+  // 因此先排除面板内部滚动，再校验 pill 位置。
   document.addEventListener('mousedown', function (e) {
     if (!panelOpen()) return;
     if (e.target.closest && e.target.closest('.kmt-panel')) return;
@@ -585,7 +588,13 @@
   }, true);
   window.addEventListener('blur', closePanel);
   window.addEventListener('resize', closePanel);
-  window.addEventListener('scroll', closePanel, true);
+  window.addEventListener('scroll', function (e) {
+    if (!panelOpen()) return;
+    var panel = document.getElementById('kmt-panel');
+    if (panel && e.target && e.target !== panel && panel.contains(e.target)) return;
+    if (!panel || !panel.__pill) return;
+    if (Math.abs(panel.__pill.getBoundingClientRect().top - panel.__anchor.top) > 1) closePanel();
+  }, true);
 
   /* ------------------------------------------------------------------ */
   /* 入口劫持                                                            */
