@@ -25,7 +25,7 @@ description: 新增和编辑模型与供应商，管理能力、强度档位与�
 
 所有配置写入先解析整份 TOML、在内存应用修改，再全量序列化并原子替换，不追加配置段，不生成 `config.toml` 自动备份，不依赖 Kimi CLI 或外部配置校验。保留未编辑字段的值及嵌套配置，不保留注释和原始排版。结构编辑需要 `tomllib`（Python ≥3.11）或环境已有的 `toml`；解析或序列化无法保留语义时拒绝保存。新接口必须携带读取时的 `version`，冲突返回 HTTP 409，需重新载入并重新编辑，不能强制覆盖。保存后用户在会话内输入 `/reload` 加载；设默认不等于立即切换当前会话。
 
-供应商卡片「⋯ → 删除供应商」确认后立即保存；托管/OAuth 供应商及仍有模型引用的供应商禁止删除，菜单展示原因，需先删除或迁移关联模型。POST `/api/model-manager/provider/delete` `{version,name}` 删除供应商及其本地连接、认证配置，不清除系统环境变量。GET `/api/model-manager` 的供应商条目包含 `delete_protected/delete_reason`。
+供应商卡片「⋯ → 删除供应商」确认后立即保存，会连同该供应商下全部模型一起删除，菜单注明将删除的模型数量。删除不受引用限制；默认模型、子代理模型池、模式档位/锁定/恢复快照中指向已删模型的引用会自动清理。POST `/api/model-manager/provider/delete` `{version,name}` 级联删除供应商、其模型及本地连接与认证配置，不清除系统环境变量。GET `/api/model-manager` 的供应商条目仍包含 `delete_protected/delete_reason` 字段，但恒为 `false`/空串，删除不再被阻止。
 
 本版不提供供应商重命名、供应商复制、原始 TOML 编辑或备份恢复界面。
 

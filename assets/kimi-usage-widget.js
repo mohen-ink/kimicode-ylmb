@@ -3167,7 +3167,7 @@
         + '<p>模型与供应商配置保存后，在会话中执行 <code>/reload</code> 加载；MCP 配置在新会话或重连后加载。设为默认不会切换当前对话。</p>'
         + '<h3>模型能力与价格</h3><p>能力、上下文和思考档位是本地配置声明，不代表上游实际支持。新模型默认开启三项能力、1M 上下文和五档思考，默认 high；请按供应商说明调整。</p>'
         + '<p>价格仅用于用量估算，不影响供应商实际收费。公开目录价格可能与转售渠道价格不同，应用前请检查匹配结果。</p>'
-        + '<h3>配置与安全</h3><p>已有密钥不回显；不更换或移除就会保留。托管供应商只读，部分模型被默认设置或模式引用时不能删除。供应商卡片「⋯」可删除无模型引用的非托管供应商，需先删除或迁移关联模型。</p>'
+        + '<h3>配置与安全</h3><p>已有密钥不回显；不更换或移除就会保留。托管供应商只读，部分模型被默认设置或模式引用时不能单独删除。供应商卡片「⋯」可删除任意供应商，会连同其下全部模型一起删除，并自动清理默认模型、子代理模型池与模式档位中的相关引用。</p>'
         + '<p>保存会保留未编辑字段的值，但重写配置排版与注释，不生成备份。外部修改导致冲突时不会强行覆盖。</p>'
         + '<p>技能的「自动调用」关闭后，仍可通过技能命令手动调用。仅用户级技能可编辑。删除技能会移除其整个目录。</p>';
       kmmRenderManagerUI(); kmmFocusDetail();
@@ -3803,13 +3803,6 @@
     } catch (e) { b.error = '未能确认添加结果。选择仍保留，请载入最新配置后核对。'; }
     finally { b.saving = false; kmmRenderManagerUI(); }
   }
-  function kmmProviderDeleteReason(p) {
-    if (!p) return '供应商不存在，请刷新后重试。';
-    if (p.managed) return '托管/OAuth 供应商由官方管理，不能删除。';
-    if (p.delete_protected) return p.delete_reason || '此供应商不能删除，请刷新后重试。';
-    var count = kmmManagerData.models.filter(function(m) { return m.provider === p.name; }).length;
-    return count ? '仍有 ' + count + ' 个模型引用此供应商，请先删除或迁移这些模型。' : '';
-  }
   async function kmmDeleteProvider(name) {
     if (kmmBusy() || !kmmEl('kmm-detail').hidden || !kmmManagerWritable()) return;
     var operation = { provider: name };
@@ -3821,9 +3814,10 @@
       if (kmmDeleting !== operation || kmmDraft || kmmBatch || !isModelModalOpen) return;
       if (!snapshot || !snapshot.editable) { kmmToast(kmmManagerMessage || '当前只读，不能删除。', true); return; }
       var provider = snapshot.providers.find(function(p) { return p.name === name; });
-      var reason = kmmProviderDeleteReason(provider);
-      if (reason) { kmmToast(reason, true); return; }
-      if (!await kmmConfirm('将删除供应商「' + name + '」及其本地连接和认证配置，此操作不能撤销。不会删除系统环境变量。', '删除供应商', '删除此供应商？')) return;
+      if (!provider) { kmmToast('供应商已不存在，请刷新后重试。', true); return; }
+      var count = snapshot.models.filter(function(m) { return m.provider === name; }).length;
+      var cascade = count ? '及其 ' + count + ' 个模型、本地连接和认证配置' : '及其本地连接和认证配置';
+      if (!await kmmConfirm('将删除供应商「' + name + '」' + cascade + '，此操作不能撤销。不会删除系统环境变量。', '删除供应商', '删除此供应商？')) return;
       var response = await kapiFetch(API_BASE + '/api/model-manager/provider/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ version: snapshot.version, name: name }) });
       var data = await response.json();
@@ -3831,7 +3825,7 @@
         kmmToast(kmmSafeMessage(data.message) || '配置已变化，删除未执行；请刷新后重新确认，不会强制覆盖。', true);
         await kmmFetchManager();
       } else if (response.ok && data.success === true && typeof data.version === 'string') {
-        kmmToast('供应商已删除并原子保存，会话中 /reload 生效');
+        kmmToast(count ? '供应商及 ' + count + ' 个模型已删除并原子保存，会话中 /reload 生效' : '供应商已删除并原子保存，会话中 /reload 生效');
         await kmmRefreshAll();
       } else {
         kmmToast(kmmSafeMessage(data.message) || '删除失败，配置未保存。', true);
@@ -3858,24 +3852,25 @@
     providers.forEach(function(p) {
       if (kw && (p.name + ' ' + p.type + ' ' + p.base_url).toLowerCase().indexOf(kw) < 0) return;
       var card = document.createElement('div'); card.className = 'kmm-card';
-      var deleteReason = kmmProviderDeleteReason(p);
+      var modelCount = kmmManagerData.models.filter(function(m) { return m.provider === p.name; }).length;
+      var menuNote = modelCount ? '将连同 ' + modelCount + ' 个模型一起删除' : '';
       card.innerHTML = '<div class="kmm-top"><div class="kmm-name kmm-provider-name"><strong>' + esc(p.name) + '</strong>'
         + (p.managed ? '<span class="kmm-tag def">托管 · 只读</span>' : '') + '</div>'
         + '<div class="kmm-acts"><button class="kmm-link accent" data-kmm-provider-edit>' + (p.managed ? '查看' : '编辑') + '</button>'
         + '<button class="kmm-link" data-kmm-provider-add>添加模型</button>'
         + '<details class="kmm-item-menu"><summary aria-label="' + esc(p.name + ' 的更多操作') + '">⋯</summary><div class="kmm-menu">'
-        + '<button class="kmm-link danger" data-kmm-provider-delete' + (deleteReason ? ' disabled' : '') + '>删除供应商</button>'
-        + (deleteReason ? '<span class="kmm-menu-reason">' + esc(deleteReason) + '</span>' : '') + '</div></details></div></div>'
+        + '<button class="kmm-link danger" data-kmm-provider-delete>删除供应商</button>'
+        + (menuNote ? '<span class="kmm-menu-reason">' + esc(menuNote) + '</span>' : '') + '</div></details></div></div>'
         + '<div class="kmm-meta" title="' + esc(p.base_url || '默认地址') + '">' + esc(p.base_url || '使用默认 API 地址') + '</div>'
         + '<div class="kmm-summary"><span>' + esc(p.type) + '</span><span>密钥' + (p.has_api_key ? '已配置' : '未配置') + '</span><span>'
-        + kmmManagerData.models.filter(function(m) { return m.provider === p.name; }).length + ' 个模型</span></div>';
+        + modelCount + ' 个模型</span></div>';
       var edit = card.querySelector('[data-kmm-provider-edit]');
       edit.disabled = busy || !kmmManagerOnline;
       edit.onclick = function() { if (!kmmBusy()) kmmOpenEditor('provider', p.name); };
       card.querySelector('[data-kmm-provider-add]').disabled = busy || !kmmManagerWritable();
       card.querySelector('[data-kmm-provider-add]').onclick = function() { if (!kmmBusy()) kmmOpenBatch(p.name); };
       var remove = card.querySelector('[data-kmm-provider-delete]');
-      remove.disabled = !!deleteReason || busy || !kmmManagerWritable();
+      remove.disabled = busy || !kmmManagerWritable();
       remove.onclick = function() {
         card.querySelector('.kmm-item-menu').open = false;
         kmmDeleteProvider(p.name);

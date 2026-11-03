@@ -245,17 +245,16 @@ def _config_change(transform):
 def get_model_manager_data():
     try:
         content = get_config_content()
-        result = model_manager.snapshot(content)
-        if result['editable']:
-            try:
-                references = _model_manager_mode_references(model_manager.parse(content))
-                for model in result['models']:
-                    if not model['delete_protected'] and model['alias'] in references:
-                        model.update(delete_protected=True, delete_reason=references[model['alias']])
-            except model_manager.ConfigError as error:
-                for model in result['models']:
-                    if not model['delete_protected']:
-                        model.update(delete_protected=True, delete_reason=str(error))
+        references, reference_error = None, ''
+        try:
+            references = _model_manager_mode_references(model_manager.parse(content))
+        except model_manager.ConfigError as error:
+            reference_error = str(error)
+        result = model_manager.snapshot(content, references)
+        if result['editable'] and reference_error:
+            for model in result['models']:
+                if not model['delete_protected']:
+                    model.update(delete_protected=True, delete_reason=reference_error)
     except Exception:
         result = model_manager.snapshot('')
         result.update(editable=False, message='无法读取配置，拒绝改写')
@@ -324,6 +323,11 @@ def save_model_manager(path, req):
             return {'success': False, 'code': 'CONFIG_CONFLICT', 'message': CONFIG_CONFLICT}, 409
         modes_version = None
         if is_provider_delete:
+            base_models = model_manager.parse(base).get('models') or {}
+            if not isinstance(base_models, dict):
+                base_models = {}
+            removed_aliases = {alias for alias, item in base_models.items()
+                               if isinstance(item, dict) and item.get('provider') == req['name']}
             new = model_manager.delete_provider(base, req['name'])
         elif is_batch:
             if not isinstance(req['removes'], list):
@@ -344,6 +348,8 @@ def save_model_manager(path, req):
             if msg == CONFIG_CONFLICT:
                 return {'success': False, 'code': 'CONFIG_CONFLICT', 'message': msg}, 409
             return {'success': False, 'message': msg}, 400
+        if is_provider_delete:
+            _purge_modes_models(removed_aliases)
         return {'success': True, 'message': msg, 'version': model_manager.version(get_config_content())}, 200
     except model_manager.ConfigError as e:
         return {'success': False, 'message': str(e)}, 400
@@ -1536,14 +1542,26 @@ def get_models_data(content=None):
             'models': models}
 
 
+def _changed_models(base_data, data):
+    """本次写入实际改动的模型别名：只校验这些模型，不拿整份配置里的历史数据卡人。"""
+    base_models = base_data.get('models') if isinstance(base_data, dict) else None
+    models = data.get('models') if isinstance(data, dict) else None
+    if not isinstance(models, dict):
+        return None
+    if not isinstance(base_models, dict):
+        return None
+    return {alias for alias, model in models.items()
+            if alias not in base_models or base_models[alias] != model}
+
+
 @_config_locked
 def safe_apply_config(new_content, *, base_content):
     try:
         if get_config_content() != base_content:
             return False, CONFIG_CONFLICT
-        model_manager.parse(base_content)
+        base_data = model_manager.parse(base_content)
         data = model_manager.parse(new_content)
-        model_manager.normalize_support_efforts_data(data)
+        model_manager.normalize_support_efforts_data(data, _changed_models(base_data, data))
         new_content = model_manager.dumps(data)
     except model_manager.ConfigError as e:
         return False, str(e)
@@ -2785,6 +2803,103 @@ def restore_mode_snapshot():
         _stop_lock_guard()
     save_modes(d)
     return True, '已恢复到使用滑杆之前的配置（%s 的快照），会话内 /reload 生效' % snap.get('time', '')
+
+
+def _purge_modes_models(removed):
+    """供应商级联删除后清理档位、锁定与快照中指向已删模型的引用。"""
+    if not removed:
+        return
+    try:
+        data = _load_toml(get_config_content()) or {}
+        defined = set((data.get('models') or {}).keys())
+        fallback = data.get('default_model') if data.get('default_model') in defined else ''
+        if not fallback and defined:
+            fallback = next(iter(defined))
+        d = load_modes(data)
+        changed = False
+
+        def stale(record):
+            if not isinstance(record, dict):
+                return False
+            main = record.get('main')
+            if isinstance(main, str) and main and main not in defined:
+                return True
+            subs = record.get('subagents')
+            return isinstance(subs, list) and any(isinstance(a, str) and a not in defined for a in subs)
+
+        for mode in d.get('modes') or []:
+            if not isinstance(mode, dict):
+                continue
+            if mode.get('main') not in defined:
+                mode['main'] = fallback
+                changed = True
+            subs = mode.get('subagents')
+            if isinstance(subs, list):
+                kept = [alias for alias in subs if isinstance(alias, str) and alias in defined]
+                if kept != subs:
+                    mode['subagents'] = kept
+                    changed = True
+
+        for field in ('locked', 'last_applied'):
+            if stale(d.get(field)):
+                d.pop(field, None)
+                changed = True
+        for field in ('session_modes', 'session_locks'):
+            entries = d.get(field)
+            if not isinstance(entries, dict):
+                continue
+            for sid in [sid for sid, record in entries.items() if stale(record)]:
+                del entries[sid]
+                changed = True
+
+        hints = d.get('pool_hints')
+        if isinstance(hints, dict):
+            for alias in [alias for alias in hints if alias not in defined]:
+                del hints[alias]
+                changed = True
+
+        snap = d.get('previous_snapshot')
+        if isinstance(snap, dict):
+            if snap.get('default_model') in removed:
+                snap['default_model'] = fallback
+                changed = True
+            try:
+                saved = model_manager.parse(snap.get('secondary_text') or '')
+            except model_manager.ConfigError:
+                saved = None
+            if saved is not None:
+                secondary = saved.get('secondary_model')
+                mutated = False
+                pool = None
+                if isinstance(secondary, str):
+                    if secondary in removed:
+                        saved.pop('secondary_model', None)
+                        mutated = True
+                elif isinstance(secondary, dict):
+                    pool = secondary.get('models')
+                    if isinstance(pool, dict):
+                        for alias in [alias for alias in pool if alias in removed]:
+                            del pool[alias]
+                            mutated = True
+                    if secondary.get('default_model') in removed:
+                        if isinstance(pool, dict) and pool:
+                            secondary['default_model'] = next(iter(pool))
+                        else:
+                            secondary.pop('default_model', None)
+                        mutated = True
+                if mutated:
+                    snap['secondary_text'] = model_manager.dumps(saved)
+                    changed = True
+
+        if changed:
+            save_modes(d)
+        locks = d.get('locked')
+        session_locks = d.get('session_locks') or {}
+        if not (isinstance(locks, dict) and locks.get('locked')) and not any(
+                isinstance(v, dict) and v.get('locked') for v in session_locks.values()):
+            _stop_lock_guard()
+    except Exception:
+        pass
 
 
 apply_mode = _widgets_action(apply_mode)

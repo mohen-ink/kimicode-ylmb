@@ -212,11 +212,13 @@ def _ordered_efforts(value):
     return [level for level in EFFORT_LEVELS if level in efforts]
 
 
-def normalize_support_efforts_data(data):
+def normalize_support_efforts_data(data, only=None):
     models = data.get('models', {})
     if not isinstance(models, dict):
         raise ConfigError('models 必须是表')
-    for model in models.values():
+    for alias, model in models.items():
+        if only is not None and alias not in only:
+            continue
         if not isinstance(model, dict):
             raise ConfigError('模型必须是表')
         overrides = model.get('overrides', {})
@@ -523,37 +525,40 @@ def upsert_provider(content, original_name, item):
     return dumps(data)
 
 
-def provider_deletion_reasons(data):
-    providers, models = data.get('providers', {}), data.get('models', {})
-    if not isinstance(providers, dict) or not isinstance(models, dict):
-        raise ConfigError('providers/models 必须是表')
-    counts = {}
-    for model in models.values():
-        if not isinstance(model, dict):
-            raise ConfigError('模型必须是表')
-        name = _string(model.get('provider', ''), 'provider')
-        counts[name] = counts.get(name, 0) + 1
-    protected = {}
-    for name, provider in providers.items():
-        if not isinstance(provider, dict):
-            raise ConfigError('供应商必须是表')
-        if managed_provider(name, provider):
-            protected[name] = '托管/OAuth 供应商由官方管理，不允许删除'
-        elif counts.get(name):
-            protected[name] = '仍有 %d 个模型引用此供应商，请先删除或迁移这些模型' % counts[name]
-    return protected
-
-
 def delete_provider(content, name):
     _string(name, 'name', True)
     data = parse(content)
     providers = _table(data, ('providers',))
     if name not in providers or not isinstance(providers[name], dict):
         raise ConfigError('供应商不存在')
-    reason = provider_deletion_reasons(data).get(name)
-    if reason:
-        raise ConfigError('供应商不可删除：' + reason)
+    models = data.get('models', {})
+    if not isinstance(models, dict):
+        raise ConfigError('models 必须是表')
+    removed = [alias for alias, model in models.items()
+               if isinstance(model, dict) and model.get('provider') == name]
+    removed_set = set(removed)
+    for alias in removed:
+        del models[alias]
     del providers[name]
+    if data.get('default_model') in removed_set:
+        if models:
+            data['default_model'] = next(iter(models))
+        else:
+            data.pop('default_model', None)
+    secondary = data.get('secondary_model')
+    if isinstance(secondary, str):
+        if secondary in removed_set:
+            data.pop('secondary_model', None)
+    elif isinstance(secondary, dict):
+        pool = secondary.get('models')
+        if isinstance(pool, dict):
+            for alias in [alias for alias in pool if alias in removed_set]:
+                del pool[alias]
+        if secondary.get('default_model') in removed_set:
+            if pool:
+                secondary['default_model'] = next(iter(pool))
+            else:
+                secondary.pop('default_model', None)
     return dumps(data)
 
 
@@ -581,7 +586,6 @@ def snapshot(content, references=None):
             raise ConfigError('providers/models 必须是表')
         result['default_model'] = _string(data.get('default_model', ''), 'default_model')
         protected = deletion_reasons(data, references)
-        protected_providers = provider_deletion_reasons(data)
         for name, provider in providers.items():
             if not isinstance(provider, dict):
                 raise ConfigError('供应商必须是表')
@@ -591,8 +595,8 @@ def snapshot(content, references=None):
                                         'base_url': provider.get('base_url', ''),
                                         'has_api_key': bool(provider.get('api_key') or provider.get('api_key_env')),
                                         'managed': managed_provider(name, provider),
-                                        'delete_protected': name in protected_providers,
-                                        'delete_reason': protected_providers.get(name, '')})
+                                        'delete_protected': False,
+                                        'delete_reason': ''})
         for alias, model in models.items():
             if not isinstance(model, dict):
                 raise ConfigError('模型必须是表')
