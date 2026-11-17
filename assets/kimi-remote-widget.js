@@ -327,8 +327,6 @@
     relayNote.textContent = '经私人中继服务器（VPS）中转，由 worker 主动建立隧道。' +
       '仅用于可信私人测试：明文 HTTP，不共享给不受信设备。';
     relayPanel.appendChild(relayNote);
-    // 中继服务器配置：host/隧道端口/公网端口/密钥，保存后写
-    // usage-dashboard/relay.json，下次 start 生效；token 只写不回显。
     var mkField = function(labelText, id, type, ph) {
       var lab = doc.createElement('label');
       lab.className = 'kur-relay-field';
@@ -341,17 +339,8 @@
       lab.appendChild(inp);
       return lab;
     };
-    relayPanel.appendChild(mkField('服务器地址', 'kur-relay-host', 'text', '例如 relay.example.com 或你的服务器 IP'));
-    var portRow = doc.createElement('div');
-    portRow.style.cssText = 'display:flex;gap:10px;';
-    var pf1 = mkField('隧道端口', 'kur-relay-tport', 'number', '48213');
-    pf1.style.flex = '1';
-    var pf2 = mkField('公网端口', 'kur-relay-pport', 'number', '47961');
-    pf2.style.flex = '1';
-    portRow.appendChild(pf1);
-    portRow.appendChild(pf2);
-    relayPanel.appendChild(portRow);
-    var tokenLab = mkField('连接密钥（token）', 'kur-relay-token', 'password', '留空 = 用内置默认');
+    relayPanel.appendChild(mkField('服务器地址（含端口）', 'kur-relay-host', 'text', 'http://relay.example.com:47961'));
+    var tokenLab = mkField('准入密钥', 'kur-relay-token', 'password', '已设置时留空保留');
     var tokSet = doc.createElement('div');
     tokSet.id = 'kur-relay-tokenset';
     tokSet.className = 'kur-relay-tokenset';
@@ -364,6 +353,23 @@
     relaySave.type = 'button';
     relaySave.textContent = '保存中继配置';
     relayPanel.appendChild(relaySave);
+    var accountStatus = doc.createElement('div');
+    accountStatus.id = 'kur-relay-account-status';
+    accountStatus.className = 'kur-relay-tokenset';
+    relayPanel.appendChild(accountStatus);
+    relayPanel.appendChild(mkField('账号', 'kur-relay-username', 'text', '注册新账号或登录已有账号'));
+    relayPanel.appendChild(mkField('账号密码（本机明文保存）', 'kur-relay-password', 'password', '用于正常登录和生成长期二维码'));
+    relayPanel.appendChild(mkField('电脑名称', 'kur-relay-device-name', 'text', '例如 家里的电脑'));
+    [['kur-relay-register', '注册账号并绑定本机'], ['kur-relay-bind', '登录账号并绑定本机'],
+      ['kur-relay-unbind', '解除本机绑定']].forEach(function(item) {
+      var button = doc.createElement('button');
+      button.id = item[0];button.type = 'button';button.className = 'kur-btn-mini';
+      button.textContent = item[1];relayPanel.appendChild(button);
+    });
+    var accountHint = doc.createElement('p');
+    accountHint.className = 'kur-relay-tokenset';
+    accountHint.textContent = '二维码含原始账号密码与本机标识，扫码自动走服务器正常登录。密码和设备密钥在本机保存；HTTP/WS 明文传输，请勿分享二维码或复用其他网站密码。改密码后须在此用新密码重新登录绑定。';
+    relayPanel.appendChild(accountHint);
     b.appendChild(relayPanel);
 
     var internet = doc.createElement('div');
@@ -386,6 +392,7 @@
     b.appendChild(internet);
 
     var passwordField = mkField('手机登录密码', 'kur-password', 'password', '任意密码，不限强度');
+    passwordField.id = 'kur-local-password';
     var passwordSave = doc.createElement('button');
     passwordSave.id = 'kur-password-save';
     passwordSave.type = 'button';
@@ -533,7 +540,8 @@
   function focusables() {
     var ids = ['#kur-x', '#kur-mode-lan', '#kur-mode-internet', '#kur-mode-relay', '#kur-legacy-stop',
                '#kur-lan-addr', '#kur-lan-consent', '#kur-download-consent', '#kur-install', '#kur-relay-consent',
-               '#kur-relay-host', '#kur-relay-tport', '#kur-relay-pport', '#kur-relay-token', '#kur-relay-save',
+               '#kur-relay-host', '#kur-relay-token', '#kur-relay-save', '#kur-relay-username',
+               '#kur-relay-password', '#kur-relay-device-name', '#kur-relay-register', '#kur-relay-bind', '#kur-relay-unbind',
                '#kur-password', '#kur-password-save',
                '#kur-link', '#kur-rotate', '#kur-copy', '#kur-enable', '#kur-disable', '#kur-note-toggle'];
     var out = [];
@@ -614,7 +622,7 @@
     if (requestLocked(allowRefresh) || !lanConfirmedOff() || startBlockedByLegacy()) return false;
     var mode = curMode();
     if (mode === 'lan') return lanAddrValid() && checked('#kur-lan-consent');
-    if (mode === 'relay') return true;   // 私人 VPS：无 consent、无 connector 前置
+    if (mode === 'relay') return !relayCfgLoading && !!relayCfg && relayCfg.bound === true;
     if (mode !== 'internet') return false;
     return !!lanStatus.connector && lanStatus.connector.state === 'installed' && checked('#kur-relay-consent');
   }
@@ -662,7 +670,7 @@
     if (off) off.classList.toggle('kur-hidden', !showStop);
     var rotate = $('#kur-rotate');
     if (rotate) {
-      rotate.textContent = lanStatus && lanStatus.password_set ? '刷新二维码' : '生成新二维码';
+      rotate.textContent = curMode() === 'relay' || (lanStatus && lanStatus.password_set) ? '刷新二维码' : '生成新二维码';
       rotate.disabled = !canRotate(true);
       rotate.setAttribute('aria-disabled', rotate.disabled || !!inflight ? 'true' : 'false');
     }
@@ -709,19 +717,28 @@
   // 保留用户已选地址，未选时仅有一块网卡才自动选中（多网卡不预选，防止选到虚拟网卡）
   /* ---------------- relay 配置 ---------------- */
   function relayCfgFieldsDisabled(disabled) {
-    ['#kur-relay-host', '#kur-relay-tport', '#kur-relay-pport', '#kur-relay-token', '#kur-relay-save']
+    ['#kur-relay-host', '#kur-relay-token', '#kur-relay-save', '#kur-relay-username',
+      '#kur-relay-password', '#kur-relay-device-name', '#kur-relay-register', '#kur-relay-bind', '#kur-relay-unbind']
       .forEach(function(id) {
         var el = $(id);
         if (el) el.disabled = disabled;
       });
+    var unbind = $('#kur-relay-unbind');
+    if (unbind) unbind.disabled = disabled || !relayCfg || !relayCfg.bound;
   }
   function relayCfgApply(c) {
     relayCfg = c || null;
-    var h = $('#kur-relay-host'), tp = $('#kur-relay-tport'), pp = $('#kur-relay-pport'), ts = $('#kur-relay-tokenset');
-    if (h && relayCfg) h.value = relayCfg.host || '';
-    if (tp && relayCfg) tp.value = (relayCfg.tunnel_port !== undefined && relayCfg.tunnel_port !== null) ? String(relayCfg.tunnel_port) : '';
-    if (pp && relayCfg) pp.value = (relayCfg.public_port !== undefined && relayCfg.public_port !== null) ? String(relayCfg.public_port) : '';
-    if (ts) ts.textContent = relayCfg && relayCfg.token_set ? '已设置（不回显）' : '未设置（用内置默认）';
+    var h = $('#kur-relay-host'), ts = $('#kur-relay-tokenset');
+    var username = $('#kur-relay-username'), name = $('#kur-relay-device-name');
+    if (h && relayCfg) h.value = relayCfg.url || '';
+    if (username && relayCfg) username.value = relayCfg.username || '';
+    if (name && relayCfg) name.value = relayCfg.device_name || '';
+    if (ts) ts.textContent = relayCfg && relayCfg.token_set ? '准入密钥已设置（不回显）' : '准入密钥未设置';
+    var status = $('#kur-relay-account-status');
+    if (status) status.textContent = relayCfg && relayCfg.bound
+      ? '已绑定：' + relayCfg.username + ' · ' + relayCfg.device_name
+      : '尚未绑定，请先保存服务器配置，再注册或登录账号。';
+    setButtons();
   }
   function loadRelayConfig() {
     if (!mobileApi || typeof mobileApi.getRelayConfig !== 'function') return;
@@ -731,20 +748,18 @@
       relayCfgApply(c);
     }).catch(function() { /* 读取失败保持输入框原样 */ }).then(function() {
       relayCfgLoading = false;
+      setButtons();
     });
   }
   function saveRelayConfig() {
     if (!mobileApi || typeof mobileApi.setRelayConfig !== 'function') return;
+    if (relayCfgLoading || !lanConfirmedOff()) return;
     var host = ($('#kur-relay-host') || {}).value || '';
-    var tport = ($('#kur-relay-tport') || {}).value || '';
-    var pport = ($('#kur-relay-pport') || {}).value || '';
     var token = ($('#kur-relay-token') || {}).value || '';
-    var body = {};
-    if (host !== '') body.host = host;
-    var tp = parseInt(tport, 10), pp = parseInt(pport, 10);
-    if (tport !== '' && !isNaN(tp)) body.tunnel_port = tp;
-    if (pport !== '' && !isNaN(pp)) body.public_port = pp;
+    var body = {url: host};
     if (token !== '') body.token = token;
+    relayCfgLoading = true;
+    setButtons();
     var saveBtn = $('#kur-relay-save');
     if (saveBtn) saveBtn.disabled = true;
     mobileApi.setRelayConfig(body).then(function(c) {
@@ -755,9 +770,30 @@
     }).catch(function(e) {
       showMsg((e && e.message) || '中继配置保存失败', true, 'req');
     }).then(function() {
-      if (saveBtn) saveBtn.disabled = false;
+      relayCfgLoading = false;
       setButtons();
     });
+  }
+
+  function relayAccountAction(register, unbind) {
+    if (!mobileApi || relayCfgLoading || !lanConfirmedOff()) return;
+    if (unbind && !window.confirm('解除本机绑定并使原二维码的目标设备失效？')) return;
+    if (!unbind && relayCfg && ($('#kur-relay-host').value.trim() !== relayCfg.url || $('#kur-relay-token').value)) {
+      showMsg('请先保存服务器地址和准入密钥，再操作账号。', true, 'local');
+      return;
+    }
+    var data = {username: ($('#kur-relay-username') || {}).value || '',
+      password: ($('#kur-relay-password') || {}).value || '',
+      device_name: ($('#kur-relay-device-name') || {}).value || '', register: register};
+    relayCfgLoading = true;setButtons();
+    var request = unbind ? mobileApi.unbindRelayAccount() : mobileApi.bindRelayAccount(data);
+    request.then(function(c) {
+      relayCfgApply(c);
+      var password = $('#kur-relay-password');if (password) password.value = '';
+      showMsg(unbind ? '本机已解除绑定。' : '账号与本机已绑定，可开启中继连接。', false, 'local');
+    }).catch(function(e) {
+      showMsg(e.message || '账号操作失败', true, 'local');
+    }).then(function() { relayCfgLoading = false;setButtons(); });
   }
 
   function renderLanAddrs() {
@@ -805,6 +841,12 @@
       var p = $(panels[m]);
       if (p) p.classList.toggle('kur-hidden', m !== mode);
     });
+    var localPassword = $('#kur-local-password');
+    if (localPassword) localPassword.classList.toggle('kur-hidden', mode === 'relay');
+    var pairHint = $('.kur-pairhint');
+    if (pairHint) pairHint.textContent = mode === 'relay'
+      ? '链接含原始账号密码，长期可用；刷新不撤销旧码，请勿分享'
+      : '链接含登录凭据，请勿分享；密码二维码可重复使用';
     var hint = $('#kur-modehint');
     if (hint) {
       var text = '';
@@ -1394,6 +1436,9 @@
       bind('#kur-rotate', rotatePair);
       bind('#kur-legacy-stop', stopOfficial);
       bind('#kur-relay-save', saveRelayConfig);
+      bind('#kur-relay-register', function() { relayAccountAction(true, false); });
+      bind('#kur-relay-bind', function() { relayAccountAction(false, false); });
+      bind('#kur-relay-unbind', function() { relayAccountAction(false, true); });
       bind('#kur-password-save', function() {
         if (!mobileApi || inflight) return;
         var input = $('#kur-password');

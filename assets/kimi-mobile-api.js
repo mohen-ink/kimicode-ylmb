@@ -35,10 +35,7 @@
   var PAIR_PATH = '/mobile/pair';
   var PAIR_TOKEN_RE = /^[A-Za-z0-9_-]{8,256}$/;
   var PUBLIC_ORIGIN_RE = /^https:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.trycloudflare\.com$/;
-  // relay 公网 origin：http://<中继 host>:<port>（不带 /t/<id> 路径，tid 只在配对
-  // URL 里）。不写死任何具体服务器——host 取字符集白名单（hostname/IPv4/IPv6
-  // 字面量），配对链接的 hostname 另须等于 status.public_origin 的 host。
-  var RELAY_ORIGIN_RE = /^http:\/\/[A-Za-z0-9._:\[\]-]+:\d+$/;
+  var RELAY_ORIGIN_RE = /^http:\/\/[A-Za-z0-9._:\[\]-]+$/;
   var ERROR_MESSAGES = {
     CONNECTOR_MISSING: '请先安装外网连接组件。',
     CONNECTOR_INSTALL_FAILED: '连接组件安装失败，请重新确认后再试。',
@@ -49,7 +46,7 @@
     TUNNEL_START_FAILED: '外网通道启动失败，请停止后再试。',
     TUNNEL_TIMEOUT: '外网通道启动超时，请检查网络后重试。',
     TUNNEL_EXITED: '外网通道已断开，请停止后重新开启。',
-    TUNNEL_AUTH_FAILED: '中继密钥错误或未授权，请检查中继服务器 token 配置。',
+    TUNNEL_AUTH_FAILED: '设备凭据失效、设备已在线或服务器协议不兼容，请停止连接后重新登录绑定并核对服务器版本。',
     OWNER_LOST: '桌面端服务已断开，连接已撤销。',
     START_CANCELLED: '连接启动已取消。',
     SERVER_TOKEN_UNAVAILABLE: '手机连接凭据创建或读取失败，请检查目录权限。',
@@ -119,14 +116,13 @@
 
   function validPublicOrigin(origin, mode) {
     if (typeof origin !== 'string' || /\s/.test(origin)) return false;
-    if (mode === 'relay') return RELAY_ORIGIN_RE.test(origin);
+    if (mode === 'relay') {
+      try {
+        var u = new URL(origin);
+        return RELAY_ORIGIN_RE.test(origin) && u.origin === origin;
+      } catch (e) { return false; }
+    }
     return PUBLIC_ORIGIN_RE.test(origin);
-  }
-
-  // 从 public_origin（'http://<host>:<port>'）解析 host 部分；解析不出返回 ''。
-  function relayOriginHost(origin) {
-    if (typeof origin !== 'string') return '';
-    try { return new URL(origin).hostname; } catch (e) { return ''; }
   }
 
   // owner_origin：http + 回环 host，无 userinfo/路径/查询/锚点
@@ -283,6 +279,19 @@
     if (typeof text !== 'string' || text === '' || text !== text.trim()) return reject();
     var u;
     try { u = new URL(text); } catch (e) { return reject(); }
+    if (isObj(status) && status.mode === 'relay') {
+      var params = new URLSearchParams(u.hash.slice(1));
+      var keys = Array.from(params.keys());
+      if (u.username || u.password || u.search || u.pathname !== '/' || u.protocol !== 'http:'
+          || u.origin !== status.public_origin || text !== status.public_origin + '/' + u.hash
+          || status.auth_mode !== 'account' || status.enabled !== true || status.state !== 'on'
+          || !status.tunnel || status.tunnel.state !== 'ready' || keys.length !== 3
+          || keys.some(function(k) { return ['username', 'password', 'device'].indexOf(k) < 0; })
+          || !/^[A-Za-z0-9_.@-]{1,64}$/.test(params.get('username') || '')
+          || !(params.get('password') || '').length || params.get('password').length > 256
+          || !/^[A-Za-z0-9_-]{16,128}$/.test(params.get('device') || '')) return reject();
+      return text;
+    }
     var passwordLink = u.hash.slice(0, 4) === '#pw=';
     if (passwordLink) {
       try {
@@ -299,17 +308,6 @@
           || status.tunnel.state !== 'ready' || !validPublicOrigin(status.public_origin, 'internet')
           || u.protocol !== 'https:' || u.port || u.origin !== status.public_origin
           || text !== status.public_origin + PAIR_PATH + u.hash) return reject();
-    } else if (isObj(status) && status.mode === 'relay') {
-      // relay：url 形如 http://<vps>:<port>/t/<tid>/mobile/pair#pair=...
-      // public_origin 只含 http://<vps>:<port>，tid 前缀需在路径里。
-      var m = /^\/t\/([A-Za-z0-9_-]{4,32})\/mobile\/pair$/.exec(u.pathname);
-      if (!m) return reject();
-      if (status.enabled !== true || status.state !== 'on' || !isObj(status.tunnel)
-          || status.tunnel.state !== 'ready' || !validPublicOrigin(status.public_origin, 'relay')
-          || u.protocol !== 'http:' || !u.port
-          || u.hostname !== relayOriginHost(status.public_origin)
-          || u.origin !== status.public_origin
-          || text !== status.public_origin + u.pathname + u.hash) return reject();
     } else {
       if (u.pathname !== PAIR_PATH) return reject();
       if (u.protocol !== 'http:' || !isRFC1918(u.hostname) || !u.port
@@ -439,10 +437,16 @@
           || d.tunnel.state !== 'ready' || !validPublicOrigin(d.public_origin, d.mode)) badStatus();
       status.public_origin = d.public_origin;
     }
+    if (d.auth_mode !== undefined) {
+      if (d.mode !== 'relay' || d.auth_mode !== 'account') badStatus();
+      status.auth_mode = 'account';
+    }
     if (d.expires_at !== undefined) {
       if (typeof d.expires_at !== 'number' || !isFinite(d.expires_at) || d.expires_at <= 0) badStatus();
     }
-    if (d.url !== undefined) {
+    if (d.url !== undefined && d.mode === 'relay') {
+      try { status.url = validateRemoteURL(d.url, status); } catch (e) { badStatus(); }
+    } else if (d.url !== undefined) {
       if (typeof d.url !== 'string' || !d.url || !d.enabled || d.state !== 'on'
           || (d.expires_at === undefined && d.password_set !== true)
           || ((d.mode === 'internet' || d.mode === 'relay') && (d.tunnel.state !== 'ready' || !status.public_origin))
@@ -542,6 +546,19 @@
     var startTimeoutMs = clamp(hasOverride ? override : DEFAULT_START_TIMEOUT_MS);
     var installTimeoutMs = clamp(hasOverride ? override : DEFAULT_INSTALL_TIMEOUT_MS);
 
+    function relayAccount(action, data) {
+      var headers = {'Content-Type': 'application/json'};
+      headers[CONTROL_HEADER] = '1';
+      return doFetch(fetchImpl, CONTROL_BASE + '/api/mobile/relay/' + action, {
+        method: 'POST', headers: headers, cache: 'no-store', body: JSON.stringify(data)
+      }, postTimeoutMs, '操作中继账号').then(function(out) {
+        var d;
+        try { d = JSON.parse(out.body); } catch (e) { throw apiErr('服务器返回格式错误', 'MOBILE_HTTP'); }
+        if (out.http !== 200) throw apiErr(d.error || '中继账号操作失败', 'MOBILE_HTTP');
+        return d.relay;
+      });
+    }
+
     return {
       status: function() {
         return call(fetchImpl, getTimeoutMs, 'GET', STATUS_PATH, undefined, '查询手机连接状态');
@@ -597,8 +614,7 @@
       rotatePair: function() {
         return call(fetchImpl, postTimeoutMs, 'POST', PAIR_ROTATE_PATH, {}, '更换配对码');
       },
-      // relay 配置（daemon 本地文件，不经 worker）：读取返回 {host,tunnel_port,public_port,token_set}，
-      // 永不回显 token 明文；写入接受明文（可仅传部分字段，缺省继承现值）。
+      // 配置查询不回显准入密钥、设备密钥或保存的原始密码。
       getRelayConfig: function() {
         var url = CONTROL_BASE + RELAY_CONFIG_PATH;
         var init = { method: 'GET', headers: { 'Accept': 'application/json' }, cache: 'no-store' };
@@ -613,9 +629,7 @@
       setRelayConfig: function(cfg) {
         var body = {};
         if (cfg && typeof cfg === 'object') {
-          if (cfg.host !== undefined) body.host = String(cfg.host || '');
-          if (cfg.tunnel_port !== undefined) body.tunnel_port = cfg.tunnel_port;
-          if (cfg.public_port !== undefined) body.public_port = cfg.public_port;
+          if (cfg.url !== undefined) body.url = String(cfg.url || '');
           if (cfg.token !== undefined) body.token = String(cfg.token || '');
         }
         var url = CONTROL_BASE + RELAY_CONFIG_PATH;
@@ -633,7 +647,9 @@
           try { var eb = JSON.parse(out.body); if (eb && eb.error) msg = String(eb.error); } catch (e) {}
           throw apiErr(msg, 'MOBILE_HTTP');
         });
-      }
+      },
+      bindRelayAccount: function(data) { return relayAccount('bind', data); },
+      unbindRelayAccount: function() { return relayAccount('unbind', {}); }
     };
   }
 

@@ -1,34 +1,8 @@
 # -*- coding: utf-8 -*-
-"""
-Kimi Code 用量面板 · 私人测试用公网中继（worker 侧，纯标准库，Python>=3.8）
+"""单端口 HTTP/WS 中继客户端：使用设备凭据连接，转发服务器授权请求到本机桥。
 
-拓扑（与 VPS 端 scripts/relay_server.py 配对）：
-  手机浏览器 --HTTP/WS--> VPS 公网口 :<public_port> --WS 帧--> 本模块（worker 隧道）
-  本模块 --HTTP/WS--> 127.0.0.1:<bridge_port>（本机桥，仍绑回环）
-
-本模块在 worker 进程内运行：向 ws://<vps>:48213/relay/register 建立一条持久
-WebSocket（X-Relay-Token 共享密钥，客户端帧必须掩码），注册后：
-
-  - 收 {type:'http', id, method, path, headers, body(b64)}：
-      向本机桥发一次普通 HTTP 请求（Host 重写为 VPS 公网口地址，
-      Content-Length 按转发的 body 实算），把响应帧化回
-      {type:'http_resp', id, status, headers, body(b64)}。
-  - 收 {type:'ws_open', id, path, headers}：
-      对本机桥发起一次 WebSocket 升级（同 Host 重写），之后把隧道侧
-      {type:'ws_data', id, opcode, fin, payload(b64)} 与本机 socket 上的
-      RFC6455 帧双向互转，{type:'ws_close'} 双向同步。
-  - 周期性发 RFC6455 ping 保活；隧道断开会以指数退避重连（须先告知桥
-    on_failure——桥语义是 fail-closed，重连只会用于下一次 start）。
-
-与 ConnectorRuntime 的调用契约一致：start(bound_port, on_ready, on_fail)
-立即返回、后台线程跑隧道；on_ready(origin) 在注册成功拿到
-{registered, tunnel_id, origin} 后回调（origin 形如
-'http://<vps>:<public_port>'，不带 /t/<id>——tid 经 self.tunnel_id 另取）；
-on_failure(code) 在隧道不可用/断线时回调一次。stop() 同步停当前隧道，
-shutdown() 永久关闭。code 只用桥白名单里的码（TUNNEL_* / START_CANCELLED）。
-
-纯标准库：socket + ssl（预留 TLS，当前 ws:// 明文）+ base64 + hashlib +
-json + secrets + struct + threading。不装任何第三方。
+start(bound_port, on_ready, on_failure) 异步启动，断线指数退避重连；
+stop() 停止当前连接，shutdown() 永久关闭。仅使用 Python>=3.8 标准库。
 """
 import base64
 import gzip
@@ -40,19 +14,6 @@ import socket
 import struct
 import threading
 import time
-
-# ---------------- 配置 ----------------
-# 默认值即「未配置」的兼容回退；持久化在 usage-dashboard/relay.json，由
-# relay_config.py 统一读写校验。运行时经 RelayClient(...) 构造参数注入——
-# 本模块不再用模块级常量写死目标 VPS（host/port/header 全部实例化）。
-RELAY_HOST = ''
-RELAY_PORT = 48213           # VPS 隧道注册口（ws://<vps>:<RELAY_PORT>/relay/register）
-RELAY_PUBLIC_PORT = 47961    # VPS 公网口（http://<vps>:<RELAY_PUBLIC_PORT>/t/<id>/...）
-# 共享密钥：运行期经 KIMI_RELAY_TOKEN 环境变量，或本机 usage-dashboard/relay.json
-# 的 token 字段提供。**仓库不内置任何 token 默认值**——真实值只存在于部署环境与
-# 本机配置，不进代码、不进提交。空串 = 不发 X-Relay-Token（仅服务器未启用
-# --token 校验时可用）。
-DEFAULT_RELAY_TOKEN = ''
 
 WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 CONNECT_TIMEOUT = 15.0
@@ -93,10 +54,7 @@ def _tok_ok(s, lo=1, hi=64):
 
 
 class RelayAuthError(Exception):
-    """注册被服务器明确拒绝（HTTP 401/403）——共享密钥错/未授权。
-    这是确定性配置错误，重连无意义：区别于超时/断连等瞬时故障，
-    触发后应立即 _fail 让桥报「密钥错误」，不进退避重连循环
-    （否则用户只能看到「一直正在开启中」直到 RECONNECT_GIVEUP）。"""
+    """设备凭据或协议被拒绝，不按临时网络故障反复重连。"""
 
 
 class FrameError(Exception):
@@ -470,30 +428,18 @@ def _pump_ws_to_tunnel(bridge_sock, tun_ws, cid, initial_rest):
 
 # ---------------- RelayClient ----------------
 class RelayClient:
-    """与 ConnectorRuntime 同形：start(bound_port, on_ready, on_fail)。
+    """使用绑定设备凭据建立隧道；每条连接单独接收本机桥授权密钥。"""
 
-    全部可配置参数经构造注入；默认即「未配置」的内置回退。public_host_header
-    不传时由 relay_host + public_port 派生（桥 Host/Origin 校验期望的
-    'host:port'）——relay_server 的 --public-host 须与之吻合，否则注册到的
-    origin 与桥白名单不匹配。"""
-
-    def __init__(self, relay_host=RELAY_HOST, relay_port=RELAY_PORT,
-                 public_port=RELAY_PUBLIC_PORT, token=None,
-                 public_host_header=None):
-        self.relay_host = relay_host
-        self.relay_port = relay_port
-        self.public_port = public_port
-        if isinstance(public_host_header, str) and public_host_header.strip():
-            self.public_host_header = public_host_header.strip()
-        else:
-            self.public_host_header = '%s:%d' % (relay_host, public_port)
-        if token is None:
-            try:
-                import os
-                token = os.environ.get('KIMI_RELAY_TOKEN') or DEFAULT_RELAY_TOKEN
-            except Exception:
-                token = DEFAULT_RELAY_TOKEN
-        self._token = token
+    def __init__(self, server_url, device_id, device_key):
+        from urllib.parse import urlsplit
+        u = urlsplit(server_url)
+        self.relay_host = u.hostname or ''
+        self.relay_port = u.port or 80
+        self.public_host_header = u.netloc
+        self.server_url = server_url
+        self.device_id = device_id
+        self.device_key = device_key
+        self.bridge_key = ''
         self._lock = threading.RLock()
         self._closing = False
         self._started = False
@@ -525,6 +471,7 @@ class RelayClient:
         with self._lock:
             ws = self._ws
             self._ws = None
+            self.bridge_key = ''
             self._started = False
         if ws is not None:
             try:
@@ -584,11 +531,6 @@ class RelayClient:
         _fail('TUNNEL_EXITED') 让桥 teardown。
         """
         if not isinstance(self.relay_host, str) or not self.relay_host.strip():
-            # 未配置中继服务器地址（relay.json host 为空/非法被清洗成 ''）：
-            # 确定性配置错误，拿空串去 create_connection 只会白重连到
-            # RECONNECT_GIVEUP。直接拒绝并回报 TUNNEL_AUTH_FAILED——现有
-            # 白名单码，前端文案指向「中继服务器配置」，且不污染
-            # _MOBILE_ERROR_CODES / mobile_worker 合同。
             with self._lock:
                 self._started = False
             self._fail('TUNNEL_AUTH_FAILED')
@@ -601,8 +543,6 @@ class RelayClient:
             try:
                 self._run_once()
             except RelayAuthError:
-                # 服务器明确拒绝（401/403 密钥错/未授权）：确定性失败，
-                # 不重连，立即回调让桥报「密钥错误」、状态转 failed。
                 with self._lock:
                     self._started = False
                 self._fail('TUNNEL_AUTH_FAILED')
@@ -613,6 +553,7 @@ class RelayClient:
             with self._lock:
                 ws = self._ws
                 self._ws = None
+                self.bridge_key = ''
                 closing = self._closing or not self._started
                 connected = self._connected_once
             if ws is not None:
@@ -639,25 +580,22 @@ class RelayClient:
 
 
     def _run_once(self):
-        # 1) TCP + WS 握手 + X-Relay-Token 注册
         sock = socket.create_connection((self.relay_host, self.relay_port),
                                         timeout=CONNECT_TIMEOUT)
+        try:
+            self._register_socket(sock)
+        finally:
+            sock.close()
+
+    def _register_socket(self, sock):
         sock.settimeout(REGISTER_TIMEOUT)
         key = base64.b64encode(secrets.token_bytes(16)).decode('ascii')
-        resume = ''
-        with self._lock:
-            resume = self.tunnel_id or ''
-        resume_hdr = ('X-Relay-Resume: %s\r\n' % resume) if resume else ''
         req = ('GET /relay/register HTTP/1.1\r\n'
-               'Host: %s:%d\r\n'
-               'Upgrade: websocket\r\n'
-               'Connection: Upgrade\r\n'
-               'Sec-WebSocket-Key: %s\r\n'
-               'Sec-WebSocket-Version: 13\r\n'
-               'X-Relay-Token: %s\r\n'
-               '%s'
-               '\r\n' % (self.relay_host, self.relay_port, key, self._token,
-                        resume_hdr))
+               'Host: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+               'Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n'
+               'X-Relay-Protocol: 2\r\nX-Relay-Device: %s\r\n'
+               'X-Relay-Device-Key: %s\r\n\r\n'
+               % (self.public_host_header, key, self.device_id, self.device_key))
         sock.sendall(req.encode('latin-1'))
         head = bytearray()
         while b'\r\n\r\n' not in head:
@@ -670,13 +608,13 @@ class RelayClient:
         head_b, rest = bytes(head).split(b'\r\n\r\n', 1)
         status_line = head_b.split(b'\r\n', 1)[0]
         if b' 101' not in status_line:
-            # 401/403 = 服务器明确拒绝（共享密钥错/未授权）：确定性配置错误，
-            # 重连只会原地打转，立刻失败让桥报「密钥错误」而非卡「开启中」。
             parts = status_line.split(b' ')
             code = parts[1] if len(parts) > 1 else b''
-            if code in (b'401', b'403'):
-                raise RelayAuthError('register refused: HTTP '
-                                     + code.decode('ascii', 'replace'))
+            sock.close()
+            if code == b'409' and b'x-relay-protocol: 2' in head_b.lower():
+                raise OSError('device reconnect pending')
+            if code in (b'400', b'401', b'403', b'404', b'409'):
+                raise RelayAuthError('register refused')
             raise OSError('register refused')
         sock.settimeout(RECV_POLL)
         ws = _WSock(sock, masked_out=True)
@@ -709,14 +647,13 @@ class RelayClient:
             except Exception:
                 continue
             if msg.get('type') == 'registered':
-                self.tunnel_id = str(msg.get('tunnel_id') or '')
-                # origin 形如 'http://<vps>:<port>/t/<id>'；桥只存不带 /t/ 的公网
-                # origin（Host/Origin 校验用），tid 经 self.tunnel_id 另取。
-                full = str(msg.get('origin') or '')
-                if '/t/' in full:
-                    origin = full.split('/t/', 1)[0]
-                else:
-                    origin = full
+                bridge_key = msg.get('bridge_key')
+                if (msg.get('protocol') != '2' or msg.get('tunnel_id') != self.device_id
+                        or msg.get('origin') != self.server_url or not _tok_ok(bridge_key, 32, 128)):
+                    raise RelayAuthError('incompatible registration')
+                self.tunnel_id = self.device_id
+                self.bridge_key = bridge_key
+                origin = self.server_url
                 self.public_origin = origin
                 break
         if not origin:
@@ -819,6 +756,11 @@ class RelayClient:
             bsock, rest = got
             with self._ws_lock:
                 self._ws_channels[cid] = bsock
+            if not ws.send_json({'type': 'ws_ready', 'id': cid}):
+                with self._ws_lock:
+                    self._ws_channels.pop(cid, None)
+                bsock.close()
+                return
             threading.Thread(target=_pump_ws_to_tunnel,
                              args=(bsock, ws, cid, rest), daemon=True).start()
         except Exception:

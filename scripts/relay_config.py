@@ -1,160 +1,171 @@
 # -*- coding: utf-8 -*-
-"""
-Kimi Code 用量面板 · 手机中继（relay）配置持久化（纯标准库，Python>=3.8）
-
-配置文件 <KIMI_HOME>/usage-dashboard/relay.json，字段：
-  {host, tunnel_port, public_port, token}
-
-- 读侧（worker / daemon 共用）：sanitize() 把任意外部输入收敛成一份规范化
-  配置（host 去空白小写、端口限 1-65535、token 限长）；load() 对不存在/
-  损坏/含非法字段的文件一律回退默认值——绝不因坏配置拒绝启动（fail-open
-  到内置默认，与「未配置」等价）。字段单独非法（如端口越界）只回退该字段。
-- 写侧（daemon）：validate_*() 严格校验用户输入，error() 抛出的中文错误
-  文案经 daemon 校验后才落盘；token 永不回显明文（读取只给 token_set）。
-- 原子写入 safe_write()：先写 .tmp 再 os.replace；失败静默（与 service.py
-  现有持久化语义一致——写失败不阻断主流程，但 API 会如实回报）。
-
-任何进程都可用本模块读配置；worker 侧 RelayClient 构造参数由调用方从
-load() 的结果拆出，本模块不感知 mobile_relay。
-"""
+"""单端口中继配置和本机设备凭据；账号原始密码只供生成登录二维码。"""
+import http.client
 import json
 import os
-import time
+import re
+from urllib.parse import urlsplit
 
-# ---------------- 默认值（未配置回退；host 空串 = 未配置） ----------------
-DEFAULTS = {
-    'host': '',            # '' = 未配置；须在面板「中继服务器配置」填入服务器地址
-    'tunnel_port': 48213,
-    'public_port': 47961,
-    'token': '',           # '' = 本机未配置；由 relay.json / KIMI_RELAY_TOKEN 提供
-}
+import mobile_auth
 
-HOST_MAX = 253
 TOKEN_MAX = 256
-
-_RELAY_FILENAME = 'relay.json'
+DEFAULTS = {'url': '', 'token': '', 'username': '', 'password': '',
+            'device_id': '', 'device_key': '', 'device_name': ''}
 
 
 def config_path(kimi_home):
-    """KIMI_HOME → relay.json 路径。"""
-    return os.path.join(kimi_home, 'usage-dashboard', _RELAY_FILENAME)
+    return os.path.join(kimi_home, 'usage-dashboard', 'relay.json')
 
 
-def _is_port(v):
-    """1-65535 整数；bool 不是端口。"""
-    return isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 65535
-
-
-def _clean_host(v):
-    """host：非空 hostname/IP，≤253 字符；合法返回小写去空白值，否则 ''。"""
-    if not isinstance(v, str):
+def normalize_url(value):
+    if not isinstance(value, str) or not value.strip() or len(value) > 512:
         return ''
-    s = v.strip().lower()
-    if not s or len(s) > HOST_MAX:
+    value = value.strip()
+    if '://' not in value:
+        value = 'http://' + value
+    if any(ord(c) <= 32 or ord(c) > 126 for c in value):
         return ''
-    # 只允许 hostname/IPv4/IPv6 字面量字符：字母数字点横线冒号方括号
-    for ch in s:
-        if not (ch.isalnum() or ch in '.-_:[]'):
-            return ''
-    if ' ' in s or '\t' in s:
-        return ''
-    return s
-
-
-def _clean_token(v):
-    """token：限长去首尾空白；None/非 str → ''。"""
-    if not isinstance(v, str):
-        return ''
-    s = v.strip()
-    if len(s) > TOKEN_MAX:
-        return ''
-    return s
-
-
-def _clean_port(v, default):
-    """端口字段：合法 int 1-65535 原样；否则回退 default。"""
-    if _is_port(v):
-        return int(v)
     try:
-        # 容忍 JSON 里的数字字符串（手编辑友好）
-        n = int(str(v).strip())
-        if 1 <= n <= 65535:
-            return n
-    except Exception:
-        pass
-    return int(default)
+        u = urlsplit(value)
+        if (u.scheme != 'http' or not u.hostname or u.username is not None or u.password is not None
+                or u.path not in ('', '/') or u.query or u.fragment
+                or not re.fullmatch(r'[A-Za-z0-9.\[\]:_-]+', u.netloc)):
+            return ''
+        port = u.port if u.port is not None else 80
+        if not 1 <= port <= 65535:
+            return ''
+        host = u.hostname.lower()
+        if ':' in host:
+            host = '[' + host + ']'
+        return 'http://' + host + ((':' + str(port)) if port != 80 else '')
+    except ValueError:
+        return ''
 
 
-def sanitize(d):
-    """把任意 dict 收敛成规范化配置 dict（未知键丢弃，非法字段回退默认）。
-
-    返回 {'host','tunnel_port','public_port','token'}；token 保留原始大小写
-    （密钥区分大小写），只做限长。
-    """
+def sanitize(data):
     out = dict(DEFAULTS)
-    if not isinstance(d, dict):
+    if not isinstance(data, dict):
         return out
-    h = _clean_host(d.get('host'))
-    if h:
-        out['host'] = h
-    out['tunnel_port'] = _clean_port(d.get('tunnel_port'), DEFAULTS['tunnel_port'])
-    out['public_port'] = _clean_port(d.get('public_port'), DEFAULTS['public_port'])
-    out['token'] = _clean_token(d.get('token'))
+    legacy = ''
+    if 'url' not in data and isinstance(data.get('host'), str) and data['host']:
+        legacy = 'http://%s:%s' % (data['host'], data.get('public_port', 47961))
+    out['url'] = normalize_url(data.get('url', legacy))
+    token = data.get('token', '')
+    if isinstance(token, str) and len(token.strip()) <= TOKEN_MAX and all(33 <= ord(c) <= 126 for c in token.strip()):
+        out['token'] = token.strip()
+    for key, limit in (('username', 64), ('password', 128), ('device_name', 64)):
+        value = data.get(key, '')
+        if isinstance(value, str) and len(value) <= limit:
+            try:
+                value.encode('utf-8')
+            except UnicodeError:
+                continue
+            out[key] = value
+    for key in ('device_id', 'device_key'):
+        value = data.get(key, '')
+        if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_-]{16,128}', value):
+            out[key] = value
     return out
 
 
 def load(kimi_home):
-    """读 relay.json；不存在/损坏/非 dict → 全部默认值。字段级回退见 sanitize。"""
-    try:
-        with open(config_path(kimi_home), encoding='utf-8') as f:
-            d = json.load(f)
-    except Exception:
-        d = {}
-    return sanitize(d)
-
-
-def safe_write(path, text):
-    """原子写：先写 <path>.tmp 再 os.replace；失败静默（同 service.safe_write）。"""
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            f.write(text)
-        for _ in range(2):
-            try:
-                os.replace(tmp, path)
-                break
-            except OSError:
-                time.sleep(0.05)
-    except Exception:
-        pass
+    return sanitize(mobile_auth._load(kimi_home, 'relay.json'))
 
 
 def save(kimi_home, cfg):
-    """校验后落盘。cfg 经 sanitize 收敛；返回落盘的规范化 dict。"""
     cfg = sanitize(cfg)
-    safe_write(config_path(kimi_home), json.dumps(cfg, ensure_ascii=False, indent=2))
+    if not mobile_auth._save(kimi_home, 'relay.json', cfg):
+        raise ValueError('中继配置保存失败，请检查目录权限')
     return cfg
 
 
+def bound(cfg):
+    return bool(cfg['url'] and cfg['username'] and cfg['password'] and cfg['device_id'] and cfg['device_key'])
+
+
 def redacted(cfg):
-    """API 回显用：永不回显 token 明文，只给 token_set。"""
     cfg = sanitize(cfg)
-    return {
-        'host': cfg['host'],
-        'tunnel_port': cfg['tunnel_port'],
-        'public_port': cfg['public_port'],
-        'token_set': bool(cfg['token']),
-    }
+    return {'url': cfg['url'], 'token_set': bool(cfg['token']),
+            'username': cfg['username'], 'device_name': cfg['device_name'],
+            'bound': bound(cfg)}
 
 
 def public_origin(cfg):
-    """规范化配置 → 公网 origin（'http://<host>:<public_port>'）。"""
-    cfg = sanitize(cfg)
-    return 'http://%s:%d' % (cfg['host'], cfg['public_port'])
+    return sanitize(cfg)['url']
 
 
 def public_host_header(cfg):
-    """规范化配置 → 'host:public_port'（桥 Host/Origin 校验用）。"""
-    cfg = sanitize(cfg)
-    return '%s:%d' % (cfg['host'], cfg['public_port'])
+    return urlsplit(public_origin(cfg)).netloc
+
+
+def request(cfg, path, body):
+    u = urlsplit(cfg['url'])
+    if not u.hostname:
+        raise ValueError('请先保存服务器地址')
+    conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=30)
+    try:
+        conn.request('POST', path, json.dumps(body, ensure_ascii=False).encode('utf-8'),
+                     {'Content-Type': 'application/json', 'Origin': cfg['url'],
+                      'X-Relay-Token': cfg['token']})
+        resp = conn.getresponse()
+        raw = resp.read(16385)
+        if len(raw) > 16384:
+            raise ValueError('服务器返回内容过大')
+        try:
+            result = json.loads(raw.decode('utf-8'))
+        except (ValueError, UnicodeError):
+            raise ValueError('服务器未提供新版账号接口，请同步升级中继服务器') from None
+        if not isinstance(result, dict):
+            raise ValueError('服务器返回格式错误')
+        if resp.status != 200:
+            errors = {'准入密钥错误', '账号已存在，请选择登录已有账号', '账号或密码错误',
+                      '设备不存在', '设备未绑定或凭据已失效', '尝试过于频繁，请两分钟后重试'}
+            error = result.get('error')
+            raise ValueError(error if isinstance(error, str) and error in errors
+                             else '注册或登录失败，请检查账号密码和服务器版本')
+        return result
+    except (OSError, http.client.HTTPException):
+        raise ValueError('连接中继服务器失败，请检查地址、端口和网络') from None
+    finally:
+        conn.close()
+
+
+def bind(kimi_home, username, password, device_name, register=False):
+    cfg = load(kimi_home)
+    if not cfg['url'] or not cfg['token']:
+        raise ValueError('请先保存服务器地址和准入密钥')
+    if not isinstance(username, str) or not re.fullmatch(r'[A-Za-z0-9_.@-]{1,64}', username):
+        raise ValueError('账号需为 1-64 位字母、数字或 _.@-')
+    if not isinstance(password, str) or not 1 <= len(password) <= 128:
+        raise ValueError('密码需为 1-128 个字符')
+    if not isinstance(device_name, str) or not 1 <= len(device_name.strip()) <= 64:
+        raise ValueError('电脑名称需为 1-64 个字符')
+    if cfg['device_id'] and cfg['username'] != username:
+        raise ValueError('请先解除原账号的本机绑定，再绑定其他账号')
+    result = request(cfg, '/api/relay/bind', {
+        'username': username, 'password': password, 'device_name': device_name.strip(),
+        'register': register, 'device_id': cfg['device_id'], 'device_key': cfg['device_key']})
+    if result.get('protocol') != '2':
+        raise ValueError('中继协议不兼容，请同步升级服务器')
+    nxt = sanitize(dict(cfg, username=username, password=password,
+                        device_name=device_name.strip(), device_id=result.get('device_id'),
+                        device_key=result.get('device_key')))
+    if not bound(nxt):
+        raise ValueError('服务器返回的设备凭据无效')
+    try:
+        save(kimi_home, nxt)
+    except ValueError:
+        raise ValueError('服务器已绑定，但本机凭据保存失败；请检查权限后从服务器网页解除此次绑定并重试') from None
+    return redacted(nxt)
+
+
+def unbind(kimi_home):
+    cfg = load(kimi_home)
+    if cfg['device_id'] and cfg['device_key']:
+        try:
+            request(cfg, '/api/relay/unbind-device', {'device_id': cfg['device_id'], 'device_key': cfg['device_key']})
+        except ValueError as exc:
+            if str(exc) != '设备未绑定或凭据已失效':
+                raise
+    cfg.update(username='', password='', device_id='', device_key='', device_name='')
+    return redacted(save(kimi_home, cfg))

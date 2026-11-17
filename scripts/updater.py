@@ -80,6 +80,7 @@ MOBILE_RUNTIME_GROUP = frozenset((
     'scripts/relay_config.py',
     'scripts/relay_server.py',
     'assets/kimi-mobile-api.js',
+    'assets/kimi-remote-widget.js',
 ))
 # 退出码：3 = 旧服务未退出，4 = 更新包损坏/应用失败，5 = 本地预览自保护，6 = 更新包不完整
 GUARD_LOCAL_PREVIEW = 5

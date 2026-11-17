@@ -1,737 +1,764 @@
 # -*- coding: utf-8 -*-
-"""
-Kimi Code 用量面板 · 私人测试用公网中继（VPS 侧，纯标准库，Python>=3.8）
-
-拓扑：
-  手机浏览器 --HTTP/WS--> 公网口 :<public_port> --WS 帧--> worker 隧道
-  worker --ws--> 隧道注册口 :<listen_port>（X-Relay-Token 共享密钥）
-
-用法（CLI 与 worker 侧 relay.json 对应，默认值即未配置回退）：
-  python3 relay_server.py --public-host <host:port>
-                          [--tunnel-port 48213] [--public-port 47961]
-                          [--token <共享密钥>]
-  --tunnel-port  worker 隧道注册口（默认 48213，worker relay.json 的 tunnel_port）
-  --public-port  手机公网口（默认 47961，worker relay.json 的 public_port）
-  --public-host  注册回执里 origin 的 host:port（**必填**，也可经环境变量
-                 PUBLIC_HOST 提供；缺省直接报错退出——不默认任何具体地址。
-                 须与 worker 桥白名单一致——worker 用 relay.json host:public_port）
-  --token        X-Relay-Token 共享密钥（默认空 = 不校验；worker 用 relay.json token）
-
-隧道注册口：worker 以 WebSocket 连到 /relay/register（路径固定），携带
-X-Relay-Token（共享密钥，经环境变量 RELAY_TOKEN 注入，可经命令行参数覆盖）。
-握手成功后回送 {type:'registered', tunnel_id, origin}；之后 worker 经该 WS
-收/发「请求帧」与「WS 数据帧」，断连即清除隧道。
-
-公网口：手机请求按 /t/<tunnel_id>/<rest> 路径寻址隧道。
-  - 普通 HTTP：组装 {type:'http', id, method, path, headers, body(b64)} 推给
-    worker，等待 {type:'http_resp', id, status, headers, body(b64)} 回写。
-  - WebSocket 升级（仅 /mobile/ws 等路径，由 worker 桥自己裁决）：服务端与手机
-    完成 RFC6455 握手后，把帧原样封进 {type:'ws'} 消息与 worker 双向互转。
-
-第一阶段只做 HTTP（ws:// + http://），无 TLS。所有密钥/tunnel_id 只进日志
-前缀，绝不回显密钥本体。本模块只依赖 Python>=3.8 标准库，不装任何第三方。
-"""
+"""私人 HTTP/WS 中继：单端口账号登录、设备绑定及请求转发（Python>=3.8）。"""
+import argparse
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import logging
+import os
+import re
 import secrets
+import sqlite3
 import struct
-import sys
 import time
-from urllib.parse import unquote
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
-# ---------------- 配置 ----------------
 LISTEN_HOST = '0.0.0.0'
-TUNNEL_PORT = 48213         # worker 隧道注册口（ws://<vps>:<TUNNEL_PORT>/relay/register）
-PUBLIC_PORT = 47961         # 手机公网口（http://<vps>:<PUBLIC_PORT>/t/<id>/...）
-# 注册回执 origin 的 host:port（worker 桥按它做 Host/Origin 校验——必须与
-# worker relay.json 的 host:public_port 一致；无内置默认，由 main() 强制要求
-# --public-host 或 PUBLIC_HOST 环境变量提供）。
-PUBLIC_HOST_HEADER = ''
-
-MAX_HTTP_BODY = 32 * 1024 * 1024     # 与桥 PROXY_MAX_REQUEST_BODY 对齐
-MAX_WS_MESSAGE = 4 * 1024 * 1024     # 与桥 _WS_MAX_MESSAGE 对齐（手机侧 WS 帧上限）
-# 隧道（worker<->VPS）单帧上限。帧里是 base64 JSON，体积约为原始的 1.34 倍：
-# 桥 PROXY_MAX_RESPONSE_BODY=128MB → 约 172MB。旧版误用 MAX_WS_MESSAGE(4MB)，
-# SPA 主包 3.5MB → 隧道帧 4.7MB 超限 → 整条隧道被判违例拆掉 → 手机一连就断。
+PUBLIC_PORT = 47961
+MAX_HTTP_BODY = 32 * 1024 * 1024
+MAX_WS_MESSAGE = 4 * 1024 * 1024
 TUNNEL_MAX_FRAME = 192 * 1024 * 1024
-HTTP_TIMEOUT = 60.0          # HTTP 请求在隧道内的等待上限
-TUNNEL_IDLE_CLOSE = 90.0     # 隧道 WS 读空闲上限（worker 有心跳）
 HEADER_MAX = 32 * 1024
-RECONNECT_WAIT = 10.0        # 隧道重连空档内，公网请求最多等它回来的秒数
-RELAY_COOKIE = 'kimi_relay_tid'   # 根路径请求的隧道归属（访问 /t/<tid>/ 时下发）
+HTTP_TIMEOUT = 60.0
+SESSION_AGE = 604800
+SESSION_COOKIE = 'kimi_relay_session'
 WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
-_TOK_ID_RE = frozenset('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-')
-
+PBKDF_ROUNDS = 600000
+PROTOCOL = '2'
+TUNNELS = {}
+STORE = None
+ADMISSION_TOKEN = ''
+FAILURES = {}
 log = logging.getLogger('relay_server')
 
 
-def _tok_ok(s, lo=1, hi=64):
-    return isinstance(s, str) and lo <= len(s) <= hi and all(c in _TOK_ID_RE for c in s)
+def _tok_ok(value, lo=16, hi=128):
+    return isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_-]{%d,%d}' % (lo, hi), value) is not None
 
 
-# ---------------- WebSocket 帧（RFC6455，纯标准库） ----------------
-def _xor_mask(data, mask):
-    """RFC6455 掩码：大整数一次异或，MB 级帧比逐字节生成器快两个数量级。"""
-    n = len(data)
-    if not n:
-        return b''
-    m = (bytes(mask) * (n // 4 + 1))[:n]
-    return (int.from_bytes(data, 'big') ^ int.from_bytes(m, 'big')).to_bytes(n, 'big')
+def _digest(value):
+    return hashlib.sha256(value.encode('utf-8')).hexdigest()
 
 
-def ws_frame(opcode, payload, mask_key=None):
-    """opcode: 0/1/2/8/9/10；mask_key=None 表示不掩码（服务端侧）。"""
-    b0 = 0x80 | opcode
-    ln = len(payload)
-    if ln < 126:
-        head = bytes([b0, ln])
-    elif ln < 65536:
-        head = bytes([b0, 126]) + struct.pack('>H', ln)
-    else:
-        head = bytes([b0, 127]) + struct.pack('>Q', ln)
-    if mask_key is None:
-        return head + payload
-    return head + mask_key + _xor_mask(payload, mask_key)
+def _password_hash(password, salt):
+    return hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), bytes.fromhex(salt), PBKDF_ROUNDS).hex()
 
 
-async def ws_read_frame(reader, masked_expected, max_len=MAX_WS_MESSAGE):
-    """读一帧；返回 (fin, opcode, payload) 或 None（连接不可用/协议违例）。"""
-    try:
-        head = await asyncio.wait_for(reader.readexactly(2), timeout=TUNNEL_IDLE_CLOSE)
-    except Exception:
-        return None
-    b0, b1 = head[0], head[1]
-    fin = bool(b0 & 0x80)
-    opcode = b0 & 0x0F
-    masked = bool(b1 & 0x80)
-    if b0 & 0x70 or masked != masked_expected or opcode not in (0, 1, 2, 8, 9, 10):
-        return None
-    ln = b1 & 0x7F
-    if opcode >= 8 and (not fin or ln > 125):
-        return None
-    if ln == 126:
-        ext = await _read_n(reader, 2)
-        if ext is None:
-            return None
-        ln = struct.unpack('>H', ext)[0]
-    elif ln == 127:
-        ext = await _read_n(reader, 8)
-        if ext is None:
-            return None
-        ln = struct.unpack('>Q', ext)[0]
-        if ln < 65536:
-            return None
-    if ln > max_len:
-        return None
-    mask = None
-    if masked:
-        mask = await _read_n(reader, 4)
-        if mask is None:
-            return None
-    payload = await _read_n(reader, ln)
-    if payload is None:
-        return None
-    if mask is not None:
-        payload = _xor_mask(payload, mask)
-    return fin, opcode, payload
+class AccountStore:
+    def __init__(self, path):
+        folder = os.path.dirname(os.path.abspath(path))
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        self.db = sqlite3.connect(path)
+        os.chmod(path, 0o600)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute('PRAGMA foreign_keys=ON')
+        self.db.executescript('''
+            CREATE TABLE IF NOT EXISTS accounts (
+                id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL,
+                salt TEXT NOT NULL, password_hash TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1);
+            CREATE TABLE IF NOT EXISTS devices (
+                id TEXT PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id),
+                name TEXT NOT NULL, secret_hash TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS sessions (
+                id_hash TEXT PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id),
+                version INTEGER NOT NULL, expires REAL NOT NULL);
+        ''')
+        self.db.commit()
 
-
-async def _read_n(reader, n):
-    try:
-        return await asyncio.wait_for(reader.readexactly(n), timeout=TUNNEL_IDLE_CLOSE)
-    except Exception:
-        return None
-
-
-def ws_client_frame(opcode, payload):
-    """worker 侧发帧：必须掩码（RFC6455 客户端语义）。"""
-    return ws_frame(opcode, payload, mask_key=secrets.token_bytes(4))
-
-
-# ---------------- HTTP 头解析（极简、有界） ----------------
-async def read_http_head(reader, max_bytes=HEADER_MAX):
-    """读到 \r\n\r\n 为止；返回 (head_bytes, rest_bytes) 或 None。"""
-    buf = bytearray()
-    while b'\r\n\r\n' not in buf:
-        try:
-            chunk = await asyncio.wait_for(reader.read(4096), timeout=30.0)
-        except Exception:
-            return None
-        if not chunk:
-            return None
-        buf += chunk
-        if len(buf) > max_bytes:
-            return None
-    head, rest = bytes(buf).split(b'\r\n\r\n', 1)
-    return head, rest
-
-
-def parse_request_head(head):
-    """返回 (method, raw_path, version, headers_list[(name_lower, value)])。失败 None。"""
-    try:
-        lines = head.split(b'\r\n')
-        first = lines[0].split(b' ', 2)
-        if len(first) != 3:
-            return None
-        method = first[0].decode('latin-1')
-        raw_path = first[1].decode('latin-1')
-        if not raw_path.startswith('/') or raw_path.startswith('//'):
-            return None
-        headers = []
-        for line in lines[1:]:
-            name, sep, value = line.partition(b':')
-            if not sep or not name:
-                return None
-            headers.append((name.decode('latin-1').strip().lower(),
-                            value.decode('latin-1').strip()))
-        return method, raw_path, 'HTTP/' + first[2].decode('latin-1'), headers
-    except Exception:
-        return None
-
-
-def headers_map(headers):
-    out = {}
-    for k, v in headers:
-        if k in out:
-            out[k] = out[k] + ', ' + v
-        else:
-            out[k] = v
-    return out
-
-
-# ---------------- 隧道注册口 ----------------
-class Tunnel:
-    """一条 worker 隧道：tunnels[tunnel_id] = Tunnel。"""
-    def __init__(self, tid, reader, writer):
-        self.id = tid
-        self.reader = reader
-        self.writer = writer
-        self.pending = {}          # http id -> asyncio.Future
-        self.ws_subs = {}          # ws channel id -> PhoneWS
-        self.alive = True
-        self.lock = asyncio.Lock() # 写锁：多并发响应帧不乱序
-
-
-TUNNELS = {}
-# tid 墓碑：刚注销的 tunnel_id -> 过期 epoch。worker 掉线重连用
-# X-Relay-Resume 复用旧 tid，让已下发给手机的 /t/<tid>/ 配对 URL 在
-# 重连后继续有效——否则手机会收到 tunnel not found。
-RECENT_TIDS = {}
-RECENT_TTL = 600.0      # 墓碑保留时长（秒）
-RECENT_MAX = 512        # 墓碑表上限，防内存膨胀
-
-
-def _recent_remember(tid):
-    if not _tok_ok(tid, 4, 32):
-        return
-    now = time.time()
-    # 先清过期，再记
-    for k in [k for k, exp in RECENT_TIDS.items() if exp <= now]:
-        RECENT_TIDS.pop(k, None)
-    while len(RECENT_TIDS) >= RECENT_MAX:
-        oldest = min(RECENT_TIDS, key=lambda k: RECENT_TIDS[k])
-        RECENT_TIDS.pop(oldest, None)
-    RECENT_TIDS[tid] = now + RECENT_TTL
-
-
-def _recent_valid(tid):
-    """tid 是否可复用：仍活着，或在墓碑表未过期。"""
-    if not _tok_ok(tid, 4, 32):
-        return False
-    if tid in TUNNELS:
-        return True
-    exp = RECENT_TIDS.get(tid)
-    return exp is not None and exp > time.time()
-
-
-async def tunnel_send(tun, msg):
-    data = json.dumps(msg, ensure_ascii=False).encode('utf-8')
-    async with tun.lock:
-        try:
-            tun.writer.write(ws_frame(1, data))
-            await tun.writer.drain()
-            return True
-        except Exception:
-            return False
-
-
-async def relay_register(reader, writer, token):
-    """处理一条到 /relay/register 的 WS：校验 X-Relay-Token，完成握手，注册隧道。"""
-    head_rest = await read_http_head(reader)
-    if head_rest is None:
-        writer.close()
-        return
-    head, _rest = head_rest
-    parsed = parse_request_head(head)
-    if parsed is None:
-        await _http_resp(writer, 400, 'bad request')
-        return
-    method, raw_path, _ver, headers = parsed
-    hmap = headers_map(headers)
-    if method != 'GET' or raw_path.split('?')[0] != '/relay/register':
-        await _http_resp(writer, 404, 'not found')
-        return
-    if token and not secrets.compare_digest(hmap.get('x-relay-token') or '', token):
-        await _http_resp(writer, 403, 'forbidden')
-        return
-    if (hmap.get('upgrade') or '').lower() != 'websocket':
-        await _http_resp(writer, 400, 'upgrade required')
-        return
-    key = hmap.get('sec-websocket-key')
-    if not key or len(key) > 64:
-        await _http_resp(writer, 400, 'bad ws key')
-        return
-    accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode('ascii')).digest())
-    writer.write((b'HTTP/1.1 101 Switching Protocols\r\n'
-                  b'Upgrade: websocket\r\n'
-                  b'Connection: Upgrade\r\n'
-                  b'Sec-WebSocket-Accept: ' + accept + b'\r\n\r\n'))
-    try:
-        await writer.drain()
-    except Exception:
-        return
-
-    # tid 粘滞：worker 掉线重连或本机重启后带 X-Relay-Resume=<旧 tid> 注册，
-    # 只要该 tid 当前没有在线隧道就复用（不再要求仍在墓碑表内；调用方已通过
-    # 共享 token 校验），保证手机端保存的 /t/<tid>/ 地址在本机重启后依然有效。
-    # 该 tid 仍在线时不抢占，签发新 tid。
-    resume = hmap.get('x-relay-resume') or ''
-    if _tok_ok(resume, 4, 32) and resume not in TUNNELS:
-        tid = resume
-    else:
-        tid = secrets.token_urlsafe(8)
-    origin = 'http://%s/t/%s' % (PUBLIC_HOST_HEADER, tid)
-    tun = Tunnel(tid, reader, writer)
-    TUNNELS[tid] = tun
-    RECENT_TIDS.pop(tid, None)   # 复用后从墓碑移除（它现在又活了）
-    try:
-        if not await tunnel_send(tun, {'type': 'registered', 'tunnel_id': tid, 'origin': origin}):
-            return
-        log.info('tunnel registered: %s', tid)
-        # 主读循环：worker 的帧 = 响应 / ws 数据 / pong
-        while True:
-            frame = await ws_read_frame(reader, masked_expected=True,
-                                        max_len=TUNNEL_MAX_FRAME)
-            if frame is None:
-                break
-            fin, opcode, payload = frame
-            if opcode == 8:
-                break
-            if opcode == 9:      # ping → pong
-                try:
-                    async with tun.lock:
-                        tun.writer.write(ws_frame(10, payload))
-                        await tun.writer.drain()
-                except Exception:
-                    break
-                continue
-            if opcode != 1:
-                continue
+    async def authenticate(self, username, password, create=False):
+        if (not isinstance(username, str) or not re.fullmatch(r'[A-Za-z0-9_.@-]{1,64}', username)
+                or not isinstance(password, str) or not 1 <= len(password) <= 128):
+            raise ValueError('账号或密码格式无效')
+        row = self.db.execute('SELECT * FROM accounts WHERE username=?', (username,)).fetchone()
+        salt = row['salt'] if row else secrets.token_hex(16)
+        value = await asyncio.get_running_loop().run_in_executor(None, _password_hash, password, salt)
+        if create:
+            if row:
+                raise ValueError('账号已存在，请选择登录已有账号')
             try:
-                msg = json.loads(payload.decode('utf-8'))
-            except Exception:
-                continue
-            if not isinstance(msg, dict):
-                continue
-            mtype = msg.get('type')
-            if mtype == 'http_resp':
-                fut = tun.pending.pop(msg.get('id'), None)
-                if fut is not None and not fut.done():
-                    fut.set_result(msg)
-            elif mtype in ('ws_data', 'ws_close'):
-                sub = tun.ws_subs.get(msg.get('id'))
-                if sub is not None:
-                    await sub.on_tunnel_frame(msg)
-            elif mtype == 'pong':
-                continue
-    finally:
-        tun.alive = False
-        if TUNNELS.get(tid) is tun:
-            TUNNELS.pop(tid, None)
-        _recent_remember(tid)   # 入墓碑：重连可 X-Relay-Resume 复用
-        for fut in tun.pending.values():
-            if not fut.done():
-                fut.cancel()
-        for sub in list(tun.ws_subs.values()):
-            await sub.close()
-        try:
-            writer.close()
-        except Exception:
-            pass
-        log.info('tunnel unregistered: %s', tid)
+                with self.db:
+                    self.db.execute('INSERT INTO accounts(username,salt,password_hash) VALUES(?,?,?)',
+                                    (username, salt, value))
+            except sqlite3.IntegrityError:
+                raise ValueError('账号已存在，请选择登录已有账号') from None
+            return self.db.execute('SELECT * FROM accounts WHERE username=?', (username,)).fetchone()
+        if row is None or not hmac.compare_digest(row['password_hash'], value):
+            raise ValueError('账号或密码错误')
+        current = self.db.execute('SELECT * FROM accounts WHERE id=?', (row['id'],)).fetchone()
+        if current['version'] != row['version']:
+            raise ValueError('密码已修改，请重新登录')
+        return current
 
-
-def _root_tid(hmap):
-    """根路径请求的隧道归属：Cookie → Referer；都没有返回 ''。"""
-    for part in (hmap.get('cookie') or '').split(';'):
-        k, sep, v = part.strip().partition('=')
-        if sep and k == RELAY_COOKIE and _tok_ok(v.strip(), 4, 32):
-            return v.strip()
-    ref = hmap.get('referer') or ''
-    i = ref.find('/t/')
-    if i >= 0:
-        cand = ref[i + 3:].split('/', 1)[0].split('?', 1)[0].split('#', 1)[0]
-        if _tok_ok(cand, 4, 32):
-            return cand
-    return ''
-
-
-async def _await_tunnel(tid):
-    """取活隧道；tid 在墓碑表（worker 正在重连）时最多等 RECONNECT_WAIT 秒。"""
-    tun = TUNNELS.get(tid)
-    if tun is not None and tun.alive:
-        return tun
-    if not _recent_valid(tid):
-        return None
-    deadline = time.monotonic() + RECONNECT_WAIT
-    while time.monotonic() < deadline:
-        await asyncio.sleep(0.25)
-        tun = TUNNELS.get(tid)
-        if tun is not None and tun.alive:
-            return tun
-        if not _recent_valid(tid):
+    def session(self, sid):
+        if not _tok_ok(sid):
             return None
-    return None
+        return self.db.execute('''SELECT a.*,s.expires FROM sessions s JOIN accounts a
+            ON a.id=s.account_id WHERE s.id_hash=? AND s.expires>? AND s.version=a.version''',
+                               (_digest(sid), time.time())).fetchone()
+
+    def new_session(self, account):
+        sid = secrets.token_urlsafe(32)
+        with self.db:
+            self.db.execute('DELETE FROM sessions WHERE expires<=?', (time.time(),))
+            self.db.execute('''DELETE FROM sessions WHERE id_hash IN
+                (SELECT id_hash FROM sessions WHERE account_id=? ORDER BY expires DESC LIMIT -1 OFFSET 7)''',
+                            (account['id'],))
+            self.db.execute('INSERT INTO sessions VALUES(?,?,?,?)',
+                            (_digest(sid), account['id'], account['version'], time.time() + SESSION_AGE))
+        return sid
+
+    def device(self, tid, account_id=None):
+        row = self.db.execute('SELECT * FROM devices WHERE id=?', (tid,)).fetchone()
+        return row if row and (account_id is None or row['account_id'] == account_id) else None
 
 
-async def _tunnel_missing(writer, tid):
-    if _recent_valid(tid):
-        await _http_resp(writer, 503, 'tunnel reconnecting')
-    else:
-        await _http_resp(writer, 404, 'tunnel not found')
+def _cookie(headers, name):
+    values = [part.strip().partition('=')[2] for part in headers.get('cookie', '').split(';')
+              if part.strip().partition('=')[0] == name]
+    return values[0] if len(values) == 1 else ''
 
 
-async def _http_resp(writer, code, text):
-    body = text.encode('utf-8')
-    writer.write((b'HTTP/1.1 %d\r\nContent-Type: text/plain; charset=utf-8\r\n'
-                  b'Content-Length: %d\r\nConnection: close\r\n\r\n%s')
-                 % (code, len(body), body))
+def _rate_ok(ip, username):
+    now = time.time()
+    for key in [k for k, v in FAILURES.items() if v[1] <= now]:
+        FAILURES.pop(key, None)
+    keys = ('ip:' + ip, 'user:' + str(username)[:64])
+    return all(FAILURES.get(key, (0, 0))[0] < 10 for key in keys)
+
+
+def _rate_fail(ip, username):
+    now = time.time()
+    for key in ('ip:' + ip, 'user:' + str(username)[:64]):
+        count, expires = FAILURES.get(key, (0, now + 120))
+        FAILURES[key] = (count + 1, expires)
+    while len(FAILURES) > 2048:
+        FAILURES.pop(next(iter(FAILURES)))
+
+
+def ws_frame(opcode, payload=b'', fin=True):
+    size = len(payload)
+    head = bytes([(0x80 if fin else 0) | opcode])
+    if size < 126:
+        return head + bytes([size]) + payload
+    if size < 65536:
+        return head + b'\x7e' + struct.pack('>H', size) + payload
+    return head + b'\x7f' + struct.pack('>Q', size) + payload
+
+
+async def ws_read_frame(reader, max_len=MAX_WS_MESSAGE):
     try:
-        await writer.drain()
-    except Exception:
-        pass
+        head = await asyncio.wait_for(reader.readexactly(2), 90)
+        fin, opcode = bool(head[0] & 128), head[0] & 15
+        size = head[1] & 127
+        if head[0] & 112 or not head[1] & 128 or opcode not in (0, 1, 2, 8, 9, 10):
+            return None
+        if opcode >= 8 and (not fin or size > 125):
+            return None
+        if size == 126:
+            size = struct.unpack('>H', await asyncio.wait_for(reader.readexactly(2), 30))[0]
+            if size < 126:
+                return None
+        elif size == 127:
+            size = struct.unpack('>Q', await asyncio.wait_for(reader.readexactly(8), 30))[0]
+            if size < 65536:
+                return None
+        if size > max_len:
+            return None
+        mask = await asyncio.wait_for(reader.readexactly(4), 30)
+        payload = await asyncio.wait_for(reader.readexactly(size), 120)
+        repeated = (mask * (size // 4 + 1))[:size]
+        payload = (int.from_bytes(payload, 'big') ^ int.from_bytes(repeated, 'big')).to_bytes(size, 'big')
+        return fin, opcode, payload
+    except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+        return None
+
+
+async def read_request(reader):
+    raw = await asyncio.wait_for(reader.readuntil(b'\r\n\r\n'), 30)
+    if len(raw) > HEADER_MAX:
+        raise ValueError('请求头过大')
+    lines = raw[:-4].decode('latin-1').split('\r\n')
+    first = lines[0].split(' ')
+    if len(first) != 3 or first[2] != 'HTTP/1.1' or not first[1].startswith('/') or first[1].startswith('//'):
+        raise ValueError('请求格式错误')
+    headers = {}
+    for line in lines[1:]:
+        key, sep, value = line.partition(':')
+        key = key.lower()
+        value = value.strip()
+        if not sep or not re.fullmatch(r'[a-z0-9!#$%&\'*+.^_`|~-]+', key) or any(ord(c) < 32 for c in value):
+            raise ValueError('请求头格式错误')
+        if key in headers:
+            raise ValueError('重复请求头')
+        headers[key] = value
+    if 'transfer-encoding' in headers or not re.fullmatch(r'\d{1,10}', headers.get('content-length', '0')):
+        raise ValueError('请求体格式错误')
+    size = int(headers.get('content-length', '0'))
+    limit = 8192 if first[1].startswith('/api/relay/') else MAX_HTTP_BODY
+    if size > limit:
+        raise ValueError('请求体过大')
+    body = await asyncio.wait_for(reader.readexactly(size), 120) if size else b''
+    return first[0], first[1], headers, body
+
+
+async def response(writer, code, body, content_type='application/json; charset=utf-8', headers=()):
+    if isinstance(body, dict):
+        body = json.dumps(body, ensure_ascii=False).encode('utf-8')
+    elif isinstance(body, str):
+        body = body.encode('utf-8')
+    head = ('HTTP/1.1 %d\r\nContent-Type: %s\r\nContent-Length: %d\r\n'
+            'Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n'
+            'Referrer-Policy: no-referrer\r\nConnection: close\r\n' % (code, content_type, len(body)))
+    for key, value in headers:
+        if '\r' in value or '\n' in value:
+            continue
+        head += '%s: %s\r\n' % (key, value)
+    writer.write(head.encode('latin-1') + b'\r\n' + body)
+    await writer.drain()
     writer.close()
 
 
-# ---------------- 公网口 ----------------
-class PhoneWS:
-    """公网口上与手机浏览器的一条 WS：与隧道内 {id} 通道双向映射。"""
-    def __init__(self, tun, cid, reader, writer):
-        self.tun = tun
-        self.cid = cid
+async def redirect(writer, target):
+    await response(writer, 302, b'', headers=(('Location', target),))
+
+
+def _upgrade(headers):
+    return headers.get('upgrade', '').lower() == 'websocket' and 'upgrade' in {
+        x.strip().lower() for x in headers.get('connection', '').split(',')}
+
+
+async def handshake(writer, headers):
+    key = headers.get('sec-websocket-key', '')
+    try:
+        valid = len(base64.b64decode(key, validate=True)) == 16
+    except ValueError:
+        valid = False
+    if not _upgrade(headers) or headers.get('sec-websocket-version') != '13' or not valid:
+        raise ValueError('WebSocket 握手无效')
+    accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode('ascii')).digest()).decode('ascii')
+    out = 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n' % accept
+    proto = next((p.strip() for p in headers.get('sec-websocket-protocol', '').split(',')
+                  if re.fullmatch(r'kimi-code\.bearer\.[A-Za-z0-9_.~-]+', p.strip())), '')
+    if proto:
+        out += 'Sec-WebSocket-Protocol: %s\r\n' % proto
+    writer.write((out + '\r\n').encode('ascii'))
+    await writer.drain()
+
+
+class Tunnel:
+    def __init__(self, device, reader, writer, origin):
+        self.id = device['id']
+        self.account_id = device['account_id']
         self.reader = reader
         self.writer = writer
+        self.origin = origin
+        self.bridge_key = secrets.token_urlsafe(32)
+        self.pending = {}
+        self.channels = {}
+        self.lock = asyncio.Lock()
         self.alive = True
 
-    async def on_tunnel_frame(self, msg):
-        """worker 推来的 ws 数据帧 → 写回手机。"""
-        if not self.alive:
-            return
-        try:
-            if msg['type'] == 'ws_data':
-                opcode = int(msg.get('opcode', 1))
-                payload = base64.b64decode(msg.get('payload', ''))
-                self.writer.write(ws_frame(opcode, payload))
-                await self.writer.drain()
-            elif msg['type'] == 'ws_close':
-                await self.close()
-        except Exception:
-            await self.close()
+    async def send(self, msg):
+        async with self.lock:
+            if not self.alive:
+                return False
+            try:
+                self.writer.write(ws_frame(1, json.dumps(msg, ensure_ascii=False).encode('utf-8')))
+                await asyncio.wait_for(self.writer.drain(), HTTP_TIMEOUT)
+                return True
+            except (OSError, asyncio.TimeoutError):
+                return False
 
     async def close(self):
-        if not self.alive:
-            return
         self.alive = False
-        try:
-            self.writer.write(ws_frame(8, b''))
-            await self.writer.drain()
-        except Exception:
-            pass
-        try:
-            self.writer.close()
-        except Exception:
-            pass
-        # 通知 worker 关侧
-        try:
-            await tunnel_send(self.tun, {'type': 'ws_close', 'id': self.cid})
-        except Exception:
-            pass
+        self.writer.close()
+        for fut in list(self.pending.values()):
+            if not fut.done():
+                fut.cancel()
+        for channel in list(self.channels.values()):
+            if not channel['ready'].done():
+                channel['ready'].set_result(False)
+            channel['active'].set()
+            channel['writer'].close()
 
 
-async def phone_ws_pump(tun, cid, reader, writer):
-    """手机→隧道的 WS 帧读循环（在 handshake 之后调用）。"""
-    sub = PhoneWS(tun, cid, reader, writer)
-    tun.ws_subs[cid] = sub
+async def relay_register(reader, writer, headers, origin):
+    if headers.get('x-relay-protocol') != PROTOCOL:
+        await response(writer, 409, {'error': '中继协议不兼容，请同时升级服务器与本机插件'})
+        return
+    tid = headers.get('x-relay-device', '')
+    device = STORE.device(tid) if _tok_ok(tid) else None
+    secret = headers.get('x-relay-device-key', '')
+    if not device or not _tok_ok(secret) or not hmac.compare_digest(device['secret_hash'], _digest(secret)):
+        await response(writer, 403, {'error': '设备未绑定或凭据已失效'})
+        return
+    if tid in TUNNELS:
+        await response(writer, 409, {'error': '此设备已有在线连接'}, headers=(('X-Relay-Protocol', PROTOCOL),))
+        return
+    tun = Tunnel(device, reader, writer, origin)
+    TUNNELS[tid] = tun
     try:
-        while sub.alive and tun.alive:
-            frame = await ws_read_frame(reader, masked_expected=True)
+        await handshake(writer, headers)
+        if not await tun.send({'type': 'registered', 'protocol': PROTOCOL, 'tunnel_id': tid,
+                               'origin': origin, 'bridge_key': tun.bridge_key}):
+            return
+        log.info('device connected: %s', tid)
+        while tun.alive:
+            frame = await ws_read_frame(reader, TUNNEL_MAX_FRAME)
             if frame is None:
                 break
             fin, opcode, payload = frame
-            if opcode == 9:      # ping → pong
-                try:
-                    writer.write(ws_frame(10, payload))
-                    await writer.drain()
-                except Exception:
-                    break
-                continue
             if opcode == 8:
                 break
-            if opcode not in (0, 1, 2):
+            if opcode == 9:
+                async with tun.lock:
+                    writer.write(ws_frame(10, payload))
+                    await writer.drain()
                 continue
-            ok = await tunnel_send(tun, {'type': 'ws_data', 'id': cid, 'opcode': opcode,
-                                       'fin': fin, 'payload': base64.b64encode(payload).decode('ascii')})
-            if not ok:
+            if opcode == 10:
+                continue
+            if opcode != 1 or not fin:
+                break
+            msg = json.loads(payload.decode('utf-8'))
+            if not isinstance(msg, dict):
+                break
+            if msg.get('type') == 'http_resp':
+                fut = tun.pending.get(msg.get('id'))
+                if fut and not fut.done():
+                    fut.set_result(msg)
+            elif msg.get('type') in ('ws_ready', 'ws_data', 'ws_close'):
+                channel = tun.channels.get(msg.get('id'))
+                if not channel:
+                    continue
+                if msg['type'] == 'ws_ready':
+                    if not channel['ready'].done():
+                        channel['ready'].set_result(True)
+                elif msg['type'] == 'ws_close':
+                    if not channel['ready'].done():
+                        channel['ready'].set_result(False)
+                    else:
+                        channel['writer'].close()
+                else:
+                    await asyncio.wait_for(channel['active'].wait(), 25)
+                    if not STORE.session(channel['sid']) or not STORE.device(tid, tun.account_id):
+                        channel['writer'].close()
+                        continue
+                    opcode = int(msg.get('opcode', 1))
+                    if opcode not in (0, 1, 2, 8, 9, 10):
+                        break
+                    channel['writer'].write(ws_frame(opcode, base64.b64decode(msg.get('payload', ''), validate=True),
+                                                    msg.get('fin', True)))
+                    await channel['writer'].drain()
+    finally:
+        if TUNNELS.get(tid) is tun:
+            TUNNELS.pop(tid, None)
+        await tun.close()
+        log.info('device disconnected: %s', tid)
+
+
+def _forward_headers(headers, tun, sid, account):
+    out = {k: v for k, v in headers.items() if k not in (
+        'host', 'connection', 'content-length', 'cookie', 'authorization', 'upgrade',
+        'sec-websocket-key', 'sec-websocket-version', 'sec-websocket-extensions')
+        and not k.startswith(('x-relay-', 'x-forwarded-', 'cf-'))}
+    ticket = '%s.%d' % (sid, int(account['expires']))
+    signature = hmac.new(tun.bridge_key.encode('ascii'), ticket.encode('ascii'), hashlib.sha256).hexdigest()
+    out.update({'X-Relay-Authorization': ticket + '.' + signature, 'Accept-Encoding': 'identity'})
+    return out
+
+
+async def proxy_ws(tun, reader, writer, headers, inner, sid, account):
+    cid = secrets.token_urlsafe(16)
+    ready = asyncio.get_running_loop().create_future()
+    channel = {'writer': writer, 'sid': sid, 'ready': ready, 'active': asyncio.Event()}
+    tun.channels[cid] = channel
+    watcher = None
+
+    async def watch():
+        while tun.alive and not writer.is_closing():
+            await asyncio.sleep(1)
+            if not STORE.session(sid) or not STORE.device(tun.id, account['id']):
+                writer.close()
+                return
+
+    try:
+        if not await tun.send({'type': 'ws_open', 'id': cid, 'path': inner,
+                               'headers': _forward_headers(headers, tun, sid, account)}):
+            await response(writer, 503, {'error': '设备连接已断开'})
+            return
+        try:
+            accepted = await asyncio.wait_for(ready, 25)
+        except asyncio.TimeoutError:
+            accepted = False
+        if not accepted or not STORE.session(sid) or not STORE.device(tun.id, account['id']):
+            await response(writer, 502, {'error': '本机未接受 WebSocket 连接'})
+            return
+        await handshake(writer, headers)
+        channel['active'].set()
+        watcher = asyncio.create_task(watch())
+        while tun.alive and STORE.session(sid) and not writer.is_closing():
+            frame = await ws_read_frame(reader)
+            if frame is None:
+                break
+            fin, opcode, payload = frame
+            if not STORE.session(sid) or not STORE.device(tun.id, account['id']):
+                break
+            if opcode == 8:
+                break
+            if opcode == 9:
+                writer.write(ws_frame(10, payload))
+                await writer.drain()
+                continue
+            if opcode == 10:
+                continue
+            if not await tun.send({'type': 'ws_data', 'id': cid, 'opcode': opcode,
+                                   'fin': fin, 'payload': base64.b64encode(payload).decode('ascii')}):
                 break
     finally:
-        sub.alive = False
-        tun.ws_subs.pop(cid, None)
-        try:
-            writer.close()
-        except Exception:
-            pass
-        try:
-            await tunnel_send(tun, {'type': 'ws_close', 'id': cid})
-        except Exception:
-            pass
+        if watcher is not None:
+            watcher.cancel()
+        channel['active'].set()
+        tun.channels.pop(cid, None)
+        writer.close()
+        await tun.send({'type': 'ws_close', 'id': cid})
 
 
-def _is_upgrade(headers):
-    return 'upgrade' in {v.strip().lower() for v in headers_map(headers).get('connection', '').split(',')} \
-        and (headers_map(headers).get('upgrade') or '').lower() == 'websocket'
+def _rewrite_content(body, headers, tid, inner):
+    kind = next((str(v).lower() for k, v in headers if k.lower() == 'content-type'), '')
+    prefix = '/t/' + tid
+    if 'text/html' in kind and not inner.startswith(('/api/', '/assets/')):
+        text = body.decode('utf-8')
+        text = re.sub(r'((?:src|href)=[\"\'])/(?!/)', lambda m: m[1] + prefix + '/', text)
+        script = '<script>' + DEVICE_SCRIPT.replace('__DEVICE_ID__', json.dumps(tid)) + '</script>'
+        text = text.replace('<head>', '<head>' + script, 1) if '<head>' in text else script + text
+        return text.encode('utf-8')
+    if inner.startswith('/assets/') and any(x in kind for x in ('javascript', 'text/css')):
+        text = body.decode('utf-8')
+        text = re.sub(r'([\"\'`(])/(assets/)', lambda m: m[1] + prefix + '/' + m[2], text)
+        return text.encode('utf-8')
+    return body
+
+
+async def proxy_http(tun, writer, method, inner, headers, body, sid, account):
+    rid = secrets.token_urlsafe(16)
+    fut = asyncio.get_running_loop().create_future()
+    tun.pending[rid] = fut
+    try:
+        if not await tun.send({'type': 'http', 'id': rid, 'method': method, 'path': inner,
+                               'headers': _forward_headers(headers, tun, sid, account),
+                               'body': base64.b64encode(body).decode('ascii')}):
+            await response(writer, 503, {'error': '设备连接已断开'})
+            return
+        try:
+            result = await asyncio.wait_for(fut, HTTP_TIMEOUT)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            await response(writer, 503, {'error': '设备连接中断或请求超时'})
+            return
+        if not STORE.session(sid) or not STORE.device(tun.id, account['id']):
+            await response(writer, 401, {'error': '登录已失效'})
+            return
+        status = int(result.get('status', 502))
+        rheaders = result.get('headers', [])
+        payload = base64.b64decode(result.get('body', ''), validate=True)
+        if 300 <= status < 400:
+            location = next((v for k, v in rheaders if k.lower() == 'location'), '')
+            target = urlsplit(urljoin('/t/' + tun.id + inner, location))
+            if (not location or target.scheme or target.netloc
+                    or not target.path.startswith('/t/' + tun.id + '/')):
+                await response(writer, 502, {'error': '设备返回的跳转不被允许'})
+                return
+            await redirect(writer, target.geturl())
+            return
+        payload = _rewrite_content(payload, rheaders, tun.id, inner)
+        kept = [(k, v) for k, v in rheaders if k.lower() not in (
+            'connection', 'transfer-encoding', 'content-length', 'set-cookie', 'server', 'date',
+            'content-encoding', 'etag', 'cache-control', 'content-type')]
+        kind = next((v for k, v in rheaders if k.lower() == 'content-type'), 'application/octet-stream')
+        await response(writer, status, payload, kind, kept)
+    finally:
+        tun.pending.pop(rid, None)
+
+
+async def account_api(writer, path, method, headers, body, ip, account, sid):
+    if method == 'GET' and path == '/api/relay/me':
+        if not account:
+            await response(writer, 401, {'error': '请先登录'})
+            return
+        devices = STORE.db.execute('SELECT id,name FROM devices WHERE account_id=? ORDER BY rowid', (account['id'],))
+        await response(writer, 200, {'username': account['username'], 'devices': [
+            {'id': d['id'], 'name': d['name'], 'online': d['id'] in TUNNELS} for d in devices]})
+        return
+    if method != 'POST':
+        await response(writer, 404, {'error': '接口不存在'})
+        return
+    if len(body) > 8192:
+        raise ValueError('请求体过大')
+    data = json.loads(body.decode('utf-8'))
+    if not isinstance(data, dict):
+        raise ValueError('请求格式错误')
+    if path == '/api/relay/unbind-device':
+        tid, key = data.get('device_id', ''), data.get('device_key', '')
+        device = STORE.device(tid) if _tok_ok(tid) else None
+        if not device or not _tok_ok(key) or not hmac.compare_digest(device['secret_hash'], _digest(key)):
+            await response(writer, 403, {'error': '设备未绑定或凭据已失效'})
+            return
+        with STORE.db:
+            STORE.db.execute('DELETE FROM devices WHERE id=?', (tid,))
+        tun = TUNNELS.get(tid)
+        if tun:
+            await tun.close()
+        await response(writer, 200, {'ok': True})
+        return
+    if path in ('/api/relay/login', '/api/relay/bind'):
+        username = data.get('username')
+        if not _rate_ok(ip, username):
+            await response(writer, 429, {'error': '尝试过于频繁，请两分钟后重试'})
+            return
+        if path.endswith('/bind'):
+            token = headers.get('x-relay-token', '')
+            if not token or not hmac.compare_digest(token.encode('utf-8'), ADMISSION_TOKEN.encode('utf-8')):
+                _rate_fail(ip, username)
+                await response(writer, 403, {'error': '准入密钥错误'})
+                return
+        try:
+            name = data.get('device_name', '')
+            if path.endswith('/bind') and (not isinstance(name, str) or not 1 <= len(name.strip()) <= 64):
+                raise ValueError('电脑名称需为 1-64 个字符')
+            user = await STORE.authenticate(username, data.get('password'),
+                                             create=path.endswith('/bind') and data.get('register') is True)
+        except (ValueError, UnicodeError) as exc:
+            _rate_fail(ip, username)
+            errors = {'账号已存在，请选择登录已有账号', '账号或密码错误', '账号或密码格式无效',
+                      '电脑名称需为 1-64 个字符', '密码已修改，请重新登录'}
+            message = str(exc)
+            await response(writer, 400, {'error': message if message in errors else '账号或密码格式无效'})
+            return
+        if path.endswith('/bind'):
+            old_id, old_key = data.get('device_id', ''), data.get('device_key', '')
+            old = STORE.device(old_id, user['id']) if _tok_ok(old_id) else None
+            if old and _tok_ok(old_key) and hmac.compare_digest(old['secret_hash'], _digest(old_key)):
+                tid, secret = old_id, old_key
+                with STORE.db:
+                    STORE.db.execute('UPDATE devices SET name=? WHERE id=?', (name.strip(), tid))
+            else:
+                tid, secret = secrets.token_urlsafe(18), secrets.token_urlsafe(32)
+                with STORE.db:
+                    STORE.db.execute('INSERT INTO devices VALUES(?,?,?,?)', (tid, user['id'], name.strip(), _digest(secret)))
+            await response(writer, 200, {'device_id': tid, 'device_key': secret,
+                                         'username': user['username'], 'device_name': name.strip(), 'protocol': PROTOCOL})
+        else:
+            with STORE.db:
+                if _tok_ok(sid):
+                    STORE.db.execute('DELETE FROM sessions WHERE id_hash=?', (_digest(sid),))
+            new_sid = STORE.new_session(user)
+            await response(writer, 200, {'ok': True}, headers=(('Set-Cookie',
+                '%s=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d' % (SESSION_COOKIE, new_sid, SESSION_AGE)),))
+        return
+    if not account:
+        await response(writer, 401, {'error': '请先登录'})
+        return
+    if path == '/api/relay/logout':
+        with STORE.db:
+            STORE.db.execute('DELETE FROM sessions WHERE id_hash=?', (_digest(sid),))
+        await response(writer, 200, {'ok': True}, headers=(('Set-Cookie',
+            SESSION_COOKIE + '=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0'),))
+    elif path == '/api/relay/password':
+        await STORE.authenticate(account['username'], data.get('old_password'))
+        password = data.get('password')
+        if not isinstance(password, str) or not 1 <= len(password) <= 128:
+            raise ValueError('密码需为 1-128 个字符')
+        salt = secrets.token_hex(16)
+        value = await asyncio.get_running_loop().run_in_executor(None, _password_hash, password, salt)
+        current = STORE.session(sid)
+        if not current or current['version'] != account['version']:
+            await response(writer, 401, {'error': '登录已失效，请重新登录'})
+            return
+        with STORE.db:
+            STORE.db.execute('UPDATE accounts SET salt=?,password_hash=?,version=version+1 WHERE id=?',
+                             (salt, value, account['id']))
+            STORE.db.execute('DELETE FROM sessions WHERE account_id=?', (account['id'],))
+        await response(writer, 200, {'ok': True})
+    elif path == '/api/relay/unbind':
+        tid = data.get('device_id', '')
+        if not STORE.device(tid, account['id']):
+            await response(writer, 404, {'error': '设备不存在'})
+            return
+        with STORE.db:
+            STORE.db.execute('DELETE FROM devices WHERE id=?', (tid,))
+        tun = TUNNELS.get(tid)
+        if tun:
+            await tun.close()
+        await response(writer, 200, {'ok': True})
+    else:
+        await response(writer, 404, {'error': '接口不存在'})
 
 
 async def public_conn(reader, writer):
-    """公网口单连接：可能是普通 HTTP（读体→隧道→回写）或 WS 升级。"""
+    upgraded = False
     try:
-        await _public_conn(reader, writer)
-    except Exception as e:
-        log.exception('public_conn error: %r', e)
-        try:
-            writer.close()
-        except Exception:
-            pass
-
-
-async def _public_conn(reader, writer):
-    head_rest = await read_http_head(reader)
-    if head_rest is None:
-        writer.close()
-        return
-    head, rest = head_rest
-    parsed = parse_request_head(head)
-    if parsed is None:
-        await _http_resp(writer, 400, 'bad request')
-        return
-    method, raw_path, _ver, headers = parsed
-    hmap = headers_map(headers)
-
-    # /t/<tunnel_id>/<rest>
-    segs = raw_path.split('/')
-    tun = None
-    set_cookie = None
-    if len(segs) >= 3 and segs[1] == 't' and _tok_ok(segs[2].split('?', 1)[0], 4, 32):
-        tid = segs[2].split('?', 1)[0]
-        tun = await _await_tunnel(tid)
-        if tun is None:
-            await _tunnel_missing(writer, tid)
-            return
-        set_cookie = tid
-        inner = '/' + '/'.join(segs[3:])
-        inner = inner.split('?', 1)[0]
-        if not inner or inner == '/':
-            inner = '/'
-    else:
-        # SPA 资源 / API / WS 用的是不带 /t/<id> 前缀的根绝对路径
-        # （/assets/*、/api/v1/*、/api/v1/ws）。归属判定优先级：
-        #   Cookie kimi_relay_tid（访问 /t/<tid>/ 时下发）→ Referer 里的
-        #   /t/<tid>/ → 仅一条隧道时兜底；多隧道又无归属则 404（不猜）。
-        tid = _root_tid(hmap)
-        if tid:
-            tun = await _await_tunnel(tid)
-            if tun is None:
-                await _tunnel_missing(writer, tid)
+        method, raw, headers, body = await read_request(reader)
+        host = headers.get('host', '')
+        parsed_host = urlsplit('http://' + host)
+        if (not host or not parsed_host.hostname or parsed_host.username or parsed_host.password
+                or parsed_host.path or parsed_host.query or parsed_host.fragment):
+            raise ValueError('Host 无效')
+        parsed_host.port
+        origin = 'http://' + host.lower()
+        path = raw.split('?', 1)[0]
+        if method not in ('GET', 'HEAD') or _upgrade(headers):
+            if path != '/relay/register' and headers.get('origin') != origin:
+                await response(writer, 403, {'error': 'Origin 不被允许'})
                 return
+        if headers.get('sec-fetch-site') == 'cross-site' and (method != 'GET' or _upgrade(headers)):
+            await response(writer, 403, {'error': '跨站请求被拒绝'})
+            return
+        if path == '/relay/register':
+            if method != 'GET' or not _upgrade(headers) or body:
+                raise ValueError('隧道注册请求无效')
+            upgraded = True
+            await relay_register(reader, writer, headers, origin)
+            return
+        sid = _cookie(headers, SESSION_COOKIE)
+        account = STORE.session(sid)
+        ip = str(writer.get_extra_info('peername')[0])
+        if path.startswith('/api/relay/'):
+            await account_api(writer, path, method, headers, body, ip, account, sid)
+            return
+        query = parse_qs(raw.partition('?')[2], keep_blank_values=True)
+        device_query = query.get('relay_device', [])
+        match = re.fullmatch(r'/t/([A-Za-z0-9_-]{16,128})(/.*)?', path)
+        tid = match[1] if match else (device_query[0] if len(device_query) == 1 else '')
+        if not tid and path == '/' and method == 'GET':
+            await response(writer, 200, PORTAL_HTML, 'text/html; charset=utf-8')
+            return
+        if not account:
+            if method == 'GET' and not _upgrade(headers) and not path.startswith(('/api/', '/assets/')):
+                await redirect(writer, '/')
+            else:
+                await response(writer, 401, {'error': '登录已失效，请返回服务器首页登录'})
+            return
+        if not _tok_ok(tid) or not STORE.device(tid, account['id']):
+            await response(writer, 403, {'error': '未指定设备或无权访问此设备'})
+            return
+        inner = (match[2] or '/') if match else path
+        if (method == 'GET' and not _upgrade(headers) and match
+                and not inner.startswith(('/api/', '/assets/', '/mobile/'))
+                and '.' not in inner.rsplit('/', 1)[-1]):
+            query.pop('relay_device', None)
+            query.pop('kimi_onboarded', None)
+            query['relay_device'] = [tid]
+            query['kimi_onboarded'] = ['1']
+            await redirect(writer, inner + '?' + urlencode(query, doseq=True))
+            return
+        tun = TUNNELS.get(tid)
+        if not tun or not tun.alive:
+            await response(writer, 503, {'error': '电脑离线，请返回服务器首页查看设备'})
+            return
+        query.pop('relay_device', None)
+        suffix = urlencode(query, doseq=True)
+        inner = inner + ('?' + suffix if suffix else '')
+        if _upgrade(headers):
+            if method != 'GET' or body or inner != '/api/v1/ws':
+                raise ValueError('升级通道不被允许')
+            upgraded = True
+            await proxy_ws(tun, reader, writer, headers, inner, sid, account)
         else:
-            if len(TUNNELS) != 1:
-                await _http_resp(writer, 404, 'unknown tunnel')
-                return
-            tun = next(iter(TUNNELS.values()))
-            if not tun.alive:
-                await _http_resp(writer, 404, 'tunnel not found')
-                return
-        inner = raw_path.split('?', 1)[0] or '/'
-    # 保留 query（inner 此时是剥了前缀/未剥前缀的纯路径，query 不在其中）
-    qidx = raw_path.find('?')
-    query = raw_path[qidx:] if qidx >= 0 else ''
-    inner_path = inner + query
-
-    if _is_upgrade(headers):
-        # WS 升级：只放行给 worker（桥自己裁决 /api/v1/ws 白名单）
-        key = hmap.get('sec-websocket-key')
-        if not key or len(key) > 64:
-            await _http_resp(writer, 400, 'bad ws key')
-            return
-        cid = secrets.token_urlsafe(8)
-        accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode('ascii')).digest())
-        # 回显浏览器请求的 WS 子协议：SPA 用 'kimi-code.bearer.<凭据>' 子协议承载
-        # 登录态，而浏览器规定服务端必须在 101 响应里回显所选子协议，否则直接
-        # 判握手失败（页面报 WebSocket error，实时更新失效）。桥对该子协议只校验
-        # 'kimi-code.bearer.' 前缀，故原样回显第一个即可；没有则不发这个头。
-        proto = ''
-        for p in (hmap.get('sec-websocket-protocol') or '').split(','):
-            p = p.strip()
-            if p.startswith('kimi-code.bearer.'):
-                proto = p
-                break
-        resp = (b'HTTP/1.1 101 Switching Protocols\r\n'
-                b'Upgrade: websocket\r\n'
-                b'Connection: Upgrade\r\n'
-                b'Sec-WebSocket-Accept: ' + accept + b'\r\n')
-        if proto:
-            resp += ('Sec-WebSocket-Protocol: %s\r\n' % proto).encode('latin-1')
-        resp += b'\r\n'
-        writer.write(resp)
-        try:
-            await writer.drain()
-        except Exception:
-            return
-        # 把 rest 里可能已含的首帧留给手机侧 pump 的 reader（readexactly 已缓冲）
-        # 告诉 worker 开一条 ws 通道
-        ok = await tunnel_send(tun, {'type': 'ws_open', 'id': cid, 'path': inner_path,
-                                     'headers': {k: v for k, v in headers
-                                                 if k not in ('host', 'connection', 'upgrade',
-                                                              'sec-websocket-key', 'sec-websocket-version',
-                                                              'sec-websocket-extensions')}})
-        if not ok:
-            writer.close()
-            return
-        await phone_ws_pump(tun, cid, reader, writer)
-        return
-
-    # ---- 普通 HTTP ----
-    # 读请求体（Content-Length；TE 不支持）
-    body = b''
-    if hmap.get('transfer-encoding'):
-        await _http_resp(writer, 400, 'chunked not supported')
-        return
-    try:
-        n = int(hmap.get('content-length') or '0')
-    except ValueError:
-        await _http_resp(writer, 400, 'bad content-length')
-        return
-    if n > MAX_HTTP_BODY:
-        await _http_resp(writer, 413, 'body too large')
-        return
-    if n:
-        need = n - len(rest)
-        if need > 0:
-            more = await _read_n(reader, need)
-            if more is None:
-                return
-            rest += more
-        body = rest[:n]
-    req_id = secrets.token_urlsafe(10)
-    t_start = time.monotonic()
-    fut = asyncio.get_event_loop().create_future()
-    tun.pending[req_id] = fut
-    try:
-        ok = await tunnel_send(tun, {
-            'type': 'http', 'id': req_id, 'method': method, 'path': inner_path,
-            'headers': {k: v for k, v in headers if k not in ('host', 'connection', 'content-length')},
-            'body': base64.b64encode(body).decode('ascii')})
-        if not ok:
-            await _http_resp(writer, 502, 'tunnel write failed')
-            return
-        try:
-            resp = await asyncio.wait_for(fut, timeout=HTTP_TIMEOUT)
-        except asyncio.TimeoutError:
-            log.warning('%s %s -> 504 timeout', method, inner)
-            await _http_resp(writer, 504, 'upstream timeout')
-            return
-        status = int(resp.get('status', 502))
-        rheaders = resp.get('headers') or []
-        rbody = base64.b64decode(resp.get('body', ''))
-        out = bytearray(b'HTTP/1.1 %d\r\n' % status)
-        sent_cl = False
-        for k, v in rheaders:
-            lk = k.lower()
-            if lk in ('connection', 'transfer-encoding', 'content-length', 'server', 'date'):
-                if lk == 'content-length':
-                    sent_cl = True
-                continue
-            try:
-                out += ('%s: %s\r\n' % (k, v)).encode('latin-1')
-            except Exception as e:
-                log.warning('hdr encode fail %r: %r', k, e)
-                continue
-        if set_cookie:
-            out += ('Set-Cookie: %s=%s; Path=/; HttpOnly; SameSite=Lax\r\n'
-                    % (RELAY_COOKIE, set_cookie)).encode('latin-1')
-        out += b'Server: kimi-relay\r\n'
-        out += b'Content-Length: %d\r\nConnection: close\r\n\r\n' % len(rbody)
-        out += rbody
-        writer.write(bytes(out))
-        log.info('%s %s -> %d %dB %.2fs', method, inner, status, len(rbody),
-                 time.monotonic() - t_start)
-        await writer.drain()
+            await proxy_http(tun, writer, method, inner, headers, body, sid, account)
+    except (ValueError, UnicodeError, KeyError, TypeError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+        if not upgraded and not writer.is_closing():
+            await response(writer, 400, {'error': '请求无效，或账号密码不正确'})
+    except (OSError, asyncio.TimeoutError):
+        pass
+    except Exception:
+        log.error('relay request failed')
+        if not upgraded and not writer.is_closing():
+            await response(writer, 500, {'error': '服务器内部错误'})
     finally:
-        tun.pending.pop(req_id, None)
         writer.close()
 
 
-# ---------------- 入口 ----------------
-async def main_async(listen_port, public_port, token):
-    loop = asyncio.get_event_loop()
-    ts = await asyncio.start_server(lambda r, w: relay_register(r, w, token),
-                                    LISTEN_HOST, listen_port)
-    ps = await asyncio.start_server(public_conn, LISTEN_HOST, public_port)
-    log.info('relay up: tunnel :%d  public :%d', listen_port, public_port)
-    async with ts, ps:
-        await asyncio.gather(ts.serve_forever(), ps.serve_forever())
+PORTAL_HTML = '''<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">
+<title>Kimi Code 远程控制</title><style>
+body{font:15px system-ui;background:#101014;color:#eee;margin:0;padding:24px}main{max-width:520px;margin:5vh auto}
+input,button{box-sizing:border-box;font:inherit;padding:12px;border-radius:8px;border:1px solid #444;background:#202027;color:inherit}
+input{width:100%;margin:6px 0}button{cursor:pointer;margin:6px 6px 6px 0}.device{padding:16px;border:1px solid #444;border-radius:10px;margin:12px 0}
+p{line-height:1.6;color:#bcbcc5}#msg{color:#f5ba75;white-space:pre-wrap}[hidden]{display:none!important}
+</style></head><body><main><h1>Kimi Code 远程控制</h1><p>私人 HTTP/WS 中继。账号密码、二维码和控制流量为明文，请勿使用其他网站的密码或分享二维码。</p>
+<p id="msg" role="status"></p><form id="login"><label>账号<input id="username" autocomplete="username" maxlength="64" required></label>
+<label>密码<input id="password" type="password" autocomplete="current-password" maxlength="128" required></label><button>登录</button></form>
+<section id="home" hidden><h2 id="who"></h2><div id="devices"></div><button id="refresh">刷新设备</button><button id="logout">退出登录</button>
+<details><summary>修改账号密码</summary><form id="change"><input id="old" type="password" placeholder="原密码" autocomplete="current-password" required>
+<input id="new" type="password" placeholder="新密码（1-128 字符）" autocomplete="new-password" maxlength="128" required><button>修改并注销全部登录</button></form>
+<p>修改后旧二维码失效。请在电脑端用新密码重新登录绑定，以更新本机保存的密码和二维码。</p></details></section></main><script>
+(function(){'use strict';var $=function(id){return document.getElementById(id)},target='',busy=false;
+var params=new URLSearchParams(location.hash.slice(1));var auto=params.has('username')&&params.has('password');
+if(location.hash)history.replaceState(null,'',location.pathname);
+async function api(path,data){var r=await fetch('/api/relay/'+path,{method:data?'POST':'GET',credentials:'same-origin',cache:'no-store',
+headers:data?{'Content-Type':'application/json'}:{},body:data?JSON.stringify(data):undefined});var d=await r.json();if(!r.ok)throw new Error(d.error||'请求失败');return d;}
+function message(text){$('msg').textContent=text||'';}
+async function home(){try{var d=await api('me');$('login').hidden=true;$('home').hidden=false;$('who').textContent=d.username+' 的电脑';$('devices').replaceChildren();
+d.devices.forEach(function(device){var box=document.createElement('div');box.className='device';var name=document.createElement('strong');name.textContent=device.name+(device.online?' · 在线':' · 离线');box.append(name,document.createElement('br'));
+var enter=document.createElement('button');enter.textContent='进入电脑';enter.disabled=!device.online;enter.onclick=function(){location.assign('/t/'+device.id+'/?kimi_onboarded=1#token=kimi-mobile-lan')};
+var remove=document.createElement('button');remove.textContent='解除绑定';remove.onclick=async function(){if(!confirm('解除“'+device.name+'”的绑定并断开控制？'))return;try{await api('unbind',{device_id:device.id});await home()}catch(e){message(e.message)}};box.append(enter,remove);$('devices').append(box);
+if(target===device.id&&device.online){target='';enter.click()}});if(!d.devices.length)message('还没有绑定的电脑，请从电脑端注册或登录并绑定。');
+if(target){message('目标电脑离线或已解除绑定，可稍后刷新。');target=''}
+}catch(e){$('login').hidden=false;$('home').hidden=true;message(e.message)}}
+$('login').onsubmit=async function(e){if(e)e.preventDefault();if(busy)return;busy=true;var b=$('login').querySelector('button');b.disabled=true;message('正在登录…');
+try{await api('login',{username:$('username').value,password:$('password').value});$('password').value='';message('');await home()}catch(err){message(err.message)}finally{busy=false;b.disabled=false}};
+$('logout').onclick=async function(){try{await api('logout',{});location.replace('/')}catch(e){message(e.message)}};
+$('refresh').onclick=home;$('change').onsubmit=async function(e){e.preventDefault();try{await api('password',{old_password:$('old').value,password:$('new').value});$('old').value='';$('new').value='';await home();message('密码已修改，请重新登录，并在电脑端更新保存的密码。')}catch(err){message(err.message)}};
+if(auto){$('username').value=params.get('username');$('password').value=params.get('password');target=params.get('device')||'';params=null;$('login').onsubmit()}else{params=null;home()}
+})();</script></body></html>'''
+
+
+DEVICE_SCRIPT = r'''(function(){'use strict';var id=__DEVICE_ID__,prefix='/t/'+id;
+function network(value){var u=new URL(value,location.href);if(u.origin===location.origin&&!u.pathname.startsWith('/t/')&&!u.pathname.startsWith('/api/relay/'))u.pathname=prefix+u.pathname;if(u.origin===location.origin)u.searchParams.delete('relay_device');return u.href}
+function asset(value){if(typeof value!=='string')return value;var u=new URL(value,location.href);return u.origin===location.origin&&(u.pathname.startsWith('/assets/')||u.pathname.startsWith('/api/'))?network(value):value}
+[[HTMLScriptElement,'src'],[HTMLLinkElement,'href'],[HTMLImageElement,'src'],[HTMLMediaElement,'src'],[HTMLSourceElement,'src']].forEach(function(item){var d=Object.getOwnPropertyDescriptor(item[0].prototype,item[1]);if(d&&d.set&&d.configurable)Object.defineProperty(item[0].prototype,item[1],Object.assign({},d,{set:function(value){d.set.call(this,asset(value))}}))});
+var setAttribute=Element.prototype.setAttribute;Element.prototype.setAttribute=function(name,value){return setAttribute.call(this,name,/^(src|href)$/i.test(name)?asset(value):value)};
+var fetch0=window.fetch;window.fetch=function(input,init){if(input instanceof Request)return fetch0.call(this,new Request(network(input.url),input),init);return fetch0.call(this,network(input),init)};
+var open=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(method,url){var args=Array.from(arguments);args[1]=network(url);return open.apply(this,args)};
+var WS=window.WebSocket;window.WebSocket=new Proxy(WS,{construct:function(Target,args){var u=new URL(args[0],location.href);if((u.protocol==='ws:'&&location.protocol==='http:')&&u.host===location.host&&!u.pathname.startsWith('/t/'))u.pathname=prefix+u.pathname;args[0]=u.href;return Reflect.construct(Target,args)}});
+function route(url){if(url==null)return url;var u=new URL(url,location.href);if(u.origin===location.origin){u.searchParams.set('relay_device',id);u.searchParams.set('kimi_onboarded','1')}return u.href}
+['pushState','replaceState'].forEach(function(key){var original=history[key];history[key]=function(state,title,url){return original.call(this,state,title,route(url))}});
+var storage=Storage.prototype;['getItem','setItem','removeItem'].forEach(function(key){var original=storage[key];storage[key]=function(name){var args=Array.from(arguments);args[0]='kimi-relay:'+id+':'+name;return original.apply(this,args)}});
+window.addEventListener('DOMContentLoaded',function(){var bar=document.createElement('div');bar.style.cssText='position:fixed;top:4px;right:8px;z-index:2147483640;display:flex;gap:6px';
+[['电脑列表',function(){location.assign('/')}],['退出登录',async function(){try{var r=await fetch0('/api/relay/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(!r.ok)throw Error();location.replace('/')}catch(e){alert('退出失败，请稍后重试')}}]].forEach(function(item){var b=document.createElement('button');b.textContent=item[0];b.style.cssText='padding:5px 8px;border:1px solid #777;border-radius:8px;background:#222;color:white;font-size:12px';b.onclick=item[1];bar.appendChild(b)});document.body.appendChild(bar)});
+})();'''
+
+
+async def main_async(port):
+    server = await asyncio.start_server(public_conn, LISTEN_HOST, port, limit=HEADER_MAX + 4)
+    log.info('relay up: HTTP/WS :%d', port)
+    async with server:
+        await server.serve_forever()
 
 
 def main():
-    logging.basicConfig(level=logging.INFO,
-                        format='%(asctime)s %(levelname)s %(message)s')
-    listen = TUNNEL_PORT
-    public = PUBLIC_PORT
-    public_host = ''
-    token = ''
-    args = sys.argv[1:]
-    i = 0
-    while i < len(args):
-        if args[i] in ('--listen-port', '--tunnel-port') and i + 1 < len(args):
-            listen = int(args[i + 1]); i += 2
-        elif args[i] == '--public-port' and i + 1 < len(args):
-            public = int(args[i + 1]); i += 2
-        elif args[i] == '--public-host' and i + 1 < len(args):
-            public_host = args[i + 1].strip(); i += 2
-        elif args[i] == '--token' and i + 1 < len(args):
-            token = args[i + 1]; i += 2
-        else:
-            i += 1
-    if not token:
-        token = __import__('os').environ.get('RELAY_TOKEN', '')
-    if not public_host:
-        public_host = __import__('os').environ.get('PUBLIC_HOST', '').strip()
-    # --public-host（或 PUBLIC_HOST env）决定注册回执里 origin 的 host:port，
-    # worker 桥白名单须与之匹配。**必填**：不默认任何具体地址——默认错 IP 会
-    # 让注册回执 origin 与桥白名单不符且来源不可审计，fail-closed 直接退出。
-    if not public_host:
-        print('error: --public-host <host:port> is required '
-              '(or set PUBLIC_HOST env)', file=sys.stderr)
-        sys.exit(2)
-    global PUBLIC_HOST_HEADER
-    PUBLIC_HOST_HEADER = (public_host if ':' in public_host
-                          else '%s:%d' % (public_host, public))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--port', type=int, default=PUBLIC_PORT)
+    parser.add_argument('--token', default=os.environ.get('RELAY_TOKEN', ''))
+    parser.add_argument('--data-dir', default=os.path.join(os.path.expanduser('~'), '.kimi-relay'))
+    args = parser.parse_args()
+    if not 1 <= args.port <= 65535:
+        parser.error('端口需为 1-65535')
+    if not args.token or len(args.token) > 256 or any(ord(c) < 33 or ord(c) > 126 for c in args.token):
+        parser.error('必须通过 RELAY_TOKEN 或 --token 设置 1-256 位可见 ASCII 准入密钥')
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    global STORE, ADMISSION_TOKEN
+    ADMISSION_TOKEN = args.token
+    os.umask(0o077)
+    STORE = AccountStore(os.path.join(args.data_dir, 'relay.sqlite3'))
     try:
-        asyncio.run(main_async(listen, public, token))
+        asyncio.run(main_async(args.port))
     except KeyboardInterrupt:
         pass
+    finally:
+        STORE.db.close()
 
 
 if __name__ == '__main__':

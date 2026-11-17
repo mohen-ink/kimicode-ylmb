@@ -3162,29 +3162,13 @@ def _mobile_error(handler, origin, code, msg):
 
 
 def _relay_config_validate(body):
-    """写侧严格校验（返回错误文案或 ''）。token 可留空表示清除/回退默认。
-
-    host：非空 hostname/IP（去空白小写后 ≤253，字母数字点横线冒号方括号）；
-    tunnel_port/public_port：1-65535 整数；token：≤256 字符串。"""
-    if 'host' in body:
-        h = body['host']
-        if not isinstance(h, str) or not relay_config._clean_host(h):
-            return '中继服务器地址无效'
-    for k in ('tunnel_port', 'public_port'):
-        if k in body:
-            v = body[k]
-            ok = isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 65535
-            if not ok:
-                try:
-                    ok = 1 <= int(str(v).strip()) <= 65535
-                except Exception:
-                    ok = False
-            if not ok:
-                return '中继端口需在 1-65535 之间'
+    if 'url' in body and not relay_config.normalize_url(body['url']):
+        return '服务器地址无效，请填写 http://主机:端口（不填端口默认 80）'
     if 'token' in body:
-        t = body['token']
-        if not isinstance(t, str) or len(t.strip()) > relay_config.TOKEN_MAX:
-            return '密钥格式无效'
+        token = body['token']
+        if (not isinstance(token, str) or len(token.strip()) > relay_config.TOKEN_MAX
+                or any(ord(c) < 33 or ord(c) > 126 for c in token.strip())):
+            return '准入密钥需为最多 256 位可见 ASCII 字符'
     return ''
 
 
@@ -3312,24 +3296,40 @@ def _mobile_dispatch(handler):
             _mobile_send(handler, 200,
                          {'relay': relay_config.redacted(relay_config.load(KIMI_HOME))},
                          origin)
-        elif method == 'POST' and path == _MOBILE_PREFIX + '/relay/config':
+        elif method == 'POST' and path in (
+                _MOBILE_PREFIX + '/relay/config', _MOBILE_PREFIX + '/relay/bind',
+                _MOBILE_PREFIX + '/relay/unbind'):
             body = _mobile_read_body(handler)
-            if set(body) - {'host', 'tunnel_port', 'public_port', 'token'}:
-                raise ValueError('请求参数不被允许')
-            # 校验：host 非空 hostname/IP、端口 1-65535、token 限长；
-            # 缺省字段继承现有值（便于部分更新）。
-            cur = relay_config.load(KIMI_HOME)
-            err = _relay_config_validate(body)
-            if err:
-                raise ValueError(err)
-            nxt = dict(cur)
-            for k in ('host', 'tunnel_port', 'public_port', 'token'):
-                if k in body:
-                    nxt[k] = body[k]
-            saved = relay_config.save(KIMI_HOME, nxt)
-            _mobile_send(handler, 200,
-                         {'success': True, 'relay': relay_config.redacted(saved)},
-                         origin)
+            with _MOBILE_RESTORE_LOCK:
+                if mgr.status().get('state') != 'off' or mgr._old_worker_handle() is not None:
+                    raise ValueError('请先停止手机连接，再修改服务器或设备绑定')
+                if path.endswith('/config'):
+                    if set(body) - {'url', 'token'}:
+                        raise ValueError('请求参数不被允许')
+                    err = _relay_config_validate(body)
+                    if err:
+                        raise ValueError(err)
+                    cur = relay_config.load(KIMI_HOME)
+                    nxt = dict(cur)
+                    if 'url' in body:
+                        nxt['url'] = relay_config.normalize_url(body['url'])
+                        if nxt['url'] != cur['url']:
+                            nxt.update(username='', password='', device_id='', device_key='', device_name='', token='')
+                    if 'token' in body:
+                        nxt['token'] = body['token']
+                    result = relay_config.redacted(relay_config.save(KIMI_HOME, nxt))
+                elif path.endswith('/bind'):
+                    if set(body) - {'username', 'password', 'device_name', 'register'}:
+                        raise ValueError('请求参数不被允许')
+                    if not isinstance(body.get('register', False), bool):
+                        raise ValueError('注册选项无效')
+                    result = relay_config.bind(KIMI_HOME, body.get('username'), body.get('password'),
+                                               body.get('device_name'), body.get('register', False))
+                else:
+                    if body:
+                        raise ValueError('请求参数不被允许')
+                    result = relay_config.unbind(KIMI_HOME)
+            _mobile_send(handler, 200, {'success': True, 'relay': result}, origin)
         elif method == 'GET' and path == _MOBILE_PREFIX + '/status':
             _mobile_send(handler, 200, mgr.status(), origin)
         elif method == 'POST' and path == _MOBILE_PREFIX + '/connector/install':

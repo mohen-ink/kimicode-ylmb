@@ -7,17 +7,21 @@ Origin；手机面不暴露控制面。LAN 显式绑定所选本机 RFC1918 IPv4
 只适合可信局域网。internet 显式同意 Cloudflare 中继后只绑定 127.0.0.1，
 ConnectorRuntime 确认 Quick Tunnel 就绪且 owner 复核通过后才发布 HTTPS 配对链接。
 
-密码链接使用 URL fragment；未设密码时配对码限时一次性。会话持久化七天，Cookie 为 HttpOnly/Strict，
-internet 额外设置 Secure。HTTP 精确 method+route allowlist 与 WS 上行消息
+LAN/CF 密码链接使用 URL fragment；未设密码时配对码限时一次性。
+中继模式由服务器校验账号并转发带隧道签名的授权，不接受本机密码配对。
+LAN/CF 会话持久化七天，Cookie 为 HttpOnly/Strict，internet 额外设置 Secure。
+HTTP 精确 method+route allowlist 与 WS 上行消息
 allowlist 保持机器级接口不可达。真实 server.token 仅在进程内存向已核实的
 owner 注入；HTTP 响应与 WS 完整帧/重组消息均过滤凭据，不向手机发送。
 
 每次启动、listener、handler、会话、授权快照、socket 与 WS 配额均绑定同代；
-stop 注销全部设备；LAN/relay 在 owner 失联时停止转发并等待重新绑定，internet 停止入口。
+stop 撤销本机控制并断开隧道，中继账号绑定和服务器登录态仍保留；
+LAN/relay 在 owner 失联时停止转发并等待重新绑定，internet 停止入口。
 shutdown 永久关闭管理器及 connector。本模块只依赖 Python>=3.8 标准库。
 """
 import base64
 import hashlib
+import hmac
 import http.client
 import ipaddress
 import json
@@ -837,6 +841,8 @@ class MobileBridgeManager(object):
         self._saved_sessions = mobile_auth.load_sessions(kimi_home)
 
     def _sync_password_locked(self):
+        if self._mode == 'relay':
+            return
         stamp = mobile_auth.password_stamp(self.kimi_home)
         if stamp != self._password_stamp:
             self._password_stamp = stamp
@@ -932,19 +938,42 @@ class MobileBridgeManager(object):
         return connector, diagnostics
 
     def _relay_config(self):
-        """读 <kimi_home>/usage-dashboard/relay.json，返回生效的规范化中继配置。
+        import relay_config
+        return relay_config.load(self.kimi_home)
 
-        worker 侧是配置的唯一消费端：daemon 负责写入，worker 每次 start 时
-        经 relay_config.load 读取（文件不存在/损坏 → 内置默认，与未配置等价）。
-        """
-        try:
-            import relay_config
-            return relay_config.load(self.kimi_home)
-        except Exception:
-            # 模块不可用/读取异常：仍给一份默认（host 空 = 未配置），
-            # 让 RelayClient 自行兜底（空 host 启动即拒绝，见 _run）
-            return {'host': '', 'tunnel_port': 48213,
-                    'public_port': 47961, 'token': ''}
+    def relay_session(self, ticket):
+        with self._lock:
+            relay = self._relay
+            if (self._mode != 'relay' or relay is None or not relay.bridge_key
+                    or not self.generation_valid(self._generation)):
+                return None
+            if not isinstance(ticket, str) or len(ticket) > 256:
+                return None
+            parts = ticket.split('.')
+            if len(parts) != 3:
+                return None
+            sid, expiry, signature = parts
+            if (not re.fullmatch(r'[A-Za-z0-9_-]{16,128}', sid)
+                    or not re.fullmatch(r'[0-9]{1,12}', expiry)
+                    or not re.fullmatch(r'[0-9a-f]{64}', signature)):
+                return None
+            expires = int(expiry)
+            if not time.time() < expires <= time.time() + SESSION_MAX_AGE_SECONDS:
+                return None
+            expected = hmac.new(relay.bridge_key.encode('ascii'),
+                                (sid + '.' + expiry).encode('ascii'), hashlib.sha256).hexdigest()
+            if not secrets.compare_digest(signature, expected):
+                return None
+            rec = self._sessions.get(ticket)
+            if rec is None:
+                if len(self._sessions) >= 64:
+                    self._sessions = {k: v for k, v in self._sessions.items() if v['expires'] > time.time()}
+                if len(self._sessions) >= 64:
+                    oldest = min(self._sessions, key=lambda k: self._sessions[k]['last_seen'])
+                    self._sessions.pop(oldest, None)
+                self._sessions[ticket] = {'created': time.time(), 'expires': expires,
+                                         'last_seen': time.time(), 'generation': self._generation}
+            return ticket
 
     # ---------- 状态 ----------
     def status(self):
@@ -972,6 +1001,16 @@ class MobileBridgeManager(object):
             if self._state == 'on' and self._mode in ('internet', 'relay') and self._tunnel['state'] == 'ready':
                 st['public_origin'] = self._public_origin
             st['password_set'] = bool(self._password)
+            if self._mode == 'relay':
+                cfg = self._relay_config()
+                st['auth_mode'] = 'account'
+                st['password_set'] = False
+                if self._state == 'on' and self._tunnel['state'] == 'ready':
+                    st['url'] = (cfg['url'] + '/#username=' + quote(cfg['username'], safe='')
+                                 + '&password=' + quote(cfg['password'], safe='')
+                                 + '&device=' + self._relay_tunnel_id)
+                    st['pair_state'] = 'available'
+                return st
             if self._state == 'on' and (self._password or best > now):
                 st['url'] = self._pair_url_locked()
                 st['pair_state'] = 'available'
@@ -1011,6 +1050,9 @@ class MobileBridgeManager(object):
         elif mode == 'relay':
             if address is not None:
                 raise MobileBridgeError('中继模式不接受监听地址')
+            import relay_config
+            if not relay_config.bound(self._relay_config()):
+                raise MobileBridgeError('请先注册或登录服务器账号并绑定本机')
         host, port = _parse_owner_origin(owner_origin)
         norm_origin = 'http://%s:%d' % (host, port)
         with self._lock:
@@ -1111,12 +1153,11 @@ class MobileBridgeManager(object):
                         except Exception:
                             pass
                     from mobile_relay import RelayClient
-                    self._relay = RelayClient(
-                        relay_host=cfg['host'], relay_port=cfg['tunnel_port'],
-                        public_port=cfg['public_port'],
-                        token=cfg['token'] or None)
-                    self._relay.tunnel_id = mobile_auth.load_relay_tid(self.kimi_home)
-                    self._relay_host = cfg['host']
+                    import relay_config
+                    if not relay_config.bound(cfg):
+                        raise MobileBridgeError('请先注册或登录服务器账号并绑定本机')
+                    self._relay = RelayClient(cfg['url'], cfg['device_id'], cfg['device_key'])
+                    self._relay_host = cfg['url']
                     self._relay.start(
                         bound_port, lambda origin: self._tunnel_ready(generation, origin),
                         lambda code: self._tunnel_failed(generation, code))
@@ -1131,16 +1172,10 @@ class MobileBridgeManager(object):
             raise MobileBridgeError(code)
 
     def _tunnel_ready(self, generation, origin):
-        # internet：cloudflared 回 https://<sub>.trycloudflare.com；
-        # relay：RelayClient 回 http://<vps>:<port>（不带 /t/<id>——tid 另存）。
-        # relay 白名单按本次 start 配置的中继 host 匹配（self._relay_host），
-        # 端口仍 \d+——不再写死任何固定 VPS IP。
         ok_origin = isinstance(origin, str) and (
-            re.fullmatch(r'https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.trycloudflare\.com',
-                         origin) is not None
-            or (isinstance(self._relay_host, str) and self._relay_host
-                and re.fullmatch(r'http://%s:\d+' % re.escape(self._relay_host),
-                                 origin) is not None))
+            (self._mode == 'internet' and re.fullmatch(
+                r'https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.trycloudflare\.com', origin) is not None)
+            or (self._mode == 'relay' and self._relay_host and origin == self._relay_host))
         if not ok_origin:
             self._tunnel_failed(generation, 'TUNNEL_START_FAILED')
             return
@@ -1162,9 +1197,7 @@ class MobileBridgeManager(object):
                         self._tunnel_failed(generation, 'TUNNEL_START_FAILED')
                     return
                 self._relay_tunnel_id = tid
-                if not mobile_auth.save_relay_tid(self.kimi_home, tid):
-                    self._tunnel_failed(generation, 'TUNNEL_START_FAILED')
-                    return
+                self._sessions.clear()
             if self._state == 'starting':
                 # 首次 ready：转 on
                 self._public_origin = origin
@@ -1172,8 +1205,7 @@ class MobileBridgeManager(object):
                 self._state = 'on'
                 self._issue_pair_token_locked()
             elif self._state == 'on':
-                # relay 断线重连后的二次 ready：只刷新 origin/tid，配对会话不动。
-                # tid 因 X-Relay-Resume 复用通常不变；变了也安全更新。
+                # 中继账号登录由服务器保留，本机授权随新隧道重新验证。
                 self._public_origin = origin
                 self._tunnel = {'state': 'ready'}
 
@@ -1360,6 +1392,8 @@ class MobileBridgeManager(object):
 
     # ---------- 配对 / 会话 ----------
     def _pair_url_locked(self):
+        if self._mode == 'relay':
+            return None
         now = time.time()
         best = None
         for tok, exp in self._pair_tokens.items():
@@ -1367,11 +1401,7 @@ class MobileBridgeManager(object):
                 best = tok
         if best is None and not self._password:
             return None
-        if self._mode == 'relay':
-            # relay：_public_origin 只存 http://<vps>:<port>（Host/Origin 校验用），
-            # 配对 URL 另拼 /t/<tid> 前缀给 VPS 公网口路由。
-            origin = self._public_origin + '/t/' + self._relay_tunnel_id
-        elif self._mode == 'internet':
+        if self._mode == 'internet':
             origin = self._public_origin
         else:
             origin = 'http://%s:%d' % (self._address, self._port)
@@ -1380,6 +1410,11 @@ class MobileBridgeManager(object):
         return origin + '/mobile/pair' + fragment
 
     def _issue_pair_token_locked(self):
+        if self._mode == 'relay':
+            self._pair_tokens.clear()
+            self._saved_sessions.clear()
+            self._pair_state = 'available'
+            return
         now = time.time()
         for tok in [t for t, e in self._pair_tokens.items() if e <= now]:
             del self._pair_tokens[t]
@@ -1511,8 +1546,10 @@ class MobileBridgeManager(object):
             return True
 
     def rotate_pair(self, generation=None):
-        """密码模式刷新原链接；未设密码时换发十分钟一次性 token。"""
+        """账号或密码模式刷新原链接；一次性配对模式换发新码。"""
         with self._lock:
+            if self._mode == 'relay':
+                return ''
             self._sync_password_locked()
             if self._password:
                 return self._password
@@ -2047,6 +2084,11 @@ class _LanHandler(BaseHTTPRequestHandler):
         path = self._clean_path()
         if path is None:
             return self._err(400, '请求路径不合法')
+        if self.mgr._mode == 'relay':
+            if path in ('/mobile/pair', '/mobile/pair/exchange'):
+                return self._err(403, '中继模式请通过服务器账号登录')
+            if not self._session_ok():
+                return self._err(403, '服务器登录授权无效')
         # 升级请求：仅 /api/v1/ws，且必须已配对
         conn_hdr = ','.join(self.headers.get_all('Connection') or [])
         if 'upgrade' in conn_hdr.lower():
@@ -2277,6 +2319,9 @@ class _LanHandler(BaseHTTPRequestHandler):
         return self._session_sid() is not None
 
     def _session_sid(self):
+        if self.mgr._mode == 'relay':
+            values = self.headers.get_all('X-Relay-Authorization') or []
+            return self.mgr.relay_session(values[0]) if len(values) == 1 else None
         cookie = self.headers.get('Cookie') or ''
         values = []
         for part in cookie.split(';'):
@@ -2834,7 +2879,7 @@ class _LanHandler(BaseHTTPRequestHandler):
         for name in self.headers.keys():
             ln = name.lower()
             if (ln in _HOP_BY_HOP or ln in conn_tokens
-                    or ln.startswith(('x-forwarded-', 'cf-'))
+                    or ln.startswith(('x-forwarded-', 'cf-', 'x-relay-'))
                     or ln == 'x-kimi-mobile-control'):
                 continue
             if ln in ('sec-websocket-key', 'sec-websocket-version',
