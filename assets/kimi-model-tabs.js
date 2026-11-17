@@ -348,7 +348,8 @@
      令牌与官方同源（--menu-pad、--menu-item-padding 系列等，
      桌面端页面里已有定义；backup 值取自 wght--9wnPkiH.css 的实际解析值） */
   var CSS = [
-    '.kmt-panel{position:fixed;z-index:2147483000;display:none;flex-direction:column;width:360px;max-height:520px;',
+    '.kmt-panel{position:fixed;z-index:2147483000;display:none;flex-direction:column;width:360px;',
+    'max-width:calc(100vw - 16px);max-height:520px;',
     'padding:var(--menu-pad,3.5px);background:var(--color-menu-bg,rgba(41,41,41,.95));',
     '-webkit-backdrop-filter:var(--p-menu-backdrop,blur(20px));backdrop-filter:var(--p-menu-backdrop,blur(20px));',
     'border:var(--p-hairline,1px) solid var(--color-line,rgba(255,255,255,.1));border-radius:var(--radius-lg,12px);',
@@ -356,7 +357,7 @@
     'font-family:var(--font-ui,system-ui);color:var(--color-text,#eee);user-select:none}',
     '.kmt-panel.kmt-open{display:flex}',
     /* 供应商标签条：官方 ModelPicker chip-strip/chip 样式（data-v-565a5940，高度 28→24 同 seg-sm） */
-    '.kmt-tabs{display:flex;gap:var(--space-1,4px);flex-wrap:wrap;padding:2px 4px 4px}',
+    '.kmt-tabs{display:flex;flex:none;gap:var(--space-1,4px);flex-wrap:wrap;padding:2px 4px 4px}',
     '.kmt-tab{flex:none;height:24px;padding:0 var(--space-2,8px);border:none;border-radius:var(--radius-full,999px);',
     'background:transparent;color:var(--color-text-muted,#999);font-family:var(--font-ui,system-ui);font-size:var(--text-sm,13px);',
     'cursor:pointer;transition:background var(--duration-base,.16s),color var(--duration-base,.16s)}',
@@ -417,7 +418,9 @@
     '.kmt-rail .es-burst{position:absolute;right:-14px;top:-13px;width:40px;height:40px;pointer-events:none;z-index:4}',
     /* 提示语：overlay-menu-copy 原样 */
     '.kmt-foot{padding:var(--space-2,8px) var(--menu-item-padding-inline,9px);color:var(--color-text-muted,#999);',
-    'font-size:var(--text-sm,13px);line-height:var(--leading-normal,1.5);white-space:normal}'
+    'font-size:var(--text-sm,13px);line-height:var(--leading-normal,1.5);white-space:normal}',
+    /* 底部固定块不参与收缩：高度不足时只让模型列表滚动 */
+    '.kmt-body{flex:none}'
   ].join('');
 
   function ensurePanel() {
@@ -563,19 +566,38 @@
     // 绝不重新测量/重算位置。定位只在 openPanel 里做一次。
   }
 
-  // 位置 = 打开时对 pill 的快照（底边贴 pill 顶边、右对齐 pill 右缘），
+  var GAP = 6;        // 面板与 pill 的间距
+  var EDGE = 8;       // 与窗口边缘的最小留白
+  var MAX_H = 520;    // 与 CSS 的 max-height 保持一致
+  var MIN_H = 120;    // 极端窄窗口下的下限，避免底栏被挤没
+
+  // 位置 = 打开时对 pill 的快照（默认底边贴 pill 顶边、右对齐 pill 右缘），
   // 此后换档/重建都不动；只有 pill 真的发生垂直漂移才关闭。
+  // 高度必须按 pill 上方的实际可视空间收敛：窗口矮或 pill 贴近底部时，
+  // 写死的 520px 会把面板顶出窗口，顶部标签条与前几行被裁掉。
   function openPanel(rt, anchor) {
     var panel = ensurePanel();
     panel.__state.tab = null;   // 每次打开重置到当前模型的供应商
     renderPanel(rt, anchor);
     panel.classList.add('kmt-open');
     var r = anchor.getBoundingClientRect();
+    var above = r.top - GAP - EDGE;
+    var below = window.innerHeight - r.bottom - GAP - EDGE;
+    // 默认向上（贴 pill 顶边）；只有上方比下方更窄时才翻到下方
+    var place = above >= below ? 'above' : 'below';
+    var room = place === 'above' ? above : below;
     panel.__anchor = { top: r.top, right: r.right, innerH: window.innerHeight, innerW: window.innerWidth };
     panel.__pill = anchor;      // 漂移校验用
-    panel.style.top = 'auto';
-    panel.style.bottom = Math.max(8, window.innerHeight - r.top + 6) + 'px';
-    panel.style.left = Math.max(8, r.right - panel.offsetWidth) + 'px';
+    panel.style.maxHeight = Math.max(MIN_H, Math.min(MAX_H, room)) + 'px';
+    if (place === 'above') {
+      panel.style.top = 'auto';
+      panel.style.bottom = Math.max(EDGE, window.innerHeight - r.top + GAP) + 'px';
+    } else {
+      panel.style.bottom = 'auto';
+      panel.style.top = Math.max(EDGE, r.bottom + GAP) + 'px';
+    }
+    var w = panel.offsetWidth;
+    panel.style.left = Math.max(EDGE, Math.min(r.right - w, window.innerWidth - w - EDGE)) + 'px';
   }
 
   // 外点 / 失焦 / 缩放关闭。滚动只在 pill 真的垂直漂移时才关闭：
