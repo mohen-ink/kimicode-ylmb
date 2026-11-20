@@ -15,9 +15,6 @@
   "skills": "./skills/",
   "commands": "./commands/",
   "systemPromptPath": "./SYSTEM.md",
-  "sessionStart": {
-    "skill": "kimi-code-usage"
-  },
   "hooks": [
     {
       "event": "SessionStart",
