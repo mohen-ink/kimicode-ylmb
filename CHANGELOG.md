@@ -2,7 +2,7 @@
 
 > 格式说明：每个版本以 `## vX.Y.Z · 发布日期` 开头；`###` 为分组标题，`-` 为条目。面板里的「发现新版本」弹窗会读取最新版本这一节。
 
-## v3.4.12 · 2026-11-02
+## v3.4.12 · 2026-11-22
 
 ### 新增：统一设置中心
 - 侧栏 `⚙` 由「模型管理器」升级为设置中心：模型、供应商、MCP 服务器、技能四个板块并列，均支持搜索；窄窗口以返回按钮回到列表，搜索词与列表位置保留。
@@ -18,14 +18,24 @@
 - MCP 的启动超时、工具超时与工具过滤收进高级设置并折叠展示；保存后在新会话或重连时加载。
 - 技能「自动调用」关闭后仍可手动触发；删除会确认移除整个目录。
 
-### 新增：供应商删除
-- `scripts/model_manager.py` 新增 `provider_deletion_reasons` 与 `delete_provider`；供应商快照新增 `delete_protected` / `delete_reason`。
-- 新增 `POST /api/model-manager/provider/delete`，删除供应商及其本地连接与认证配置，不清除系统环境变量。
-- 托管/OAuth 供应商、以及仍被模型引用的供应商禁止删除，原因直接展示，需先删除或迁移关联模型。
+### 新增：供应商级联删除
+- `scripts/model_manager.py` 新增 `delete_provider`，配套 `POST /api/model-manager/provider/delete`：无条件原子删除供应商及其本地连接与认证配置，并连同其下全部模型一起删除（不清除系统环境变量）。
+- 删除后自动清理 `default_model`、`secondary_model` 模型池以及档位、锁定、恢复快照中的悬空引用；侧栏菜单与确认框写明将连带删除的模型数量。
+- 配置写入改为仅校验本次实际改动的模型，避免其他模型的历史非法档位阻断删除或保存。
 
-### 变更：文档同步
-- `README.md`、`SYSTEM.md`、`commands/models.md`、`skills/kimi-code-usage/SKILL.md` 同步设置中心、MCP 与技能、供应商删除的说明。
+### 变更：中继单端口账号体系
+- `scripts/relay_server.py` 由双端口共享密钥重构为单 HTTP/WS 端口，新增 `AccountStore`（SQLite `relay.sqlite3`）、账号注册/登录、设备凭据校验、登录 Cookie 与登录限流。
+- `scripts/relay_config.py` 配置字段升级为 `url`、`token`、`username`、`password`、`device_id`、`device_key`、`device_name`（保留旧地址兼容转换）；`scripts/service.py` 新增 `/api/mobile/relay/{config,bind,unbind}` 与账号接口，停止连接后才允许修改配置或绑定。
+- 手机桥与隧道改用设备凭据，二维码改为携带账号密码与设备 ID 的 fragment 链接，手机端支持账号登录并切换账号下已绑定的电脑；`scripts/updater.py` 将 `kimi-remote-widget.js` 加入手机运行时热更清单；worker 版本升至 `mobile-relay-accounts-8`。
+
+### 变更：技能按需加载与文档同步
+- 精简 `SYSTEM.md` 常驻提示并改为按需加载用量技能，减少常规对话的上下文占用。
+- 同步更新 `README.md`、`SYSTEM.md`、`HANDOFF.md`、`commands/models.md`、`skills/kimi-code-usage/SKILL.md`、`docs/自建中继服务器-搭建教程.md` 与 `AGENTS.md`（补充本地插件同步流程）。
 - 本版仍不提供供应商重命名、供应商复制、原始 TOML 编辑与备份恢复界面。
+
+### 修复：模型菜单与手机中继连接
+- 修复桌面模型选择器（`assets/kimi-model-tabs.js`）：滚轮滚动面板内列表不再误触发脱锚关闭，并补 `overscroll-behavior: contain`；在矮窗口与窄窗口下按实际可视空间动态计算 `max-height`、自动切换向上/向下展开并夹取左右位置，避免溢出屏幕。
+- 修复手机中继连接与界面交互（`scripts/relay_server.py`、`assets/kimi-mobile-nav.js`）：中继转发剥离 `accept-encoding` 并允许带查询参数的 `/api/v1/ws` WebSocket 升级；手机端模型下拉菜单按可用空间自适应向上、向下或底栏弹层展开；中继「电脑列表」与「退出登录」按钮收进「面板」悬浮球内，不再悬浮遮挡顶栏。
 
 ## v3.4.11 · 2026-10-28
 
