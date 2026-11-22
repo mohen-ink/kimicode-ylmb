@@ -362,7 +362,7 @@ async def relay_register(reader, writer, headers, origin):
 def _forward_headers(headers, tun, sid, account):
     out = {k: v for k, v in headers.items() if k not in (
         'host', 'connection', 'content-length', 'cookie', 'authorization', 'upgrade',
-        'sec-websocket-key', 'sec-websocket-version', 'sec-websocket-extensions')
+        'accept-encoding', 'sec-websocket-key', 'sec-websocket-version', 'sec-websocket-extensions')
         and not k.startswith(('x-relay-', 'x-forwarded-', 'cf-'))}
     ticket = '%s.%d' % (sid, int(account['expires']))
     signature = hmac.new(tun.bridge_key.encode('ascii'), ticket.encode('ascii'), hashlib.sha256).hexdigest()
@@ -661,7 +661,7 @@ async def public_conn(reader, writer):
         suffix = urlencode(query, doseq=True)
         inner = inner + ('?' + suffix if suffix else '')
         if _upgrade(headers):
-            if method != 'GET' or body or inner != '/api/v1/ws':
+            if method != 'GET' or body or inner.partition('?')[0] != '/api/v1/ws':
                 raise ValueError('升级通道不被允许')
             upgraded = True
             await proxy_ws(tun, reader, writer, headers, inner, sid, account)
@@ -726,8 +726,9 @@ var WS=window.WebSocket;window.WebSocket=new Proxy(WS,{construct:function(Target
 function route(url){if(url==null)return url;var u=new URL(url,location.href);if(u.origin===location.origin){u.searchParams.set('relay_device',id);u.searchParams.set('kimi_onboarded','1')}return u.href}
 ['pushState','replaceState'].forEach(function(key){var original=history[key];history[key]=function(state,title,url){return original.call(this,state,title,route(url))}});
 var storage=Storage.prototype;['getItem','setItem','removeItem'].forEach(function(key){var original=storage[key];storage[key]=function(name){var args=Array.from(arguments);args[0]='kimi-relay:'+id+':'+name;return original.apply(this,args)}});
-window.addEventListener('DOMContentLoaded',function(){var bar=document.createElement('div');bar.style.cssText='position:fixed;top:4px;right:8px;z-index:2147483640;display:flex;gap:6px';
-[['电脑列表',function(){location.assign('/')}],['退出登录',async function(){try{var r=await fetch0('/api/relay/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(!r.ok)throw Error();location.replace('/')}catch(e){alert('退出失败，请稍后重试')}}]].forEach(function(item){var b=document.createElement('button');b.textContent=item[0];b.style.cssText='padding:5px 8px;border:1px solid #777;border-radius:8px;background:#222;color:white;font-size:12px';b.onclick=item[1];bar.appendChild(b)});document.body.appendChild(bar)});
+window.addEventListener('DOMContentLoaded',function(){var status=document.querySelector('#kuOv #kuBox [data-ku="status"]');if(!status)return;
+var actions=document.createElement('div');actions.className='ku-actions';actions.setAttribute('role','group');actions.setAttribute('aria-label','中继连接');
+[['电脑列表',function(){location.assign('/')}],['退出登录',async function(){try{var r=await fetch0('/api/relay/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(!r.ok)throw Error();location.replace('/')}catch(e){alert('退出失败，请稍后重试')}}]].forEach(function(item){var b=document.createElement('button');b.type='button';b.textContent=item[0];b.onclick=item[1];actions.appendChild(b)});status.insertAdjacentElement('afterend',actions)});
 })();'''
 
 

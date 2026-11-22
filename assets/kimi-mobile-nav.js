@@ -245,8 +245,84 @@
     '.sheet-root .sheet-panel.ku-switcher-sheet{height:calc(var(--app-height,100dvh) - 50px - var(--safe-top,0px));max-height:calc(var(--app-height,100dvh) - 50px - var(--safe-top,0px))}',
     '#app{max-width:100%;overflow-x:clip}',
     'body.ku-spa-overlay #kuUsageBtn{visibility:hidden!important;pointer-events:none!important}',
-    'body.ku-spa-overlay #ku-steer-btn{display:none!important}'
+    'body.ku-spa-overlay #ku-steer-btn{display:none!important}',
+    '.model-dropdown[data-ku-model-side]{display:flex;flex-direction:column;min-height:0;max-height:var(--ku-model-room)!important;overflow:hidden}',
+    '.model-dropdown[data-ku-model-side]>.md-list{flex:0 1 auto;min-height:0}',
+    '.model-dropdown[data-ku-model-side]>:not(.md-list){flex:none}',
+    '.model-dropdown[data-ku-model-side="up"]{top:auto!important;bottom:calc(100% + var(--space-1))!important;transform-origin:bottom right}',
+    '.model-dropdown[data-ku-model-side="down"]{top:calc(100% + var(--space-1))!important;bottom:auto!important;transform-origin:top right}',
+    '.model-dropdown[data-ku-model-side="sheet"]{top:auto!important;bottom:var(--ku-model-bottom)!important;left:0!important;right:0!important;min-width:0;max-width:none;transform-origin:bottom center}',
+    '.model-dropdown.ku-model-compact{overflow-y:auto}',
+    '.model-dropdown.ku-model-compact>.md-list{flex:none;max-height:none;overflow:visible}'
   ].join('');
+
+  function watchModelMenu() {
+    var selector = '.model-dropdown';
+    var menu = null, anchor = null, header = null, list = null, frame = 0;
+    var viewport = window.visualViewport;
+    var resize = typeof ResizeObserver === 'function' ? new ResizeObserver(schedule) : null;
+
+    function layout() {
+      frame = 0;
+      if (!menu || !menu.isConnected || !anchor || !list) return;
+      var rect = anchor.getBoundingClientRect();
+      var offset = viewport ? viewport.offsetTop : 0;
+      var top = Math.max(offset, header ? header.getBoundingClientRect().bottom : offset) + 8;
+      var bottom = offset + (viewport ? viewport.height : window.innerHeight) - 8;
+      if (bottom <= top) return;
+      var css = window.getComputedStyle(menu);
+      var gap = parseFloat(css.getPropertyValue('--space-1')) || 4;
+      var border = (parseFloat(css.borderTopWidth) || 0) + (parseFloat(css.borderBottomWidth) || 0);
+      var chrome = menu.scrollHeight - list.offsetHeight + border;
+      var row = list.querySelector('.md-row');
+      var rowHeight = row ? row.offsetHeight : 0;
+      var minRoom = chrome + Math.min(list.scrollHeight, 2 * rowHeight);
+      var above = rect.top + anchor.clientTop - anchor.scrollTop - gap - top;
+      var below = bottom - (rect.top + anchor.clientTop + anchor.clientHeight - anchor.scrollTop + gap);
+      var side = above >= minRoom ? 'up' : below >= minRoom ? 'down' : 'sheet';
+      var room = side === 'up' ? above : side === 'down' ? below : bottom - top;
+      menu.dataset.kuModelSide = side;
+      menu.style.setProperty('--ku-model-room', Math.floor(room) + 'px');
+      if (side === 'sheet') {
+        menu.style.setProperty('--ku-model-bottom', (rect.top + anchor.clientTop + anchor.clientHeight - anchor.scrollTop - bottom) + 'px');
+      }
+      menu.classList.toggle('ku-model-compact', side === 'sheet' && room < chrome + rowHeight);
+    }
+
+    function schedule() {
+      if (menu && !frame) frame = window.requestAnimationFrame(layout);
+    }
+
+    function sync() {
+      var next = document.querySelector(selector);
+      if (next === menu) return;
+      if (resize) resize.disconnect();
+      menu = next;
+      if (!menu) return;
+      anchor = menu.offsetParent;
+      list = menu.querySelector('.md-list');
+      header = firstVisible('.topbar') || firstVisible('.chat-header');
+      if (resize) [menu, anchor, header].forEach(function (el) { if (el) resize.observe(el); });
+      schedule();
+    }
+
+    window.addEventListener('resize', schedule);
+    if (viewport) {
+      viewport.addEventListener('resize', schedule);
+      viewport.addEventListener('scroll', schedule);
+    }
+    sync();
+    return function (records) {
+      if (menu && !menu.isConnected) return sync();
+      for (var i = 0; i < records.length; i++) {
+        var nodes = records[i].addedNodes;
+        for (var j = 0; j < nodes.length; j++) {
+          var node = nodes[j];
+          if (node.nodeType === 1 && (node.matches(selector) || node.querySelector(selector))) return sync();
+        }
+      }
+    };
+  }
 
   function installScrollFix() {
     try {
@@ -647,7 +723,11 @@
       ensureSteerButton();
       // 只观察 body 的子节点增删（不看 attributes/characterData），并以 200ms 合并，
       // 避免在流式输出时给手机叠加高频重排
-      var mo = new MutationObserver(scheduleSync);
+      var syncModelMenu = watchModelMenu();
+      var mo = new MutationObserver(function (records) {
+        scheduleSync();
+        syncModelMenu(records);
+      });
       mo.observe(document.body, { childList: true, subtree: true });
       scheduleSync();
     } catch (e) { /* 安装失败即静默降级，不影响原生队列面板 */ }
